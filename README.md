@@ -1,4 +1,4 @@
-# 赛题题目：面向openEuler的自适应资源管控Agent
+# 赛题题目：面向openEuler的自适应资源管控Agent（社区赛题）
 
 ## 赛题说明：
 设计并实现一个基于用户态调度的资源管控Agent框架，例如用户态调度的agent，通过agent感知workload然后基于sched_ext调整cpu调度策略，生成scx，优化workload性能；除了上面的cpu调度agent，还可以考虑将ebpf作为hook，agent作为策略决策，实现其他类型的os agent；比如：network policy agent，security policy agent, resource contral agent(cgroup)等。
