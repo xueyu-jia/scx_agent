@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "bench" / "workloads" / "src"
+BIN = ROOT / "bench" / "workloads" / "bin"
+
+
+@dataclass(frozen=True)
+class Workload:
+    name: str
+    repo: str
+    ref: str
+
+
+WORKLOADS = {
+    "hackbench": Workload(
+        name="hackbench",
+        repo="https://github.com/linux-test-project/ltp.git",
+        ref="master",
+    ),
+    "schbench": Workload(
+        name="schbench",
+        repo="https://kernel.googlesource.com/pub/scm/linux/kernel/git/mason/schbench",
+        ref="master",
+    ),
+    "stress-ng": Workload(
+        name="stress-ng",
+        repo="https://github.com/ColinIanKing/stress-ng.git",
+        ref="master",
+    ),
+    "fio": Workload(
+        name="fio",
+        repo="https://github.com/axboe/fio.git",
+        ref="master",
+    ),
+    "redis": Workload(
+        name="redis",
+        repo="https://github.com/redis/redis.git",
+        ref="unstable",
+    ),
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Fetch and build benchmark workloads")
+    parser.add_argument(
+        "workloads",
+        nargs="*",
+        default=list(WORKLOADS),
+        help=f"workloads to build: {', '.join(WORKLOADS)}",
+    )
+    parser.add_argument("--force", action="store_true", help="delete existing source before cloning")
+    args = parser.parse_args(argv)
+
+    SRC.mkdir(parents=True, exist_ok=True)
+    BIN.mkdir(parents=True, exist_ok=True)
+
+    for name in args.workloads:
+        if name not in WORKLOADS:
+            raise SystemExit(f"unknown workload: {name}")
+        workload = WORKLOADS[name]
+        source = SRC / workload.name
+        if args.force and source.exists():
+            shutil.rmtree(source)
+        clone_or_update(workload, source)
+        build(workload.name, source)
+
+    print(f"workload binaries: {BIN}")
+    return 0
+
+
+def clone_or_update(workload: Workload, source: Path) -> None:
+    if not source.exists():
+        run(["git", "clone", "--depth", "1", "--branch", workload.ref, workload.repo, str(source)])
+        return
+
+    run(["git", "fetch", "--depth", "1", "origin", workload.ref], cwd=source)
+    run(["git", "checkout", "FETCH_HEAD"], cwd=source)
+
+
+def build(name: str, source: Path) -> None:
+    builders = {
+        "hackbench": build_hackbench,
+        "schbench": build_make_binary,
+        "stress-ng": build_make_binary,
+        "fio": build_fio,
+        "redis": build_redis,
+    }
+    builders[name](source)
+
+
+def build_hackbench(source: Path) -> None:
+    candidates = list(source.rglob("hackbench.c"))
+    if not candidates:
+        raise RuntimeError("hackbench.c not found in LTP source")
+    src = candidates[0]
+    run(["gcc", "-O2", "-pthread", "-o", str(BIN / "hackbench"), str(src)])
+
+
+def build_make_binary(source: Path) -> None:
+    run(["make", f"-j{os.cpu_count() or 1}"], cwd=source)
+    binary = source / source.name
+    if not binary.exists():
+        matches = list(source.glob(source.name.replace("-", "_")))
+        if matches:
+            binary = matches[0]
+    if not binary.exists():
+        binary = find_executable(source, source.name)
+    install(binary, BIN / source.name)
+
+
+def build_fio(source: Path) -> None:
+    run(["./configure", "--disable-native"], cwd=source)
+    run(["make", f"-j{os.cpu_count() or 1}"], cwd=source)
+    install(source / "fio", BIN / "fio")
+
+
+def build_redis(source: Path) -> None:
+    run(["make", f"-j{os.cpu_count() or 1}", "BUILD_TLS=no"], cwd=source)
+    install(source / "src" / "redis-server", BIN / "redis-server")
+    install(source / "src" / "redis-benchmark", BIN / "redis-benchmark")
+
+
+def find_executable(root: Path, name: str) -> Path:
+    for path in root.rglob(name):
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    raise RuntimeError(f"built binary not found: {name}")
+
+
+def install(src: Path, dst: Path) -> None:
+    if not src.exists():
+        raise RuntimeError(f"missing built binary: {src}")
+    shutil.copy2(src, dst)
+    dst.chmod(0o755)
+
+
+def run(command: list[str], cwd: Path | None = None) -> None:
+    print("+", " ".join(command), f"(cwd={cwd})" if cwd else "")
+    subprocess.run(command, cwd=cwd, check=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

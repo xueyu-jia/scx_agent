@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+bench/results/
+bench/workloads/
+
+.venv/
+venv/
+*.log
