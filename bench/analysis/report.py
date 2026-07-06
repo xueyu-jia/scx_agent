@@ -85,6 +85,9 @@ def render_html(analysis: dict[str, Any]) -> str:
     .verdict-improvement {{ color: var(--good); font-weight: 650; }}
     .verdict-regression {{ color: var(--bad); font-weight: 650; }}
     .verdict-no_change, .verdict-informational {{ color: var(--neutral); }}
+    .delta-improvement {{ color: var(--good); font-weight: 650; }}
+    .delta-regression {{ color: var(--bad); font-weight: 650; }}
+    .delta-no_change, .delta-informational {{ color: var(--neutral); }}
     .bar {{
       width: 180px;
       height: 10px;
@@ -99,6 +102,7 @@ def render_html(analysis: dict[str, Any]) -> str:
     }}
     .bar .positive {{ background: var(--good); }}
     .bar .negative {{ background: var(--bad); }}
+    .bar .neutral {{ background: #98a2b3; }}
     code {{
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
@@ -158,8 +162,8 @@ def _comparison_table(comparisons: list[dict[str, Any]]) -> str:
             f"<td>{_h(item.get('role'))}</td>"
             f"<td>{_fmt_stat(item.get('baseline'), item.get('unit'))}</td>"
             f"<td>{_fmt_stat(item.get('candidate'), item.get('unit'))}</td>"
-            f"<td>{_fmt_delta(item.get('delta_pct'))}</td>"
-            f"<td>{_bar(item.get('delta_pct'))}</td>"
+            f"<td>{_fmt_delta(item.get('delta_pct'), item.get('verdict'))}</td>"
+            f"<td>{_bar(item.get('delta_pct'), item.get('verdict'))}</td>"
             f"<td class=\"verdict-{_h(item.get('verdict'))}\">{_h(item.get('verdict'))}</td>"
             "</tr>"
         )
@@ -205,18 +209,18 @@ def _fmt_stat(stats: Any, unit: Any) -> str:
     return f"{float(stats['mean']):.4g}{unit_text} <span class=\"muted\">n={_h(stats.get('count'))}</span>"
 
 
-def _fmt_delta(value: Any) -> str:
+def _fmt_delta(value: Any, verdict: Any = None) -> str:
     if not isinstance(value, (int, float)):
         return '<span class="muted">missing</span>'
     sign = "+" if value > 0 else ""
-    return f"{sign}{value:.2f}%"
+    return f'<span class="delta-{_h(verdict)}">{sign}{value:.2f}%</span>'
 
 
-def _bar(value: Any) -> str:
+def _bar(value: Any, verdict: Any = None) -> str:
     if not isinstance(value, (int, float)):
         return ""
     width = min(abs(value), 100.0)
-    klass = "positive" if value >= 0 else "negative"
+    klass = "positive" if verdict == "improvement" else "negative" if verdict == "regression" else "neutral"
     return f'<div class="bar"><span class="{klass}" style="width:{width:.2f}%"></span></div>'
 
 

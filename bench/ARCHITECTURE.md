@@ -118,6 +118,10 @@ schbench    kernel.googlesource.com/.../mason/schbench
 stress-ng   ColinIanKing/stress-ng
 fio         axboe/fio
 redis       redis/redis
+rt-tests    kernel.org rt-tests
+will-it-scale antonblanchard/will-it-scale
+perf bench  host perf tool
+kernel build configured kernel source tree
 ```
 
 The script stores source trees under:
@@ -165,8 +169,8 @@ Generic workload wrapper.
 It runs a community workload binary, saves raw stdout/stderr, and emits
 normalized JSON.
 
-Specialized wrappers should be added here for tools such as `fio`, `schbench`,
-or `cyclictest`.
+Specialized wrappers are used for tools such as `fio`, `schbench`, `perf bench
+sched`, `will-it-scale`, `cyclictest`, `kernel build`, and `redis-benchmark`.
 
 ### `bench/analysis/loader.py`
 

@@ -48,6 +48,16 @@ WORKLOADS = {
         repo="https://github.com/redis/redis.git",
         ref="unstable",
     ),
+    "rt-tests": Workload(
+        name="rt-tests",
+        repo="https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git",
+        ref="main",
+    ),
+    "will-it-scale": Workload(
+        name="will-it-scale",
+        repo="https://github.com/antonblanchard/will-it-scale.git",
+        ref="master",
+    ),
 }
 
 
@@ -95,6 +105,8 @@ def build(name: str, source: Path) -> None:
         "stress-ng": build_make_binary,
         "fio": build_fio,
         "redis": build_redis,
+        "rt-tests": build_rt_tests,
+        "will-it-scale": build_will_it_scale,
     }
     builders[name](source)
 
@@ -129,6 +141,25 @@ def build_redis(source: Path) -> None:
     run(["make", f"-j{os.cpu_count() or 1}", "BUILD_TLS=no"], cwd=source)
     install(source / "src" / "redis-server", BIN / "redis-server")
     install(source / "src" / "redis-benchmark", BIN / "redis-benchmark")
+
+
+def build_rt_tests(source: Path) -> None:
+    run(["make", f"-j{os.cpu_count() or 1}", "cyclictest"], cwd=source)
+    install(find_executable(source, "cyclictest"), BIN / "cyclictest")
+
+
+def build_will_it_scale(source: Path) -> None:
+    run(["make", f"-j{os.cpu_count() or 1}"], cwd=source)
+    if not (source / "runtest.py").exists():
+        raise RuntimeError("will-it-scale runtest.py not found")
+    wrapper = BIN / "will-it-scale"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"cd {source.resolve()}\n"
+        'exec ./runtest.py "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
 
 
 def find_executable(root: Path, name: str) -> Path:

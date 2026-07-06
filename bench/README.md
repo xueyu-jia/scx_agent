@@ -39,12 +39,21 @@
 CPU throughput:
   hackbench
   stress-ng
+  will-it-scale
 
 IO unblock:
   fio
 
+调度 / IPC:
+  perf bench sched pipe
+  perf bench sched messaging
+
 tail latency:
   schbench
+  cyclictest
+
+综合构建:
+  kernel build
 
 真实服务场景:
   redis-server + redis-benchmark
@@ -54,7 +63,7 @@ tail latency:
 
 ```bash
 python3 bench/scripts/fetch_workloads.py \
-  hackbench schbench stress-ng fio redis
+  hackbench schbench stress-ng fio redis rt-tests will-it-scale
 ```
 
 构建后的二进制会安装到：
@@ -77,6 +86,10 @@ bench/benchmarks/schbench.py
 bench/benchmarks/stress_ng.py
 bench/benchmarks/fio.py
 bench/benchmarks/redis.py
+bench/benchmarks/perf_sched.py
+bench/benchmarks/will_it_scale.py
+bench/benchmarks/cyclictest.py
+bench/benchmarks/kernel_build.py
 ```
 
 示例配置当前使用：
