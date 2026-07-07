@@ -22,6 +22,7 @@ bench/
   runner.py
 
   scripts/
+    prepare_env.py
     run.py
     isolation.py
     fetch_workloads.py
@@ -40,6 +41,7 @@ bench/
 
   configs/
     example.config
+    local.config  # generated, ignored by git
 
   workloads/
   schedulers/
@@ -68,7 +70,10 @@ Key responsibilities:
 
 - create per-run directories;
 - generate guest scripts;
-- run `vng`;
+- create a per-run qcow2 overlay;
+- generate libvirt domain XML;
+- define, start, destroy, and undefine libvirt domains;
+- run the guest script over SSH and copy artifacts back;
 - enforce host preflight checks;
 - save per-run metadata and raw artifacts;
 - parse wrapper JSON into `bench_metrics.json`.
@@ -85,11 +90,30 @@ Key responsibilities:
 - read config;
 - select `--baseline` and `--candidate` schedulers;
 - expand the selected plan;
-- run baseline/candidate in alternating or sequential order;
+- build comparison pairs from expanded `RunSpec` objects;
+- allocate host CPU placement for `pin_cpus: auto`;
+- run comparison pairs concurrently when isolated resources allow it;
+- run baseline/candidate inside each pair in alternating or sequential order;
 - write experiment metadata;
 - invoke analysis and report generation.
 
 This script is the normal user-facing entry point.
+
+### `bench/scripts/prepare_env.py`
+
+Prepares a machine-specific local environment.
+
+Key responsibilities:
+
+- generate `bench/configs/local.config` from `example.config`;
+- derive `libvirt.emulator_cpus` and `executor.isolated_cpus` from host topology;
+- generate the SSH key used by the guest;
+- call `fetch_workloads.py`;
+- create the libvirt base image;
+- call `isolation.py prepare --no-reboot`;
+- verify that the generated environment is usable.
+
+`prepare_env.py` owns machine-local setup. It does not run experiments.
 
 ### `bench/scripts/isolation.py`
 
@@ -120,7 +144,7 @@ fio         axboe/fio
 redis       redis/redis
 rt-tests    kernel.org rt-tests
 will-it-scale antonblanchard/will-it-scale
-perf bench  host perf tool
+perf bench  configured kernel source tree tools/perf
 kernel build configured kernel source tree
 ```
 
@@ -136,9 +160,13 @@ and installs runnable binaries under:
 bench/workloads/bin/
 ```
 
+`perf` is built from `libvirt.kernel_source/tools/perf` and installed as
+`bench/workloads/bin/perf`. The `perf bench sched` wrapper uses this binary
+before falling back to host `perf`.
+
 ### `bench/collectors/guest.py`
 
-Generates the shell script executed inside the `vng` guest.
+Generates the shell script executed inside the libvirt guest.
 
 The guest script:
 
@@ -244,12 +272,14 @@ Standalone analysis CLI for re-analyzing existing result directories.
 ## Data Flow
 
 ```text
-example.config
+example.config + prepare_env.py init
+  -> local.config
+local.config
   -> config parser
   -> RunSpec list
   -> scripts/run.py chooses scheduler order
   -> runner.py executes scheduler + RunSpec batch
-  -> vng guest runs generated run_guest.sh
+  -> libvirt guest runs generated run_guest.sh over SSH
   -> per-run raw artifacts
   -> analysis loader
   -> comparison objects
@@ -359,17 +389,29 @@ produce comparison objects.
 Machine config declares required isolation:
 
 ```yaml
+executor:
+  parallel: auto
+  cpu_source: isolated
+  isolated_cpus: "2-9"
+  smt_policy: use_all_siblings
+  pair_policy: sequential
+
 machines:
   small:
     vcpus: 2
     memory: 8G
-    pin_cpus: "2-3"
+    pin_cpus: auto
     exclusive: true
     frequency:
       fixed: true
 ```
 
 `scripts/isolation.py prepare` configures host boot/runtime state.
+
+When `pin_cpus: auto` is used, `executor.isolated_cpus` defines the host CPU
+range to isolate. `scripts/run.py` then allocates complete SMT sibling groups
+to comparison pairs. A physical core's logical CPU siblings are never split
+across different pairs.
 
 `runner.py` checks:
 

@@ -57,6 +57,8 @@ def main(argv: list[str] | None = None) -> int:
         "primary: "
         f"{summary['primary_improvements']} improvement(s), "
         f"{summary['primary_regressions']} regression(s), "
+        f"{summary['primary_failed']} failed, "
+        f"{summary['primary_partial_failed']} partial failed, "
         f"{summary['primary_missing']} missing"
     )
     print(f"output: {output}")

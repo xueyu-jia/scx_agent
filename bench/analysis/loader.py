@@ -19,6 +19,11 @@ class RunMetricSet:
     metric_profile: str
     metric_profile_config: dict[str, Any]
     metrics: dict[str, Any]
+    returncode: int | None
+    vm_returncode: int | None
+    bench_returncode: int | None
+    scheduler_start_returncode: int | None
+    failure_reason: str
 
 
 def load_result_dir(path: str | Path, label: str) -> list[RunMetricSet]:
@@ -44,6 +49,7 @@ def _load_one(
         return None
 
     metrics = bench_metrics.get("metrics", {})
+    guest_result = _as_dict(result.get("guest_result", {}))
     return RunMetricSet(
         result_dir=result_dir,
         run_dir=run_dir,
@@ -56,6 +62,13 @@ def _load_one(
         metric_profile=str(spec.get("metric_profile", "")),
         metric_profile_config=_as_dict(spec.get("metric_profile_config", {})),
         metrics=_as_dict(metrics),
+        returncode=_as_int(result.get("returncode")),
+        vm_returncode=_as_int(
+            result.get("vm_returncode", result.get("libvirt_returncode", result.get("vng_returncode")))
+        ),
+        bench_returncode=_as_int(guest_result.get("bench_returncode")),
+        scheduler_start_returncode=_as_int(guest_result.get("scheduler_start_returncode")),
+        failure_reason=_failure_reason(result, run_dir),
     )
 
 
@@ -71,3 +84,52 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _as_int(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def _failure_reason(result: dict[str, Any], run_dir: Path) -> str:
+    status = str(result.get("status", "UNKNOWN"))
+    if status == "PASS":
+        return ""
+
+    libvirt_stderr = _first_non_empty_line(run_dir / "libvirt_stderr.log")
+    if libvirt_stderr:
+        return f"libvirt: {libvirt_stderr}"
+
+    legacy_vng_stderr = _first_non_empty_line(run_dir / "vng_stderr.log")
+    if legacy_vng_stderr:
+        return f"vng: {legacy_vng_stderr}"
+
+    scheduler_stderr = _first_non_empty_line(run_dir / "scheduler_stderr.log")
+    if scheduler_stderr:
+        return f"scheduler: {scheduler_stderr}"
+
+    workload_stderr = _first_non_empty_line(run_dir / "workload_stderr.log")
+    if workload_stderr:
+        return f"benchmark: {workload_stderr}"
+
+    guest_result = _as_dict(result.get("guest_result", {}))
+    vm_returncode = result.get(
+        "vm_returncode",
+        result.get("libvirt_returncode", result.get("vng_returncode")),
+    )
+    if vm_returncode not in (None, 0):
+        return f"vm returncode {vm_returncode}"
+    if guest_result.get("scheduler_start_returncode") not in (None, 0):
+        return f"scheduler returncode {guest_result.get('scheduler_start_returncode')}"
+    if guest_result.get("bench_returncode") not in (None, 0):
+        return f"benchmark returncode {guest_result.get('bench_returncode')}"
+    return status
+
+
+def _first_non_empty_line(path: Path) -> str:
+    if not path.exists():
+        return ""
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        text = line.strip()
+        if text:
+            return text[:240]
+    return ""

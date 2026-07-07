@@ -3,6 +3,7 @@ __pycache__/
 
 bench/results/
 bench/workloads/
+bench/configs/local.config
 
 .venv/
 venv/

@@ -34,7 +34,7 @@ BOOT_ARG_KEYS = {
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare or restore host isolation for scx bench")
     parser.add_argument("action", choices=("prepare", "restore", "status", "apply-runtime"))
-    parser.add_argument("--config", default="bench/configs/example.config")
+    parser.add_argument("--config", default="bench/configs/local.config")
     parser.add_argument("--plan", help="only use machines referenced by this plan")
     parser.add_argument("--state", default=str(STATE_PATH))
     parser.add_argument("--grub", default=str(GRUB_PATH))
@@ -177,6 +177,10 @@ def apply_runtime(state_path: Path, dry_run: bool = False) -> int:
 
 
 def collect_target_cpus(config: dict[str, Any], plan_name: str | None) -> list[int]:
+    executor = config.get("executor", {})
+    if isinstance(executor, dict) and executor.get("isolated_cpus"):
+        return parse_cpu_list(executor["isolated_cpus"])
+
     if plan_name:
         specs = expand_plan(config, plan_name)
         machines = [spec.machine for spec in specs]
@@ -185,7 +189,12 @@ def collect_target_cpus(config: dict[str, Any], plan_name: str | None) -> list[i
 
     cpus: set[int] = set()
     for machine in machines:
-        cpus.update(parse_cpu_list(machine["pin_cpus"]))
+        pin_cpus = machine["pin_cpus"]
+        if pin_cpus == "auto":
+            raise ConfigError(
+                "executor.isolated_cpus is required when machines use pin_cpus: auto"
+            )
+        cpus.update(parse_cpu_list(pin_cpus))
     return sorted(cpus)
 
 

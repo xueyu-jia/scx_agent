@@ -12,12 +12,14 @@ from bench.benchmarks.util import emit, run_command
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="perf bench sched wrapper")
+    parser.add_argument("--binary", default=None, help="perf binary path")
     parser.add_argument("bench", choices=("pipe", "messaging"))
     parser.add_argument("args", nargs=argparse.REMAINDER)
     ns = parser.parse_args(argv)
     args = ns.args[1:] if ns.args[:1] == ["--"] else ns.args
 
-    result = run_command(["perf", "bench", "sched", ns.bench, *args])
+    perf = ns.binary or resolve_perf_binary()
+    result = run_command([perf, "bench", "sched", ns.bench, *args])
     text = result.stdout + "\n" + result.stderr
     metrics = {"elapsed_time_sec": result.elapsed_time_sec}
     metrics.update(parse_metrics(text, args))
@@ -25,10 +27,17 @@ def main(argv: list[str] | None = None) -> int:
     return result.returncode
 
 
+def resolve_perf_binary() -> str:
+    local = Path("bench/workloads/bin/perf")
+    if local.exists():
+        return str(local)
+    return "perf"
+
+
 def parse_metrics(text: str, args: list[str] | None = None) -> dict[str, float]:
     metrics: dict[str, float] = {}
     total = re.search(r"Total time:\s*([0-9.]+)\s*\[sec\]", text)
-    if total:
+    if total and float(total.group(1)) > 0:
         metrics["elapsed_time_sec"] = float(total.group(1))
     usecs = re.search(r"([0-9.]+)\s+usecs/op", text)
     if usecs:

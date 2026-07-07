@@ -9,10 +9,13 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(ROOT := Path(__file__).resolve().parents[2]))
+from bench.config.parser import load_config
 
-ROOT = Path(__file__).resolve().parents[2]
+
 SRC = ROOT / "bench" / "workloads" / "src"
 BIN = ROOT / "bench" / "workloads" / "bin"
+BUILD = ROOT / "bench" / "workloads" / "build"
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,11 @@ WORKLOADS = {
         repo="https://github.com/antonblanchard/will-it-scale.git",
         ref="master",
     ),
+    "perf": Workload(
+        name="perf",
+        repo="",
+        ref="",
+    ),
 }
 
 
@@ -69,16 +77,26 @@ def main(argv: list[str] | None = None) -> int:
         default=list(WORKLOADS),
         help=f"workloads to build: {', '.join(WORKLOADS)}",
     )
+    parser.add_argument(
+        "--config",
+        default=str(ROOT / "bench" / "configs" / "local.config"),
+        help="benchmark config path; used to find libvirt.kernel_source for perf",
+    )
     parser.add_argument("--force", action="store_true", help="delete existing source before cloning")
     args = parser.parse_args(argv)
+    config = load_config(args.config)
 
     SRC.mkdir(parents=True, exist_ok=True)
     BIN.mkdir(parents=True, exist_ok=True)
+    BUILD.mkdir(parents=True, exist_ok=True)
 
     for name in args.workloads:
         if name not in WORKLOADS:
             raise SystemExit(f"unknown workload: {name}")
         workload = WORKLOADS[name]
+        if name == "perf":
+            build_perf(Path(config["libvirt"]["kernel_source"]))
+            continue
         source = SRC / workload.name
         if args.force and source.exists():
             shutil.rmtree(source)
@@ -160,6 +178,32 @@ def build_will_it_scale(source: Path) -> None:
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
+
+
+def build_perf(kernel_source: Path) -> None:
+    if not kernel_source:
+        raise RuntimeError("kernel source path is required to build perf")
+    perf_source = kernel_source / "tools" / "perf"
+    if not perf_source.exists():
+        raise RuntimeError(f"kernel source does not contain tools/perf: {kernel_source}")
+
+    build_dir = BUILD / "perf"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True)
+
+    run(
+        [
+            "make",
+            "-C",
+            str(perf_source),
+            f"O={build_dir}",
+            f"-j{os.cpu_count() or 1}",
+            "NO_LIBTRACEEVENT=1",
+            "NO_LIBTRACEFS=1",
+        ]
+    )
+    install(build_dir / "perf", BIN / "perf")
 
 
 def find_executable(root: Path, name: str) -> Path:

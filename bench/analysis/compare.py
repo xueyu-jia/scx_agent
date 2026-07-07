@@ -119,8 +119,11 @@ def _build_comparison(
     machine, suite, bench, profile = key
     baseline_values = _values(baseline_group, metric_spec.name)
     candidate_values = _values(candidate_group, metric_spec.name)
-    baseline_stats = _stats(baseline_values)
-    candidate_stats = _stats(candidate_values)
+    baseline_run_summary = _run_summary(baseline_group, metric_spec.name)
+    candidate_run_summary = _run_summary(candidate_group, metric_spec.name)
+    run_status = _run_status(baseline_run_summary, candidate_run_summary)
+    baseline_stats = _stats(baseline_values, baseline_run_summary)
+    candidate_stats = _stats(candidate_values, candidate_run_summary)
     delta_pct = _delta_pct(baseline_stats.get("mean"), candidate_stats.get("mean"))
 
     return {
@@ -135,8 +138,16 @@ def _build_comparison(
         "chart": metric_spec.chart,
         "baseline": baseline_stats,
         "candidate": candidate_stats,
+        "run_status": run_status,
+        "failure_reason": _failure_reason(baseline_run_summary, candidate_run_summary),
         "delta_pct": delta_pct,
-        "verdict": _verdict(metric_spec, baseline_values, candidate_values, delta_pct),
+        "verdict": _verdict(
+            metric_spec,
+            baseline_values,
+            candidate_values,
+            delta_pct,
+            run_status,
+        ),
     }
 
 
@@ -153,12 +164,74 @@ def _values(runs: list[RunMetricSet], metric: str) -> list[float]:
     return values
 
 
-def _stats(values: list[float]) -> dict[str, Any]:
-    if not values:
-        return {"values": [], "count": 0}
+def _run_summary(runs: list[RunMetricSet], metric: str) -> dict[str, Any]:
+    passed = [run for run in runs if run.status in VALID_STATUSES]
+    failed = [run for run in runs if run.status not in VALID_STATUSES]
+    metric_missing = [
+        run
+        for run in passed
+        if not _is_number(run.metrics.get(metric))
+    ]
     return {
+        "total": len(runs),
+        "passed": len(passed),
+        "failed": len(failed),
+        "metric_missing": len(metric_missing),
+        "failed_runs": [
+            {
+                "label": run.label,
+                "status": run.status,
+                "path": str(run.run_dir),
+                "reason": run.failure_reason,
+            }
+            for run in failed
+        ],
+    }
+
+
+def _run_status(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> str:
+    if _all_failed(baseline) or _all_failed(candidate):
+        return "failed"
+    if baseline["failed"] > 0 or candidate["failed"] > 0:
+        return "partial_failed"
+    return "ok"
+
+
+def _all_failed(summary: dict[str, Any]) -> bool:
+    return summary["total"] > 0 and summary["passed"] == 0
+
+
+def _failure_reason(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> str:
+    reasons = []
+    for side, summary in (("baseline", baseline), ("candidate", candidate)):
+        failed_runs = summary.get("failed_runs", [])
+        if not failed_runs:
+            continue
+        first = failed_runs[0]
+        reason = first.get("reason") or first.get("status") or "failed"
+        reasons.append(f"{side}: {reason}")
+    return "; ".join(reasons)
+
+
+def _stats(values: list[float], run_summary: dict[str, Any]) -> dict[str, Any]:
+    base = {
         "values": values,
         "count": len(values),
+        "total_runs": run_summary["total"],
+        "passed_runs": run_summary["passed"],
+        "failed_runs": run_summary["failed"],
+        "metric_missing_runs": run_summary["metric_missing"],
+    }
+    if not values:
+        return base
+    return {
+        **base,
         "mean": statistics.fmean(values),
         "median": statistics.median(values),
         "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
@@ -182,7 +255,10 @@ def _verdict(
     baseline_values: list[float],
     candidate_values: list[float],
     delta_pct: float | None,
+    run_status: str,
 ) -> str:
+    if run_status == "failed":
+        return "failed"
     if not baseline_values or not candidate_values:
         return "missing"
     if metric_spec.direction not in {"higher", "lower"} or delta_pct is None:
@@ -225,6 +301,10 @@ def _summary(
         "primary_improvements": _count(primary, "improvement"),
         "primary_regressions": _count(primary, "regression"),
         "primary_no_change": _count(primary, "no_change"),
+        "primary_failed": sum(1 for item in primary if item["run_status"] == "failed"),
+        "primary_partial_failed": sum(
+            1 for item in primary if item["run_status"] == "partial_failed"
+        ),
         "primary_missing": _count(primary, "missing"),
         "invalid_runs": len(_invalid_runs(baseline_runs, candidate_runs)),
     }
@@ -245,6 +325,7 @@ def _invalid_runs(
                 "machine": run.machine,
                 "suite": run.suite,
                 "bench": run.bench,
+                "reason": run.failure_reason,
                 "path": str(run.run_dir),
             }
         )
@@ -253,6 +334,12 @@ def _invalid_runs(
 
 def _count(comparisons: list[dict[str, Any]], verdict: str) -> int:
     return sum(1 for item in comparisons if item["verdict"] == verdict)
+
+
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
 
 
 def _default_chart(metric_name: str) -> str:

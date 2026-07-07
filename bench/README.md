@@ -12,13 +12,40 @@
 
 当前实现支持：
 
-- 基于 `vng` 启动 VM；
+- 基于 `libvirt + KVM` 启动 VM；
 - host 隔离环境检查；
-- 手动触发 host 隔离环境准备和恢复；
+- 一键生成本机配置、workload、base image 和 host 隔离配置；
 - 配置化的 machine、suite、bench、metric profile 和 scheduler；
 - baseline / candidate 交替运行；
 - guest 内每次 run 的原始数据收集；
 - 自动生成 `analysis.json` 和 `report.html`。
+
+## 快速开始
+
+拉取代码后，默认流程是：
+
+```bash
+git clone <repo>
+cd scx_agent
+
+python3 bench/scripts/prepare_env.py init --kernel-source ~/linux-6.18
+sudo reboot
+python3 bench/scripts/prepare_env.py verify
+
+python3 bench/scripts/run.py \
+  --plan smoke \
+  --baseline default \
+  --candidate scx_rlfifo
+```
+
+`prepare_env.py init` 会生成本机专属配置：
+
+```text
+bench/configs/local.config
+```
+
+`local.config` 不提交到 git。`run.py`、`isolation.py` 和
+`fetch_workloads.py` 默认都使用它。
 
 ## 依赖
 
@@ -26,10 +53,14 @@
 
 - Python 3
 - PyYAML
-- `vng`
-- 可由 `vng` 启动的内核镜像
+- libvirt / QEMU / KVM：`virsh`、`qemu-img`、`ssh`、`scp`
+- 可由 libvirt 直接启动的内核镜像
+- 可通过 SSH 登录的 base qcow2 guest image
 - 放在 `bench/workloads/` 下的 benchmark 程序
 - 如果使用 `kind: scx`，需要放在 `bench/schedulers/` 下的调度器程序
+
+第一版 `prepare_env.py init` 会检查这些依赖；缺依赖时默认尝试通过 apt 安装。
+如果不希望脚本安装系统包，可以加 `--no-install-deps`。
 
 ## 拉取和构建 Workload
 
@@ -63,7 +94,15 @@ tail latency:
 
 ```bash
 python3 bench/scripts/fetch_workloads.py \
-  hackbench schbench stress-ng fio redis rt-tests will-it-scale
+  hackbench schbench stress-ng fio redis rt-tests will-it-scale perf
+```
+
+`perf` 会根据配置文件中的 `libvirt.kernel_source` 从当前内核源码的
+`tools/perf` 构建：
+
+```yaml
+libvirt:
+  kernel_source: <kernel-source>
 ```
 
 构建后的二进制会安装到：
@@ -92,27 +131,30 @@ bench/benchmarks/cyclictest.py
 bench/benchmarks/kernel_build.py
 ```
 
-示例配置当前使用：
-
-```yaml
-vng:
-  kernel: /home/bob/linux-6.18/arch/x86/boot/bzImage
-```
-
-请根据本机环境修改 [bench/configs/example.config](bench/configs/example.config)。
+通常不需要手动调用该脚本，`prepare_env.py init` 会自动调用。
 
 ## 配置文件
 
-主配置文件是：
+运行时默认配置文件是：
+
+```text
+bench/configs/local.config
+```
+
+模板配置文件是：
 
 ```text
 bench/configs/example.config
 ```
 
+`example.config` 不包含个人绝对路径，只作为 `prepare_env.py init` 生成
+`local.config` 的模板。
+
 顶层结构：
 
 ```text
-vng              VM 内核和 vng 设置
+libvirt         VM 内核、base image、SSH 和 libvirt 设置
+executor         pair 并行、自动 CPU pinning 和 host 资源策略
 schedulers       builtin 或 scx 调度器定义
 plans            smoke / full 等测试计划
 machines         VM CPU、内存、pinning、隔离要求
@@ -145,6 +187,31 @@ python3 bench/scripts/run.py \
 
 baseline 和 candidate 都可以是 `scx` 调度器。
 
+自动并行和 CPU pinning 由 `executor` 控制：
+
+```yaml
+executor:
+  parallel: auto
+  cpu_source: isolated
+  isolated_cpus: "2-9"
+  smt_policy: use_all_siblings
+  pair_policy: sequential
+  memory_guard_gb: 16
+
+machines:
+  small:
+    vcpus: 2
+    memory: 8G
+    pin_cpus: auto
+    exclusive: true
+    frequency:
+      fixed: true
+```
+
+`isolated_cpus` 必须包含完整的 SMT sibling group。运行时会以
+comparison pair 为单位分配 CPU，同一个 physical core 的所有 logical
+CPU sibling 只会分配给同一个 pair。
+
 ## Host 隔离环境
 
 runner 在真实启动 VM 前会严格检查：
@@ -158,27 +225,24 @@ runner 在真实启动 VM 前会严格检查：
 查看当前隔离状态：
 
 ```bash
-python3 bench/scripts/isolation.py status \
-  --config bench/configs/example.config \
-  --plan smoke
+python3 bench/scripts/isolation.py status
 ```
 
 预览将要修改的 host 设置：
 
 ```bash
 python3 bench/scripts/isolation.py prepare \
-  --config bench/configs/example.config \
-  --plan smoke \
   --dry-run
 ```
 
-准备隔离环境并自动重启：
+准备隔离环境：
 
 ```bash
-sudo python3 bench/scripts/isolation.py prepare \
-  --config bench/configs/example.config \
-  --plan smoke
+sudo python3 bench/scripts/isolation.py prepare --no-reboot
 ```
+
+通常不需要手动执行，`prepare_env.py init` 会调用它，然后用户手动
+`sudo reboot`。
 
 恢复原始 host 设置并自动重启：
 
@@ -193,6 +257,9 @@ sudo python3 bench/scripts/isolation.py restore
 ```
 
 它会修改 GRUB 启动参数，并安装一个 systemd service，用于重启后设置 pinned CPU 的固定频率。
+
+当 machine 使用 `pin_cpus: auto` 时，隔离脚本使用
+`executor.isolated_cpus` 作为需要隔离和固定频率的 CPU 范围。
 
 ## 运行实验
 
@@ -215,12 +282,18 @@ python3 bench/scripts/run.py \
   --candidate scx_simple
 ```
 
-默认执行顺序是交替运行：
+默认以 comparison pair 为基本单位运行：
 
 ```text
-round 1: baseline -> candidate
-round 2: candidate -> baseline
-round 3: baseline -> candidate
+pair = 同一个 RunSpec 下的 baseline + candidate
+```
+
+pair 内 baseline/candidate 串行执行，pair 之间可以并行。默认执行顺序是交替：
+
+```text
+run_index 1: baseline -> candidate
+run_index 2: candidate -> baseline
+run_index 3: baseline -> candidate
 ```
 
 也可以使用顺序运行：
@@ -232,6 +305,19 @@ python3 bench/scripts/run.py \
   --candidate scx_simple \
   --order sequential
 ```
+
+控制 pair 并行度：
+
+```bash
+python3 bench/scripts/run.py \
+  --plan smoke \
+  --baseline default \
+  --candidate scx_simple \
+  --parallel auto
+```
+
+`--parallel auto` 会根据已隔离 CPU、SMT sibling group、VM 内存和
+`memory_guard_gb` 自动决定哪些 pair 可以同时运行。
 
 ## 结果目录
 
@@ -259,8 +345,11 @@ runs/
       workload_stderr.log
       scheduler_stdout.log
       scheduler_stderr.log
-      vng_stdout.log
-      vng_stderr.log
+      libvirt_stdout.log
+      libvirt_stderr.log
+      domain.xml
+      placement.json
+      disk.qcow2
       guest_result.json
       run_guest.sh
       snapshots/
@@ -368,7 +457,7 @@ report.html
 
 - `--baseline` 只是比较基准，不代表必须是内核默认调度器。
 - baseline 和 candidate 都可以是 `builtin` 或 `scx`。
-- `vng --pin` 只能 pin QEMU vCPU 线程，不能单独保证 host CPU 独占。
+- libvirt XML 会显式设置 `vcpupin` 和 `emulatorpin`。
 - host CPU 隔离和固定频率需要先通过 `bench/scripts/isolation.py` 准备。
 - runner 会在真实运行前做严格 preflight 检查。
-- 当前 runner 顺序执行 VM，不并发运行多个 VM。
+- run.py 以 comparison pair 为单位调度，资源允许时可以并发运行多个 VM。

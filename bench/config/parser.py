@@ -11,7 +11,7 @@ except ImportError as exc:  # pragma: no cover - environment guard
 
 
 REQUIRED_TOP_LEVEL_KEYS = (
-    "vng",
+    "libvirt",
     "schedulers",
     "plans",
     "machines",
@@ -24,6 +24,34 @@ VALID_DIRECTIONS = {"higher", "lower"}
 VALID_CHARTS = {"delta_bar", "latency_bar", "summary_table"}
 VALID_SCHEDULER_KINDS = {"builtin", "scx"}
 VALID_MACHINE_KEYS = {"vcpus", "memory", "pin_cpus", "exclusive", "frequency"}
+VALID_EXECUTOR_KEYS = {
+    "parallel",
+    "cpu_source",
+    "isolated_cpus",
+    "smt_policy",
+    "pair_policy",
+    "memory_guard_gb",
+}
+VALID_LIBVIRT_KEYS = {
+    "uri",
+    "kernel",
+    "kernel_args",
+    "kernel_source",
+    "initrd",
+    "root_image",
+    "runtime_dir",
+    "network",
+    "ssh_user",
+    "ssh_key",
+    "ssh_host",
+    "ssh_port",
+    "workdir",
+    "guest_output_dir",
+    "emulator_cpus",
+    "timeout_extra_seconds",
+    "destroy_on_exit",
+    "cpu_mode",
+}
 
 
 class ConfigError(ValueError):
@@ -42,7 +70,7 @@ class RunSpec:
     suite: dict[str, Any]
     bench: dict[str, Any]
     metric_profile: dict[str, Any]
-    vng: dict[str, Any]
+    libvirt: dict[str, Any]
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -66,8 +94,9 @@ def validate_config(config: dict[str, Any]) -> None:
         if not isinstance(config[key], dict):
             raise ConfigError(f"{key} must be a mapping")
 
-    _validate_vng(config)
+    _validate_libvirt(config)
     _validate_schedulers(config)
+    _validate_executor(config)
     _validate_plans(config)
     _validate_machines(config)
     _validate_suites(config)
@@ -107,28 +136,87 @@ def expand_plan(config: dict[str, Any], plan_name: str) -> list[RunSpec]:
                             suite=suite,
                             bench=config["benches"][bench_name],
                             metric_profile=metric_profile,
-                            vng=config["vng"],
+                            libvirt=config["libvirt"],
                         )
                     )
 
     return specs
 
 
-def _validate_vng(config: dict[str, Any]) -> None:
-    kernel = config["vng"].get("kernel")
-    if not isinstance(kernel, str):
-        raise ConfigError("vng.kernel must be a string")
-    if not Path(kernel).exists():
-        raise ConfigError(f"vng.kernel does not exist: {kernel}")
-    user = config["vng"].get("user", "root")
-    if not isinstance(user, str):
-        raise ConfigError("vng.user must be a string")
-    timeout_extra = config["vng"].get("timeout_extra_seconds", 120)
+def _validate_libvirt(config: dict[str, Any]) -> None:
+    libvirt = config["libvirt"]
+    unknown_keys = set(libvirt) - VALID_LIBVIRT_KEYS
+    if unknown_keys:
+        raise ConfigError(f"libvirt has unsupported keys: {sorted(unknown_keys)}")
+
+    uri = libvirt.get("uri", "qemu:///system")
+    if not isinstance(uri, str):
+        raise ConfigError("libvirt.uri must be a string")
+
+    kernel = libvirt.get("kernel")
+    if kernel is not None:
+        if not isinstance(kernel, str):
+            raise ConfigError("libvirt.kernel must be a string")
+        if not Path(kernel).exists():
+            raise ConfigError(f"libvirt.kernel does not exist: {kernel}")
+
+    kernel_args = libvirt.get("kernel_args", "")
+    if not isinstance(kernel_args, str):
+        raise ConfigError("libvirt.kernel_args must be a string")
+
+    initrd = libvirt.get("initrd")
+    if initrd is not None:
+        if not isinstance(initrd, str):
+            raise ConfigError("libvirt.initrd must be a string")
+        if not Path(initrd).exists():
+            raise ConfigError(f"libvirt.initrd does not exist: {initrd}")
+
+    root_image = libvirt.get("root_image")
+    if not isinstance(root_image, str):
+        raise ConfigError("libvirt.root_image must be a string")
+
+    runtime_dir = libvirt.get("runtime_dir")
+    if runtime_dir is not None and not isinstance(runtime_dir, str):
+        raise ConfigError("libvirt.runtime_dir must be a string")
+
+    kernel_source = libvirt.get("kernel_source")
+    if not isinstance(kernel_source, str):
+        raise ConfigError("libvirt.kernel_source must be a string")
+    if not Path(kernel_source).exists():
+        raise ConfigError(f"libvirt.kernel_source does not exist: {kernel_source}")
+    if not (Path(kernel_source) / "tools" / "perf").exists():
+        raise ConfigError(f"libvirt.kernel_source does not contain tools/perf: {kernel_source}")
+
+    network = libvirt.get("network", "default")
+    if network is not None and not isinstance(network, str):
+        raise ConfigError("libvirt.network must be a string or null")
+
+    for key in ("ssh_user", "ssh_key", "workdir", "guest_output_dir", "emulator_cpus"):
+        value = libvirt.get(key)
+        if not isinstance(value, str):
+            raise ConfigError(f"libvirt.{key} must be a string")
+
+    ssh_host = libvirt.get("ssh_host")
+    if ssh_host is not None and not isinstance(ssh_host, str):
+        raise ConfigError("libvirt.ssh_host must be a string")
+
+    ssh_port = libvirt.get("ssh_port", 22)
+    if not isinstance(ssh_port, int) or ssh_port < 1:
+        raise ConfigError("libvirt.ssh_port must be a positive integer")
+
+    parse_cpu_list(libvirt["emulator_cpus"])
+
+    timeout_extra = libvirt.get("timeout_extra_seconds", 120)
     if not isinstance(timeout_extra, int) or timeout_extra < 0:
-        raise ConfigError("vng.timeout_extra_seconds must be a non-negative integer")
-    skip_modules = config["vng"].get("skip_modules", True)
-    if not isinstance(skip_modules, bool):
-        raise ConfigError("vng.skip_modules must be a boolean")
+        raise ConfigError("libvirt.timeout_extra_seconds must be a non-negative integer")
+
+    destroy_on_exit = libvirt.get("destroy_on_exit", True)
+    if not isinstance(destroy_on_exit, bool):
+        raise ConfigError("libvirt.destroy_on_exit must be a boolean")
+
+    cpu_mode = libvirt.get("cpu_mode", "host-passthrough")
+    if not isinstance(cpu_mode, str):
+        raise ConfigError("libvirt.cpu_mode must be a string")
 
 
 def _validate_schedulers(config: dict[str, Any]) -> None:
@@ -155,6 +243,42 @@ def _validate_schedulers(config: dict[str, Any]) -> None:
         for key, value in env.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ConfigError(f"schedulers.{scheduler_name}.env entries must be string:string")
+
+
+def _validate_executor(config: dict[str, Any]) -> None:
+    executor = config.get("executor", {})
+    if not isinstance(executor, dict):
+        raise ConfigError("executor must be a mapping")
+
+    unknown_keys = set(executor) - VALID_EXECUTOR_KEYS
+    if unknown_keys:
+        raise ConfigError(f"executor has unsupported keys: {sorted(unknown_keys)}")
+
+    parallel = executor.get("parallel", 1)
+    if parallel != "auto" and (not isinstance(parallel, int) or parallel < 1):
+        raise ConfigError("executor.parallel must be 'auto' or a positive integer")
+
+    cpu_source = executor.get("cpu_source", "configured")
+    if cpu_source not in ("configured", "isolated"):
+        raise ConfigError("executor.cpu_source must be 'configured' or 'isolated'")
+
+    isolated_cpus = executor.get("isolated_cpus")
+    if isolated_cpus is not None:
+        if not isinstance(isolated_cpus, str):
+            raise ConfigError("executor.isolated_cpus must be a string")
+        parse_cpu_list(isolated_cpus)
+
+    smt_policy = executor.get("smt_policy", "use_all_siblings")
+    if smt_policy != "use_all_siblings":
+        raise ConfigError("executor.smt_policy must be 'use_all_siblings'")
+
+    pair_policy = executor.get("pair_policy", "sequential")
+    if pair_policy != "sequential":
+        raise ConfigError("executor.pair_policy must be 'sequential'")
+
+    memory_guard = executor.get("memory_guard_gb", 0)
+    if not isinstance(memory_guard, int) or memory_guard < 0:
+        raise ConfigError("executor.memory_guard_gb must be a non-negative integer")
 
 
 def _validate_plans(config: dict[str, Any]) -> None:
@@ -208,14 +332,16 @@ def _validate_machines(config: dict[str, Any]) -> None:
             raise ConfigError(f"machines.{machine_name}.vcpus must be a positive integer")
         if not isinstance(machine["memory"], str):
             raise ConfigError(f"machines.{machine_name}.memory must be a string")
-        if not isinstance(machine.get("pin_cpus"), str):
+        pin_cpus_value = machine.get("pin_cpus")
+        if not isinstance(pin_cpus_value, str):
             raise ConfigError(f"machines.{machine_name}.pin_cpus must be a string")
-        pin_cpus = parse_cpu_list(machine["pin_cpus"])
-        if len(pin_cpus) != machine["vcpus"]:
-            raise ConfigError(
-                f"machines.{machine_name}.pin_cpus must contain exactly "
-                f"{machine['vcpus']} CPU(s)"
-            )
+        if pin_cpus_value != "auto":
+            pin_cpus = parse_cpu_list(pin_cpus_value)
+            if len(pin_cpus) != machine["vcpus"]:
+                raise ConfigError(
+                    f"machines.{machine_name}.pin_cpus must contain exactly "
+                    f"{machine['vcpus']} CPU(s)"
+                )
         if machine.get("exclusive") is not True:
             raise ConfigError(f"machines.{machine_name}.exclusive must be true")
         frequency = machine.get("frequency")
