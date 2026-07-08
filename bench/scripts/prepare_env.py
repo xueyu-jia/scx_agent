@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -32,6 +34,11 @@ DEFAULT_CLOUD_IMAGE = Path("/var/lib/libvirt/images/scx-bench-cloudimg.qcow2")
 DEFAULT_SEED_IMAGE = Path("/var/lib/libvirt/images/scx-bench-seed.iso")
 DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 DEFAULT_KERNEL_DIR = Path("/var/lib/libvirt/scx-bench-kernels")
+QEMU_CONF = Path("/etc/libvirt/qemu.conf")
+QEMU_CONF_BACKUP = Path("/etc/libvirt/qemu.conf.scx-bench.bak")
+QEMU_CONF_MISSING_MARKER = Path("/etc/libvirt/qemu.conf.scx-bench.missing")
+QEMU_CONF_BEGIN = "# BEGIN scx-bench qemu user"
+QEMU_CONF_END = "# END scx-bench qemu user"
 DEFAULT_IMAGE_URL = (
     "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/jammy/current/"
     "jammy-server-cloudimg-amd64.img"
@@ -72,6 +79,13 @@ DEFAULT_WORKLOADS = (
 )
 
 
+def _default_user_home() -> Path:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        return Path(pwd.getpwnam(sudo_user).pw_dir)
+    return Path.home()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare a local scx benchmark environment")
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -86,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--seed-image", default=str(DEFAULT_SEED_IMAGE))
     init.add_argument("--image-url", default=DEFAULT_IMAGE_URL)
     init.add_argument("--image-size", default="40G")
-    init.add_argument("--ssh-key", default=str(Path.home() / ".ssh" / "scx-bench"))
+    init.add_argument("--ssh-key", default=str(_default_user_home() / ".ssh" / "scx-bench"))
     init.add_argument("--workdir", default=str(REPO_ROOT))
     init.add_argument("--workloads", nargs="*", default=list(DEFAULT_WORKLOADS))
     init.add_argument("--force", action="store_true")
@@ -99,12 +113,17 @@ def main(argv: list[str] | None = None) -> int:
     verify = subparsers.add_parser("verify", help="verify generated local environment")
     verify.add_argument("--config", default=str(DEFAULT_CONFIG))
 
+    restore = subparsers.add_parser("restore", help="restore libvirt/qemu settings changed by init")
+    restore.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args(argv)
     try:
         if args.action == "init":
             return init_environment(args)
         if args.action == "verify":
             return verify_environment(args)
+        if args.action == "restore":
+            return restore_environment(args)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -149,6 +168,7 @@ def init_environment(args: argparse.Namespace) -> int:
         isolated_cpus=isolated_cpus,
     )
     _write_config(config_path, local_config, force=args.force, dry_run=args.dry_run)
+    _prepare_qemu_user_config(dry_run=args.dry_run)
     _prepare_runtime_dir(local_config["libvirt"], dry_run=args.dry_run)
 
     if not args.skip_workloads:
@@ -194,6 +214,7 @@ def verify_environment(args: argparse.Namespace) -> int:
             raise RuntimeError(f"missing {name}: {libvirt.get(name)}")
 
     _require_libvirt(libvirt)
+    _verify_qemu_user_config()
     _verify_isolation(config)
     _verify_workloads()
 
@@ -201,14 +222,18 @@ def verify_environment(args: argparse.Namespace) -> int:
     return 0
 
 
+def restore_environment(args: argparse.Namespace) -> int:
+    _restore_qemu_user_config(dry_run=args.dry_run)
+    print("libvirt/qemu config restored")
+    return 0
+
+
 def _required_commands_for_init(args: argparse.Namespace) -> dict[str, str]:
-    commands: dict[str, str] = {}
+    commands: dict[str, str] = {"sudo": "sudo"}
     if not args.skip_workloads:
         commands.update({"git": "git", "make": "make"})
     if not args.skip_image:
         commands.update(REQUIRED_COMMANDS)
-    if not args.skip_isolation:
-        commands.update({"sudo": "sudo"})
     return commands
 
 
@@ -290,7 +315,7 @@ def _build_local_config(
         **data.get("libvirt", {}),
         "uri": "qemu:///system",
         "kernel": str(kernel),
-        "kernel_args": "root=/dev/vda1 console=ttyS0",
+        "kernel_args": "root=/dev/vda1 console=ttyS0 systemd.mask=boot-efi.mount",
         "kernel_source": str(kernel_source),
         "initrd": None,
         "root_image": str(root_image),
@@ -302,6 +327,7 @@ def _build_local_config(
         "workdir": str(workdir),
         "guest_output_dir": "/scx_bench_out",
         "emulator_cpus": emulator_cpus,
+        "boot_timeout_seconds": 30,
         "timeout_extra_seconds": 120,
         "destroy_on_exit": True,
         "cpu_mode": "host-passthrough",
@@ -384,7 +410,9 @@ def _prepare_base_image(
 def _prepare_runtime_dir(libvirt: dict[str, Any], dry_run: bool) -> None:
     runtime_dir = Path(libvirt.get("runtime_dir", DEFAULT_RUNTIME_DIR))
     _run_sudo(["mkdir", "-p", str(runtime_dir)], dry_run=dry_run)
-    _run_sudo(["chmod", "1777", str(runtime_dir)], dry_run=dry_run)
+    user, group = _benchmark_user_group()
+    _run_sudo(["chown", f"{user}:{group}", str(runtime_dir)], dry_run=dry_run)
+    _run_sudo(["chmod", "0775", str(runtime_dir)], dry_run=dry_run)
 
 
 def _ensure_libvirt_runtime(libvirt: dict[str, Any], dry_run: bool) -> None:
@@ -403,6 +431,152 @@ def _ensure_libvirt_runtime(libvirt: dict[str, Any], dry_run: bool) -> None:
             dry_run=dry_run,
             check=False,
         )
+
+
+def _prepare_qemu_user_config(dry_run: bool) -> None:
+    user, group = _benchmark_user_group()
+    original = _read_optional_root_file(QEMU_CONF, dry_run=dry_run)
+    _backup_qemu_conf(existed=original is not None, dry_run=dry_run)
+    updated = _qemu_conf_with_managed_block(original or "", user=user, group=group)
+    _write_root_file(QEMU_CONF, updated, dry_run=dry_run)
+    _restart_libvirt(dry_run=dry_run)
+
+
+def _restore_qemu_user_config(dry_run: bool) -> None:
+    if QEMU_CONF_BACKUP.exists():
+        _run_sudo(["cp", "-a", str(QEMU_CONF_BACKUP), str(QEMU_CONF)], dry_run=dry_run)
+        _run_sudo(["rm", "-f", str(QEMU_CONF_BACKUP), str(QEMU_CONF_MISSING_MARKER)], dry_run=dry_run)
+    elif QEMU_CONF_MISSING_MARKER.exists():
+        _run_sudo(["rm", "-f", str(QEMU_CONF), str(QEMU_CONF_MISSING_MARKER)], dry_run=dry_run)
+    else:
+        print(f"no scx-bench qemu.conf backup found: {QEMU_CONF_BACKUP}")
+    _restart_libvirt(dry_run=dry_run)
+
+
+def _backup_qemu_conf(existed: bool, dry_run: bool) -> None:
+    if QEMU_CONF_BACKUP.exists() or QEMU_CONF_MISSING_MARKER.exists():
+        return
+    if existed:
+        _run_sudo(["cp", "-a", str(QEMU_CONF), str(QEMU_CONF_BACKUP)], dry_run=dry_run)
+    else:
+        _run_sudo(["install", "-D", "-m", "0644", "/dev/null", str(QEMU_CONF_MISSING_MARKER)], dry_run=dry_run)
+
+
+def _qemu_conf_with_managed_block(text: str, user: str, group: str) -> str:
+    lines: list[str] = []
+    in_managed_block = False
+    for line in text.splitlines():
+        if line.strip() == QEMU_CONF_BEGIN:
+            in_managed_block = True
+            continue
+        if line.strip() == QEMU_CONF_END:
+            in_managed_block = False
+            continue
+        if not in_managed_block:
+            lines.append(line)
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.extend(
+        [
+            "",
+            QEMU_CONF_BEGIN,
+            f'user = "{user}"',
+            f'group = "{group}"',
+            "dynamic_ownership = 1",
+            QEMU_CONF_END,
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _verify_qemu_user_config() -> None:
+    user, group = _benchmark_user_group()
+    text = _read_optional_root_file(QEMU_CONF, dry_run=False)
+    if text is None:
+        raise RuntimeError(f"missing libvirt qemu config: {QEMU_CONF}")
+    values = _parse_qemu_conf_values(text)
+    expected = {
+        "user": user,
+        "group": group,
+        "dynamic_ownership": "1",
+    }
+    mismatched = [
+        f"{key}={values.get(key)!r}, expected {value!r}"
+        for key, value in expected.items()
+        if values.get(key) != value
+    ]
+    if mismatched:
+        raise RuntimeError(
+            "libvirt qemu user config is not prepared: "
+            + "; ".join(mismatched)
+            + "; run: python3 bench/scripts/prepare_env.py init --kernel-source <path> --force"
+        )
+
+
+def _parse_qemu_conf_values(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in {"user", "group", "dynamic_ownership"}:
+            continue
+        values[key] = value.strip().strip('"')
+    return values
+
+
+def _benchmark_user_group() -> tuple[str, str]:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        user_info = pwd.getpwnam(sudo_user)
+    else:
+        user_info = pwd.getpwuid(os.getuid())
+    try:
+        qemu_group = grp.getgrnam("kvm").gr_name
+    except KeyError:
+        qemu_group = grp.getgrgid(user_info.pw_gid).gr_name
+    return user_info.pw_name, qemu_group
+
+
+def _read_optional_root_file(path: Path, dry_run: bool) -> str | None:
+    if dry_run:
+        print(f"would read {path}")
+        try:
+            return path.read_text(encoding="utf-8") if path.exists() else None
+        except OSError as exc:
+            print(f"would need sudo to read {path}: {exc}")
+            return None
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        command = _sudo_command(["cat", str(path)])
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        return completed.stdout
+
+
+def _write_root_file(path: Path, text: str, dry_run: bool) -> None:
+    if dry_run:
+        print(f"would write {path}:")
+        print(text)
+        return
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        tmp.write(text)
+        tmp_path = Path(tmp.name)
+    try:
+        _run_sudo(["install", "-D", "-m", "0644", str(tmp_path), str(path)], dry_run=False)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _restart_libvirt(dry_run: bool) -> None:
+    if shutil.which("systemctl") is None:
+        return
+    _run_sudo(["systemctl", "restart", "libvirtd"], dry_run=dry_run)
 
 
 def _download_cloud_image(url: str, path: Path, dry_run: bool) -> None:
@@ -501,11 +675,43 @@ def _initialize_base_vm(libvirt: dict[str, Any], seed_image: Path, dry_run: bool
     host = _wait_for_domain_ip(libvirt, name)
     _wait_for_ssh(libvirt, host)
     _ssh(libvirt, host, "cloud-init status --wait")
+    _sanitize_guest_image(libvirt, host)
     _sync_repo_to_guest(libvirt, host)
     _ssh(libvirt, host, "sync && poweroff", check=False)
     time.sleep(5)
     _run_sudo(["virsh", "--connect", libvirt["uri"], "destroy", name], dry_run=False, check=False)
     _run_sudo(["virsh", "--connect", libvirt["uri"], "undefine", name], dry_run=False, check=False)
+
+
+def _sanitize_guest_image(libvirt: dict[str, Any], host: str) -> None:
+    # Direct kernel boot does not need the guest EFI partition. If the matching
+    # filesystem modules are unavailable, systemd drops into emergency mode.
+    _ssh(
+        libvirt,
+        host,
+        r"sed -i.bak '\|[[:space:]]/boot/efi[[:space:]]|s|^|# scx-bench disabled: |' /etc/fstab",
+    )
+    _ssh(
+        libvirt,
+        host,
+        r"""cat > /etc/netplan/01-scx-bench.yaml <<'EOF'
+network:
+  version: 2
+  ethernets:
+    scxbench:
+      match:
+        name: "e*"
+      dhcp4: true
+      dhcp6: false
+      optional: true
+EOF
+chmod 600 /etc/netplan/01-scx-bench.yaml
+rm -f /etc/netplan/50-cloud-init.yaml
+systemctl mask systemd-networkd-wait-online.service
+systemctl disable --now snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service 2>/dev/null || true
+systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service 2>/dev/null || true
+""",
+    )
 
 
 def _sync_repo_to_guest(libvirt: dict[str, Any], host: str) -> None:
@@ -715,9 +921,14 @@ def _format_cpu_list(cpus: list[int]) -> str:
 
 
 def _run_sudo(command: list[str], dry_run: bool, check: bool = True) -> None:
-    if os.geteuid() != 0:
-        command = ["sudo", *command]
+    command = _sudo_command(command)
     _run(command, dry_run=dry_run, check=check)
+
+
+def _sudo_command(command: list[str]) -> list[str]:
+    if os.geteuid() != 0:
+        return ["sudo", *command]
+    return command
 
 
 def _run(command: list[str], dry_run: bool, check: bool = True) -> None:

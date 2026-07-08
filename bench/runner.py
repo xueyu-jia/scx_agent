@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import shlex
 import shutil
@@ -13,7 +14,8 @@ from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree as ET
 
-from bench.collectors.guest import GUEST_OUTPUT_DIR, parse_bench_metrics, write_guest_script
+from bench.collectors.guest import GUEST_OUTPUT_DIR, write_guest_script
+from bench.metrics import load_bench_metrics
 
 from bench.config.parser import RunSpec, parse_cpu_list
 
@@ -24,6 +26,10 @@ DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 
 class PreflightError(RuntimeError):
     """Raised when host isolation requirements are not satisfied."""
+
+
+class BootTimeout(RuntimeError):
+    """Raised when the guest does not become reachable after VM start."""
 
 
 def run_specs(
@@ -93,18 +99,17 @@ def _run_one(
         spec.bench.get("env", {}),
         scheduler=scheduler,
         output_dir=guest_output_dir,
+        vm_warmup_seconds=_vm_warmup_seconds(spec),
+        bench_warmup_seconds=_bench_warmup_seconds(spec),
+        bench_cooldown_seconds=_bench_cooldown_seconds(spec),
     )
     domain_name = _domain_name(label, spec, run_dir)
     runtime_dir = _runtime_run_dir(spec.libvirt, domain_name)
     overlay_path = runtime_dir / "disk.qcow2"
-    serial_path = runtime_dir / "serial.log"
-    console_path = runtime_dir / "console.log"
     domain_xml = _domain_xml(
         spec,
         domain_name,
         overlay_path,
-        serial_path,
-        console_path,
         placement,
     )
     domain_xml_path = run_dir / "domain.xml"
@@ -119,6 +124,7 @@ def _run_one(
         "runtime_overlay": str(overlay_path),
         "dry_run": dry_run,
         "placement": placement,
+        "warmup": _warmup_metadata(spec, scheduler),
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -161,11 +167,10 @@ def _run_one(
         domain_name,
         domain_xml_path,
         overlay_path,
-        serial_path,
-        console_path,
         guest_script,
         guest_output_dir,
-        timeout=_vm_timeout(spec),
+        timeout=_vm_timeout(spec, scheduler),
+        boot_timeout=_boot_timeout(spec),
         progress_interval=progress_interval,
         heartbeat=lambda elapsed: _emit_progress(
             progress_callback,
@@ -185,7 +190,7 @@ def _run_one(
     (run_dir / "libvirt_stderr.log").write_text(libvirt_stderr, encoding="utf-8")
 
     guest_result = _read_guest_result(run_dir / "guest_result.json")
-    bench_metrics = parse_bench_metrics(run_dir / "stdout.log")
+    bench_metrics = load_bench_metrics(run_dir / "stdout.log")
     _write_json(run_dir / "bench_metrics.json", bench_metrics)
 
     if status is None:
@@ -223,26 +228,25 @@ def _run_libvirt(
     domain_name: str,
     domain_xml_path: Path,
     overlay_path: Path,
-    serial_path: Path,
-    console_path: Path,
     guest_script: Path,
     guest_output_dir: str,
     timeout: int | None,
+    boot_timeout: int,
     progress_interval: int,
     heartbeat: Callable[[float], None],
 ) -> dict[str, Any]:
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     libvirt = spec.libvirt
+    status: str | None = None
+    returncode: int | None = None
     try:
         _prepare_runtime_dir(runtime_dir, stdout_parts, stderr_parts)
-        _prepare_runtime_log(serial_path, stdout_parts, stderr_parts)
-        _prepare_runtime_log(console_path, stdout_parts, stderr_parts)
         _create_overlay(libvirt, overlay_path, stdout_parts, stderr_parts)
         _run_command(_virsh(libvirt, ["define", str(domain_xml_path)]), stdout_parts, stderr_parts)
         _run_command(_virsh(libvirt, ["start", domain_name]), stdout_parts, stderr_parts)
 
-        host, port = _wait_for_ssh(libvirt, domain_name, timeout, progress_interval, heartbeat)
+        host, port = _wait_for_ssh(libvirt, domain_name, boot_timeout, progress_interval, heartbeat)
         _scp_to_guest(libvirt, host, port, guest_script, "/tmp/scx-bench-run.sh", stdout_parts, stderr_parts)
         completed = _run_guest_command(
             libvirt,
@@ -255,39 +259,47 @@ def _run_libvirt(
             stdout_parts,
             stderr_parts,
         )
-        _scp_from_guest(
+        _copy_guest_output(
             libvirt,
             host,
             port,
-            f"{guest_output_dir}/.",
+            guest_output_dir,
             run_dir,
             stdout_parts,
             stderr_parts,
         )
-        return {
-            "status": None,
-            "returncode": completed.returncode,
-            "stdout": "".join(stdout_parts),
-            "stderr": "".join(stderr_parts),
-        }
+        returncode = completed.returncode
     except FileNotFoundError as exc:
-        return _libvirt_result("LIBVIRT_TOOL_NOT_FOUND", None, stdout_parts, [*stderr_parts, str(exc)])
-    except subprocess.TimeoutExpired as exc:
-        stderr_parts.append(_ensure_text(exc.stderr))
-        stdout_parts.append(_ensure_text(exc.stdout))
-        return _libvirt_result("TIMEOUT", None, stdout_parts, stderr_parts)
-    except subprocess.CalledProcessError as exc:
-        stdout_parts.append(_ensure_text(exc.stdout))
-        stderr_parts.append(_ensure_text(exc.stderr))
-        return _libvirt_result("LIBVIRT_FAILED", exc.returncode, stdout_parts, stderr_parts)
-    except RuntimeError as exc:
+        status = "LIBVIRT_TOOL_NOT_FOUND"
         stderr_parts.append(str(exc))
-        return _libvirt_result("LIBVIRT_FAILED", None, stdout_parts, stderr_parts)
+    except BootTimeout as exc:
+        status = "BOOT_TIMEOUT"
+        stderr_parts.append(str(exc))
+    except subprocess.TimeoutExpired as exc:
+        status = "TIMEOUT"
+        stderr_parts.append(_ensure_text(exc.stderr))
+        stdout_parts.append(_ensure_text(exc.stdout))
+    except subprocess.CalledProcessError as exc:
+        status = "LIBVIRT_FAILED"
+        returncode = exc.returncode
+        stdout_parts.append(_ensure_text(exc.stdout))
+        stderr_parts.append(_ensure_text(exc.stderr))
+    except RuntimeError as exc:
+        status = "LIBVIRT_FAILED"
+        stderr_parts.append(str(exc))
     finally:
-        if libvirt.get("destroy_on_exit", True):
-            _cleanup_domain(libvirt, domain_name, stdout_parts, stderr_parts)
-        _copy_runtime_artifacts(runtime_dir, run_dir, stdout_parts, stderr_parts)
-        _cleanup_runtime_dir(runtime_dir, stdout_parts, stderr_parts)
+        try:
+            if libvirt.get("destroy_on_exit", True):
+                _cleanup_domain(libvirt, domain_name, stdout_parts, stderr_parts)
+                _cleanup_runtime_dir(runtime_dir, stdout_parts, stderr_parts)
+            else:
+                stdout_parts.append(f"+ preserve runtime dir {runtime_dir}\n")
+        except RuntimeError as exc:
+            if status is None:
+                status = "LIBVIRT_FAILED"
+            stderr_parts.append(str(exc))
+
+    return _libvirt_result(status, returncode, stdout_parts, stderr_parts)
 
 
 def _run_guest_command(
@@ -309,60 +321,95 @@ def _run_guest_command(
     )
     command = _ssh_command(libvirt, host, port, remote)
     started_at = time.monotonic()
+    last_heartbeat_at = started_at
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
     while True:
-        wait_seconds = _next_wait_seconds(started_at, timeout, progress_interval)
-        if wait_seconds is not None and wait_seconds <= 0:
-            raise subprocess.TimeoutExpired(command, timeout)
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=wait_seconds,
-            )
-            stdout_parts.append(completed.stdout)
-            stderr_parts.append(completed.stderr)
-            return completed
-        except subprocess.TimeoutExpired as exc:
-            stdout_parts.append(_ensure_text(exc.stdout))
-            stderr_parts.append(_ensure_text(exc.stderr))
-            elapsed = time.monotonic() - started_at
-            if timeout is not None and elapsed >= timeout:
-                raise
+        returncode = process.poll()
+        if returncode is not None:
+            stdout, stderr = process.communicate()
+            stdout_parts.append(stdout)
+            stderr_parts.append(stderr)
+            return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+        now = time.monotonic()
+        elapsed = now - started_at
+        if timeout is not None and elapsed >= timeout:
+            _kill_process_group(process)
+            stdout, stderr = process.communicate()
+            stdout_parts.append(stdout)
+            stderr_parts.append(stderr)
+            raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+
+        if progress_interval > 0 and now - last_heartbeat_at >= progress_interval:
             heartbeat(elapsed)
+            last_heartbeat_at = now
+
+        sleep_for = 1.0
+        if timeout is not None:
+            sleep_for = min(sleep_for, max(0.1, timeout - elapsed))
+        time.sleep(sleep_for)
 
 
-def _next_wait_seconds(
-    started_at: float,
-    timeout: int | None,
-    progress_interval: int,
-) -> float | None:
-    if progress_interval <= 0:
-        return None if timeout is None else timeout - (time.monotonic() - started_at)
-    if timeout is None:
-        return progress_interval
-    remaining = timeout - (time.monotonic() - started_at)
-    return min(progress_interval, remaining)
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, 9)
+    except ProcessLookupError:
+        return
 
 
 def _bench_command(spec: RunSpec) -> list[str]:
     return [spec.bench["command"], *spec.bench.get("args", [])]
 
 
-def _vm_timeout(spec: RunSpec) -> int | None:
+def _vm_timeout(spec: RunSpec, scheduler: dict[str, Any]) -> int | None:
     bench_timeout = spec.bench.get("timeout_seconds")
     if bench_timeout is None:
         return None
-    return bench_timeout + spec.libvirt.get("timeout_extra_seconds", 120)
+    warmup_timeout = (
+        _vm_warmup_seconds(spec)
+        + int(scheduler.get("warmup_seconds", 0))
+        + _bench_warmup_seconds(spec)
+        + _bench_cooldown_seconds(spec)
+    )
+    return bench_timeout + warmup_timeout + spec.libvirt.get("timeout_extra_seconds", 120)
+
+
+def _boot_timeout(spec: RunSpec) -> int:
+    return int(spec.libvirt.get("boot_timeout_seconds", 10))
+
+
+def _vm_warmup_seconds(spec: RunSpec) -> int:
+    return int(spec.libvirt.get("vm_warmup_seconds", 0))
+
+
+def _bench_warmup_seconds(spec: RunSpec) -> int:
+    return int(spec.bench.get("warmup_seconds", 0))
+
+
+def _bench_cooldown_seconds(spec: RunSpec) -> int:
+    return int(spec.bench.get("cooldown_seconds", 0))
+
+
+def _warmup_metadata(spec: RunSpec, scheduler: dict[str, Any]) -> dict[str, int]:
+    return {
+        "vm_warmup_seconds": _vm_warmup_seconds(spec),
+        "scheduler_warmup_seconds": int(scheduler.get("warmup_seconds", 0)),
+        "bench_warmup_seconds": _bench_warmup_seconds(spec),
+        "bench_cooldown_seconds": _bench_cooldown_seconds(spec),
+    }
 
 
 def _domain_xml(
     spec: RunSpec,
     domain_name: str,
     overlay_path: Path,
-    serial_path: Path,
-    console_path: Path,
     placement: dict[str, Any] | None,
 ) -> str:
     libvirt = spec.libvirt
@@ -409,14 +456,6 @@ def _domain_xml(
         ET.SubElement(interface, "source", {"network": libvirt.get("network", "default")})
         ET.SubElement(interface, "model", {"type": "virtio"})
 
-    serial = ET.SubElement(devices, "serial", {"type": "file"})
-    ET.SubElement(serial, "source", {"path": str(serial_path.resolve())})
-    ET.SubElement(serial, "target", {"port": "0"})
-
-    console = ET.SubElement(devices, "console", {"type": "file"})
-    ET.SubElement(console, "source", {"path": str(console_path.resolve())})
-    ET.SubElement(console, "target", {"type": "serial", "port": "0"})
-
     ET.indent(domain)
     return ET.tostring(domain, encoding="unicode") + "\n"
 
@@ -455,38 +494,10 @@ def _prepare_runtime_dir(
     stderr_parts: list[str],
 ) -> None:
     if runtime_dir.exists():
-        shutil.rmtree(runtime_dir)
+        _remove_path(runtime_dir, stdout_parts, stderr_parts)
     runtime_dir.mkdir(parents=True, exist_ok=False)
     runtime_dir.chmod(0o777)
     stdout_parts.append(f"+ prepare runtime dir {runtime_dir}\n")
-
-
-def _prepare_runtime_log(
-    path: Path,
-    stdout_parts: list[str],
-    stderr_parts: list[str],
-) -> None:
-    path.touch()
-    path.chmod(0o666)
-    stdout_parts.append(f"+ prepare runtime log {path}\n")
-
-
-def _copy_runtime_artifacts(
-    runtime_dir: Path,
-    run_dir: Path,
-    stdout_parts: list[str],
-    stderr_parts: list[str],
-) -> None:
-    for name in ("serial.log", "console.log"):
-        src = runtime_dir / name
-        if not src.exists():
-            continue
-        dst = run_dir / name
-        try:
-            shutil.copy2(src, dst)
-            stdout_parts.append(f"+ copy runtime artifact {src} {dst}\n")
-        except OSError as exc:
-            stderr_parts.append(f"failed to copy runtime artifact {src}: {exc}\n")
 
 
 def _cleanup_runtime_dir(
@@ -496,11 +507,7 @@ def _cleanup_runtime_dir(
 ) -> None:
     if not runtime_dir.exists():
         return
-    try:
-        shutil.rmtree(runtime_dir)
-        stdout_parts.append(f"+ cleanup runtime dir {runtime_dir}\n")
-    except OSError as exc:
-        stderr_parts.append(f"failed to cleanup runtime dir {runtime_dir}: {exc}\n")
+    _remove_path(runtime_dir, stdout_parts, stderr_parts)
 
 
 def _wait_for_ssh(
@@ -513,20 +520,30 @@ def _wait_for_ssh(
     configured_host = libvirt.get("ssh_host")
     port = int(libvirt.get("ssh_port", 22))
     started_at = time.monotonic()
+    last_heartbeat_at = started_at
+    poll_interval = 1.0
 
     while True:
         host = configured_host or _domain_ip(libvirt, domain_name)
-        if host and _ssh_probe(libvirt, host, port):
+        elapsed = time.monotonic() - started_at
+        remaining = None if timeout is None else max(0.1, timeout - elapsed)
+        probe_timeout = 1 if remaining is None else min(1, remaining)
+        if host and _ssh_probe(libvirt, host, port, probe_timeout):
             return host, port
 
         elapsed = time.monotonic() - started_at
         if timeout is not None and elapsed >= timeout:
-            raise subprocess.TimeoutExpired(["ssh", domain_name], timeout)
-        heartbeat(elapsed)
-        sleep_for = progress_interval if progress_interval > 0 else 5
+            raise BootTimeout(f"guest SSH did not become ready for domain {domain_name}")
+
+        now = time.monotonic()
+        if progress_interval > 0 and now - last_heartbeat_at >= progress_interval:
+            heartbeat(elapsed)
+            last_heartbeat_at = now
+
+        sleep_for = poll_interval
         if timeout is not None:
-            sleep_for = min(sleep_for, max(1, int(timeout - elapsed)))
-        time.sleep(max(1, sleep_for))
+            sleep_for = min(sleep_for, max(0.1, timeout - elapsed))
+        time.sleep(sleep_for)
 
 
 def _domain_ip(libvirt: dict[str, Any], domain_name: str) -> str | None:
@@ -543,15 +560,36 @@ def _domain_ip(libvirt: dict[str, Any], domain_name: str) -> str | None:
     return None
 
 
-def _ssh_probe(libvirt: dict[str, Any], host: str, port: int) -> bool:
-    completed = subprocess.run(
-        _ssh_command(libvirt, host, port, "true"),
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    return completed.returncode == 0
+def _ssh_probe(libvirt: dict[str, Any], host: str, port: int, timeout: int) -> bool:
+    try:
+        completed = subprocess.run(
+            _ssh_command(libvirt, host, port, "true"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return completed.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _remove_path(
+    path: Path,
+    stdout_parts: list[str],
+    stderr_parts: list[str],
+) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        stdout_parts.append(f"+ remove path {path}\n")
+    except OSError as exc:
+        raise RuntimeError(
+            f"runtime path is not removable: {path}: {exc}; "
+            "run prepare_env.py init to configure libvirt/qemu as the benchmark user"
+        ) from exc
 
 
 def _scp_to_guest(
@@ -567,17 +605,34 @@ def _scp_to_guest(
     _run_command([*_scp_base(libvirt, port), str(src), target], stdout_parts, stderr_parts)
 
 
-def _scp_from_guest(
+def _copy_guest_output(
     libvirt: dict[str, Any],
     host: str,
     port: int,
-    src: str,
+    guest_output_dir: str,
     dst: Path,
     stdout_parts: list[str],
     stderr_parts: list[str],
 ) -> None:
-    source = f"{libvirt['ssh_user']}@{host}:{src}"
-    _run_command([*_scp_base(libvirt, port), "-r", source, str(dst)], stdout_parts, stderr_parts)
+    remote = f"tar -C {shlex.quote(guest_output_dir)} -cf - ."
+    ssh_command = _ssh_command(libvirt, host, port, remote)
+    stdout_parts.append(f"+ {shlex.join(ssh_command)} | tar -C {shlex.quote(str(dst))} -xf -\n")
+    remote_tar = subprocess.run(
+        ssh_command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stderr_parts.append(_ensure_text(remote_tar.stderr))
+    local_tar = subprocess.run(
+        ["tar", "-C", str(dst), "-xf", "-"],
+        input=remote_tar.stdout,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout_parts.append(_ensure_text(local_tar.stdout))
+    stderr_parts.append(_ensure_text(local_tar.stderr))
 
 
 def _ssh_command(libvirt: dict[str, Any], host: str, port: int, remote_command: str) -> list[str]:
@@ -651,7 +706,7 @@ def _cleanup_domain(
 
 
 def _libvirt_result(
-    status: str,
+    status: str | None,
     returncode: int | None,
     stdout_parts: list[str],
     stderr_parts: list[str],

@@ -24,6 +24,7 @@ VALID_DIRECTIONS = {"higher", "lower"}
 VALID_CHARTS = {"delta_bar", "latency_bar", "summary_table"}
 VALID_SCHEDULER_KINDS = {"builtin", "scx"}
 VALID_MACHINE_KEYS = {"vcpus", "memory", "pin_cpus", "exclusive", "frequency"}
+VALID_BENCH_DEFAULT_KEYS = {"warmup_seconds", "cooldown_seconds"}
 VALID_EXECUTOR_KEYS = {
     "parallel",
     "cpu_source",
@@ -49,6 +50,8 @@ VALID_LIBVIRT_KEYS = {
     "guest_output_dir",
     "emulator_cpus",
     "timeout_extra_seconds",
+    "boot_timeout_seconds",
+    "vm_warmup_seconds",
     "destroy_on_exit",
     "cpu_mode",
 }
@@ -101,6 +104,7 @@ def validate_config(config: dict[str, Any]) -> None:
     _validate_machines(config)
     _validate_suites(config)
     _validate_metric_profiles(config)
+    _validate_bench_defaults(config)
     _validate_benches(config)
 
 
@@ -134,7 +138,7 @@ def expand_plan(config: dict[str, Any], plan_name: str) -> list[RunSpec]:
                             metric_profile_name=metric_profile_name,
                             machine=machine,
                             suite=suite,
-                            bench=config["benches"][bench_name],
+                            bench=_bench_with_defaults(config, bench_name),
                             metric_profile=metric_profile,
                             libvirt=config["libvirt"],
                         )
@@ -210,6 +214,14 @@ def _validate_libvirt(config: dict[str, Any]) -> None:
     if not isinstance(timeout_extra, int) or timeout_extra < 0:
         raise ConfigError("libvirt.timeout_extra_seconds must be a non-negative integer")
 
+    boot_timeout = libvirt.get("boot_timeout_seconds", 10)
+    if not isinstance(boot_timeout, int) or boot_timeout < 1:
+        raise ConfigError("libvirt.boot_timeout_seconds must be a positive integer")
+
+    vm_warmup = libvirt.get("vm_warmup_seconds", 0)
+    if not isinstance(vm_warmup, int) or vm_warmup < 0:
+        raise ConfigError("libvirt.vm_warmup_seconds must be a non-negative integer")
+
     destroy_on_exit = libvirt.get("destroy_on_exit", True)
     if not isinstance(destroy_on_exit, bool):
         raise ConfigError("libvirt.destroy_on_exit must be a boolean")
@@ -243,6 +255,12 @@ def _validate_schedulers(config: dict[str, Any]) -> None:
         for key, value in env.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ConfigError(f"schedulers.{scheduler_name}.env entries must be string:string")
+
+        warmup = scheduler.get("warmup_seconds", 0)
+        if not isinstance(warmup, int) or warmup < 0:
+            raise ConfigError(
+                f"schedulers.{scheduler_name}.warmup_seconds must be a non-negative integer"
+            )
 
 
 def _validate_executor(config: dict[str, Any]) -> None:
@@ -406,6 +424,16 @@ def _validate_metric_profiles(config: dict[str, Any]) -> None:
                 raise ConfigError(f"metric_profiles.{profile_name}.secondary entries must be strings")
 
 
+def _validate_bench_defaults(config: dict[str, Any]) -> None:
+    defaults = config.get("bench_defaults", {})
+    if not isinstance(defaults, dict):
+        raise ConfigError("bench_defaults must be a mapping")
+    unknown_keys = set(defaults) - VALID_BENCH_DEFAULT_KEYS
+    if unknown_keys:
+        raise ConfigError(f"bench_defaults has unsupported keys: {sorted(unknown_keys)}")
+    _validate_non_negative_seconds(defaults, "bench_defaults", VALID_BENCH_DEFAULT_KEYS)
+
+
 def _validate_benches(config: dict[str, Any]) -> None:
     for bench_name, bench in config["benches"].items():
         if not isinstance(bench, dict):
@@ -424,12 +452,36 @@ def _validate_benches(config: dict[str, Any]) -> None:
         if timeout is not None and (not isinstance(timeout, int) or timeout < 1):
             raise ConfigError(f"benches.{bench_name}.timeout_seconds must be a positive integer")
 
+        _validate_non_negative_seconds(
+            bench,
+            f"benches.{bench_name}",
+            ("warmup_seconds", "cooldown_seconds"),
+        )
+
         env = bench.get("env", {})
         if not isinstance(env, dict):
             raise ConfigError(f"benches.{bench_name}.env must be a mapping")
         for key, value in env.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ConfigError(f"benches.{bench_name}.env entries must be string:string")
+
+
+def _bench_with_defaults(config: dict[str, Any], bench_name: str) -> dict[str, Any]:
+    return {
+        **config.get("bench_defaults", {}),
+        **config["benches"][bench_name],
+    }
+
+
+def _validate_non_negative_seconds(
+    values: dict[str, Any],
+    prefix: str,
+    keys: tuple[str, ...] | set[str],
+) -> None:
+    for key in keys:
+        value = values.get(key, 0)
+        if not isinstance(value, int) or value < 0:
+            raise ConfigError(f"{prefix}.{key} must be a non-negative integer")
 
 
 def parse_cpu_list(value: str) -> list[int]:

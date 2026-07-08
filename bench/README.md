@@ -44,6 +44,13 @@ python3 bench/scripts/run.py \
 bench/configs/local.config
 ```
 
+它也会备份并修改 `/etc/libvirt/qemu.conf`，让 QEMU 以当前测试用户运行，
+避免 `run.py` 读取 VM runtime 文件时需要 sudo。恢复该设置：
+
+```bash
+python3 bench/scripts/prepare_env.py restore
+```
+
 `local.config` 不提交到 git。`run.py`、`isolation.py` 和
 `fetch_workloads.py` 默认都使用它。
 
@@ -154,6 +161,7 @@ bench/configs/example.config
 
 ```text
 libvirt         VM 内核、base image、SSH 和 libvirt 设置
+bench_defaults  benchmark 默认 warmup / cooldown 设置
 executor         pair 并行、自动 CPU pinning 和 host 资源策略
 schedulers       builtin 或 scx 调度器定义
 plans            smoke / full 等测试计划
@@ -174,6 +182,18 @@ schedulers:
     kind: scx
     command: bench/schedulers/scx_simple
     args: []
+    warmup_seconds: 2
+```
+
+warmup 当前使用 sleep 实现，正式 benchmark 的 before/after snapshot 只覆盖测量窗口：
+
+```yaml
+libvirt:
+  vm_warmup_seconds: 10
+
+bench_defaults:
+  warmup_seconds: 2
+  cooldown_seconds: 1
 ```
 
 某次实验使用哪个 baseline / candidate 由命令行指定：

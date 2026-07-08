@@ -107,6 +107,7 @@ Key responsibilities:
 
 - generate `bench/configs/local.config` from `example.config`;
 - derive `libvirt.emulator_cpus` and `executor.isolated_cpus` from host topology;
+- configure `/etc/libvirt/qemu.conf` so QEMU runs as the benchmark user;
 - generate the SSH key used by the guest;
 - call `fetch_workloads.py`;
 - create the libvirt base image;
@@ -114,6 +115,8 @@ Key responsibilities:
 - verify that the generated environment is usable.
 
 `prepare_env.py` owns machine-local setup. It does not run experiments.
+It also owns restoring the libvirt/QEMU user override through
+`prepare_env.py restore`.
 
 ### `bench/scripts/isolation.py`
 
@@ -170,12 +173,19 @@ Generates the shell script executed inside the libvirt guest.
 
 The guest script:
 
+- waits for VM-level warmup after SSH is ready;
 - starts the selected scheduler if `kind: scx`;
-- collects before/after snapshots;
+- waits for scheduler and benchmark warmup;
+- collects `before` snapshot;
 - runs the workload wrapper;
+- collects `after` snapshot;
+- waits for benchmark cooldown;
 - stops the scheduler;
 - writes `guest_result.json`;
 - stores dmesg delta and raw logs.
+
+Warmup and cooldown are outside the measured snapshot window. The benchmark
+wrapper's own metric JSON remains the source of workload performance metrics.
 
 Snapshots currently include:
 
@@ -199,6 +209,15 @@ normalized JSON.
 
 Specialized wrappers are used for tools such as `fio`, `schbench`, `perf bench
 sched`, `will-it-scale`, `cyclictest`, `kernel build`, and `redis-benchmark`.
+
+### `bench/metrics.py`
+
+Loads and validates benchmark wrapper output.
+
+Benchmark wrappers convert workload-native output into the framework metric
+JSON contract. `bench/metrics.py` reads that JSON from `stdout.log`, preserves
+the metrics, and records parse status such as `ok`, `empty_stdout`, or
+`non_json_stdout`.
 
 ### `bench/analysis/loader.py`
 

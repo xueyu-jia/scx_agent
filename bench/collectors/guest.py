@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shlex
 from pathlib import Path
 from typing import Any
@@ -14,10 +13,14 @@ def build_guest_script(
     env: dict[str, str] | None = None,
     scheduler: dict[str, Any] | None = None,
     output_dir: str = GUEST_OUTPUT_DIR,
+    vm_warmup_seconds: int = 0,
+    bench_warmup_seconds: int = 0,
+    bench_cooldown_seconds: int = 0,
 ) -> str:
     scheduler = scheduler or {"kind": "builtin"}
     command = _shell_command(bench_command, env or {})
     scheduler_command = _scheduler_command(scheduler)
+    scheduler_warmup_seconds = int(scheduler.get("warmup_seconds", 0))
 
     return f"""#!/bin/sh
 set +e
@@ -26,6 +29,10 @@ OUT={shlex.quote(output_dir)}
 BENCH_CMD={shlex.quote(command)}
 SCHEDULER_KIND={shlex.quote(str(scheduler.get("kind", "builtin")))}
 SCHEDULER_CMD={shlex.quote(scheduler_command)}
+VM_WARMUP_SECONDS={int(vm_warmup_seconds)}
+SCHEDULER_WARMUP_SECONDS={scheduler_warmup_seconds}
+BENCH_WARMUP_SECONDS={int(bench_warmup_seconds)}
+BENCH_COOLDOWN_SECONDS={int(bench_cooldown_seconds)}
 scheduler_pid=""
 scheduler_start_rc=0
 
@@ -102,28 +109,45 @@ stop_scheduler() {{
     fi
 }}
 
-snapshot before
-start_epoch="$(date +%s)"
+script_start_epoch="$(date +%s)"
 export SCX_BENCH_OUT="$OUT"
+
+if [ "$VM_WARMUP_SECONDS" -gt 0 ]; then
+    sleep "$VM_WARMUP_SECONDS"
+fi
 
 start_scheduler
 scheduler_start_rc="$?"
 
 if [ "$scheduler_start_rc" -eq 0 ]; then
+    if [ "$SCHEDULER_WARMUP_SECONDS" -gt 0 ]; then
+        sleep "$SCHEDULER_WARMUP_SECONDS"
+    fi
+    if [ "$BENCH_WARMUP_SECONDS" -gt 0 ]; then
+        sleep "$BENCH_WARMUP_SECONDS"
+    fi
+    snapshot before
+    start_epoch="$(date +%s)"
     (
         eval "$BENCH_CMD"
     ) > "$OUT/stdout.log" 2> "$OUT/stderr.log"
     bench_rc="$?"
+    end_epoch="$(date +%s)"
+    snapshot after
+    if [ "$BENCH_COOLDOWN_SECONDS" -gt 0 ]; then
+        sleep "$BENCH_COOLDOWN_SECONDS"
+    fi
 else
     bench_rc=125
+    start_epoch=0
+    end_epoch=0
     : > "$OUT/stdout.log"
     echo "scheduler failed to start" > "$OUT/stderr.log"
 fi
 
 stop_scheduler
 
-end_epoch="$(date +%s)"
-snapshot after
+script_end_epoch="$(date +%s)"
 
 if command -v diff >/dev/null 2>&1; then
     diff -u "$OUT/snapshots/before/dmesg.txt" "$OUT/snapshots/after/dmesg.txt" \\
@@ -134,8 +158,14 @@ cat > "$OUT/guest_result.json" <<EOF
 {{
   "scheduler_start_returncode": $scheduler_start_rc,
   "bench_returncode": $bench_rc,
+  "script_started_at_epoch": $script_start_epoch,
+  "script_finished_at_epoch": $script_end_epoch,
   "started_at_epoch": $start_epoch,
-  "finished_at_epoch": $end_epoch
+  "finished_at_epoch": $end_epoch,
+  "vm_warmup_seconds": $VM_WARMUP_SECONDS,
+  "scheduler_warmup_seconds": $SCHEDULER_WARMUP_SECONDS,
+  "bench_warmup_seconds": $BENCH_WARMUP_SECONDS,
+  "bench_cooldown_seconds": $BENCH_COOLDOWN_SECONDS
 }}
 EOF
 
@@ -149,53 +179,23 @@ def write_guest_script(
     env: dict[str, str] | None = None,
     scheduler: dict[str, Any] | None = None,
     output_dir: str = GUEST_OUTPUT_DIR,
+    vm_warmup_seconds: int = 0,
+    bench_warmup_seconds: int = 0,
+    bench_cooldown_seconds: int = 0,
 ) -> None:
     path.write_text(
-        build_guest_script(bench_command, env, scheduler, output_dir),
+        build_guest_script(
+            bench_command,
+            env,
+            scheduler,
+            output_dir,
+            vm_warmup_seconds,
+            bench_warmup_seconds,
+            bench_cooldown_seconds,
+        ),
         encoding="utf-8",
     )
     path.chmod(0o755)
-
-
-def parse_bench_metrics(stdout_path: Path) -> dict[str, Any]:
-    if not stdout_path.exists():
-        return {"metrics": {}, "metadata": {}, "parse_status": "missing_stdout"}
-
-    text = stdout_path.read_text(encoding="utf-8", errors="replace").strip()
-    if not text:
-        return {"metrics": {}, "metadata": {}, "parse_status": "empty_stdout"}
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        return {
-            "metrics": {},
-            "metadata": {},
-            "parse_status": "non_json_stdout",
-            "parse_error": str(exc),
-        }
-
-    if not isinstance(parsed, dict):
-        return {
-            "metrics": {},
-            "metadata": {},
-            "parse_status": "json_not_object",
-        }
-
-    if "metrics" in parsed:
-        metrics = parsed.get("metrics")
-        return {
-            "metrics": metrics if isinstance(metrics, dict) else {},
-            "metadata": parsed.get("metadata", {}) if isinstance(parsed.get("metadata", {}), dict) else {},
-            "raw": parsed.get("raw", {}),
-            "parse_status": "ok",
-        }
-
-    return {
-        "metrics": parsed,
-        "metadata": {},
-        "parse_status": "legacy_json_object",
-    }
 
 
 def _shell_command(command: list[str], env: dict[str, str]) -> str:
