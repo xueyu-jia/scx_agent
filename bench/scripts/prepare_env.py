@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import grp
 import os
 import pwd
 import shutil
@@ -34,11 +33,6 @@ DEFAULT_CLOUD_IMAGE = Path("/var/lib/libvirt/images/scx-bench-cloudimg.qcow2")
 DEFAULT_SEED_IMAGE = Path("/var/lib/libvirt/images/scx-bench-seed.iso")
 DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 DEFAULT_KERNEL_DIR = Path("/var/lib/libvirt/scx-bench-kernels")
-QEMU_CONF = Path("/etc/libvirt/qemu.conf")
-QEMU_CONF_BACKUP = Path("/etc/libvirt/qemu.conf.scx-bench.bak")
-QEMU_CONF_MISSING_MARKER = Path("/etc/libvirt/qemu.conf.scx-bench.missing")
-QEMU_CONF_BEGIN = "# BEGIN scx-bench qemu user"
-QEMU_CONF_END = "# END scx-bench qemu user"
 DEFAULT_IMAGE_URL = (
     "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/jammy/current/"
     "jammy-server-cloudimg-amd64.img"
@@ -113,7 +107,9 @@ def main(argv: list[str] | None = None) -> int:
     verify = subparsers.add_parser("verify", help="verify generated local environment")
     verify.add_argument("--config", default=str(DEFAULT_CONFIG))
 
-    restore = subparsers.add_parser("restore", help="restore libvirt/qemu settings changed by init")
+    restore = subparsers.add_parser("restore", help="restore host settings changed by init")
+    restore.add_argument("--config", default=str(DEFAULT_CONFIG))
+    restore.add_argument("--reboot", action="store_true", help="reboot after restoring isolation")
     restore.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(argv)
@@ -168,8 +164,7 @@ def init_environment(args: argparse.Namespace) -> int:
         isolated_cpus=isolated_cpus,
     )
     _write_config(config_path, local_config, force=args.force, dry_run=args.dry_run)
-    _prepare_qemu_user_config(dry_run=args.dry_run)
-    _prepare_runtime_dir(local_config["libvirt"], dry_run=args.dry_run)
+    _prepare_libvirt_env(config_path, dry_run=args.dry_run)
 
     if not args.skip_workloads:
         _fetch_workloads(config_path, args.workloads, dry_run=args.dry_run)
@@ -213,8 +208,7 @@ def verify_environment(args: argparse.Namespace) -> int:
         if not ok:
             raise RuntimeError(f"missing {name}: {libvirt.get(name)}")
 
-    _require_libvirt(libvirt)
-    _verify_qemu_user_config()
+    _verify_libvirt_env(config_path)
     _verify_isolation(config)
     _verify_workloads()
 
@@ -223,8 +217,9 @@ def verify_environment(args: argparse.Namespace) -> int:
 
 
 def restore_environment(args: argparse.Namespace) -> int:
-    _restore_qemu_user_config(dry_run=args.dry_run)
-    print("libvirt/qemu config restored")
+    _restore_libvirt_env(dry_run=args.dry_run)
+    _restore_isolation(Path(args.config), no_reboot=not args.reboot, dry_run=args.dry_run)
+    print("environment restored")
     return 0
 
 
@@ -327,7 +322,9 @@ def _build_local_config(
         "workdir": str(workdir),
         "guest_output_dir": "/scx_bench_out",
         "emulator_cpus": emulator_cpus,
-        "boot_timeout_seconds": 30,
+        "iothread_cpus": emulator_cpus,
+        "pin_vhost_threads": True,
+        "boot_timeout_seconds": 90,
         "timeout_extra_seconds": 120,
         "destroy_on_exit": True,
         "cpu_mode": "host-passthrough",
@@ -337,6 +334,7 @@ def _build_local_config(
         "parallel": "auto",
         "cpu_source": "isolated",
         "isolated_cpus": isolated_cpus,
+        "irq_cpus": emulator_cpus,
         "smt_policy": "use_all_siblings",
         "pair_policy": "sequential",
         "memory_guard_gb": 16,
@@ -391,8 +389,6 @@ def _prepare_base_image(
     dry_run: bool,
 ) -> None:
     libvirt = config["libvirt"]
-    _ensure_libvirt_runtime(libvirt, dry_run=dry_run)
-
     root_image = Path(libvirt["root_image"])
     if root_image.exists() and not force:
         print(f"base image exists: {root_image}")
@@ -405,178 +401,6 @@ def _prepare_base_image(
     _run_sudo(["qemu-img", "resize", str(root_image), image_size], dry_run)
     _write_seed_image(libvirt, seed_image, dry_run=dry_run)
     _initialize_base_vm(libvirt, seed_image, dry_run=dry_run)
-
-
-def _prepare_runtime_dir(libvirt: dict[str, Any], dry_run: bool) -> None:
-    runtime_dir = Path(libvirt.get("runtime_dir", DEFAULT_RUNTIME_DIR))
-    _run_sudo(["mkdir", "-p", str(runtime_dir)], dry_run=dry_run)
-    user, group = _benchmark_user_group()
-    _run_sudo(["chown", f"{user}:{group}", str(runtime_dir)], dry_run=dry_run)
-    _run_sudo(["chmod", "0775", str(runtime_dir)], dry_run=dry_run)
-
-
-def _ensure_libvirt_runtime(libvirt: dict[str, Any], dry_run: bool) -> None:
-    if shutil.which("systemctl") is not None:
-        _run_sudo(["systemctl", "enable", "--now", "libvirtd"], dry_run=dry_run)
-
-    network = libvirt.get("network")
-    if network:
-        _run_sudo(
-            ["virsh", "--connect", libvirt["uri"], "net-start", network],
-            dry_run=dry_run,
-            check=False,
-        )
-        _run_sudo(
-            ["virsh", "--connect", libvirt["uri"], "net-autostart", network],
-            dry_run=dry_run,
-            check=False,
-        )
-
-
-def _prepare_qemu_user_config(dry_run: bool) -> None:
-    user, group = _benchmark_user_group()
-    original = _read_optional_root_file(QEMU_CONF, dry_run=dry_run)
-    _backup_qemu_conf(existed=original is not None, dry_run=dry_run)
-    updated = _qemu_conf_with_managed_block(original or "", user=user, group=group)
-    _write_root_file(QEMU_CONF, updated, dry_run=dry_run)
-    _restart_libvirt(dry_run=dry_run)
-
-
-def _restore_qemu_user_config(dry_run: bool) -> None:
-    if QEMU_CONF_BACKUP.exists():
-        _run_sudo(["cp", "-a", str(QEMU_CONF_BACKUP), str(QEMU_CONF)], dry_run=dry_run)
-        _run_sudo(["rm", "-f", str(QEMU_CONF_BACKUP), str(QEMU_CONF_MISSING_MARKER)], dry_run=dry_run)
-    elif QEMU_CONF_MISSING_MARKER.exists():
-        _run_sudo(["rm", "-f", str(QEMU_CONF), str(QEMU_CONF_MISSING_MARKER)], dry_run=dry_run)
-    else:
-        print(f"no scx-bench qemu.conf backup found: {QEMU_CONF_BACKUP}")
-    _restart_libvirt(dry_run=dry_run)
-
-
-def _backup_qemu_conf(existed: bool, dry_run: bool) -> None:
-    if QEMU_CONF_BACKUP.exists() or QEMU_CONF_MISSING_MARKER.exists():
-        return
-    if existed:
-        _run_sudo(["cp", "-a", str(QEMU_CONF), str(QEMU_CONF_BACKUP)], dry_run=dry_run)
-    else:
-        _run_sudo(["install", "-D", "-m", "0644", "/dev/null", str(QEMU_CONF_MISSING_MARKER)], dry_run=dry_run)
-
-
-def _qemu_conf_with_managed_block(text: str, user: str, group: str) -> str:
-    lines: list[str] = []
-    in_managed_block = False
-    for line in text.splitlines():
-        if line.strip() == QEMU_CONF_BEGIN:
-            in_managed_block = True
-            continue
-        if line.strip() == QEMU_CONF_END:
-            in_managed_block = False
-            continue
-        if not in_managed_block:
-            lines.append(line)
-
-    while lines and not lines[-1].strip():
-        lines.pop()
-    lines.extend(
-        [
-            "",
-            QEMU_CONF_BEGIN,
-            f'user = "{user}"',
-            f'group = "{group}"',
-            "dynamic_ownership = 1",
-            QEMU_CONF_END,
-        ]
-    )
-    return "\n".join(lines) + "\n"
-
-
-def _verify_qemu_user_config() -> None:
-    user, group = _benchmark_user_group()
-    text = _read_optional_root_file(QEMU_CONF, dry_run=False)
-    if text is None:
-        raise RuntimeError(f"missing libvirt qemu config: {QEMU_CONF}")
-    values = _parse_qemu_conf_values(text)
-    expected = {
-        "user": user,
-        "group": group,
-        "dynamic_ownership": "1",
-    }
-    mismatched = [
-        f"{key}={values.get(key)!r}, expected {value!r}"
-        for key, value in expected.items()
-        if values.get(key) != value
-    ]
-    if mismatched:
-        raise RuntimeError(
-            "libvirt qemu user config is not prepared: "
-            + "; ".join(mismatched)
-            + "; run: python3 bench/scripts/prepare_env.py init --kernel-source <path> --force"
-        )
-
-
-def _parse_qemu_conf_values(text: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key not in {"user", "group", "dynamic_ownership"}:
-            continue
-        values[key] = value.strip().strip('"')
-    return values
-
-
-def _benchmark_user_group() -> tuple[str, str]:
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user and sudo_user != "root":
-        user_info = pwd.getpwnam(sudo_user)
-    else:
-        user_info = pwd.getpwuid(os.getuid())
-    try:
-        qemu_group = grp.getgrnam("kvm").gr_name
-    except KeyError:
-        qemu_group = grp.getgrgid(user_info.pw_gid).gr_name
-    return user_info.pw_name, qemu_group
-
-
-def _read_optional_root_file(path: Path, dry_run: bool) -> str | None:
-    if dry_run:
-        print(f"would read {path}")
-        try:
-            return path.read_text(encoding="utf-8") if path.exists() else None
-        except OSError as exc:
-            print(f"would need sudo to read {path}: {exc}")
-            return None
-    if not path.exists():
-        return None
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        command = _sudo_command(["cat", str(path)])
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
-        return completed.stdout
-
-
-def _write_root_file(path: Path, text: str, dry_run: bool) -> None:
-    if dry_run:
-        print(f"would write {path}:")
-        print(text)
-        return
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
-        tmp.write(text)
-        tmp_path = Path(tmp.name)
-    try:
-        _run_sudo(["install", "-D", "-m", "0644", str(tmp_path), str(path)], dry_run=False)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
-def _restart_libvirt(dry_run: bool) -> None:
-    if shutil.which("systemctl") is None:
-        return
-    _run_sudo(["systemctl", "restart", "libvirtd"], dry_run=dry_run)
 
 
 def _download_cloud_image(url: str, path: Path, dry_run: bool) -> None:
@@ -702,6 +526,7 @@ network:
       match:
         name: "e*"
       dhcp4: true
+      dhcp-identifier: mac
       dhcp6: false
       optional: true
 EOF
@@ -773,11 +598,58 @@ def _prepare_isolation(config_path: Path, force: bool, dry_run: bool) -> None:
     _run_sudo(command, dry_run=dry_run)
 
 
-def _require_libvirt(libvirt: dict[str, Any]) -> None:
-    _run_sudo(["virsh", "--connect", libvirt["uri"], "uri"], dry_run=False)
-    network = libvirt.get("network")
-    if network is not None:
-        _run_sudo(["virsh", "--connect", libvirt["uri"], "net-info", network], dry_run=False)
+def _restore_isolation(config_path: Path, no_reboot: bool, dry_run: bool) -> None:
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "bench" / "scripts" / "isolation.py"),
+        "restore",
+        "--config",
+        str(config_path),
+    ]
+    if no_reboot:
+        command.append("--no-reboot")
+    if dry_run:
+        command.append("--dry-run")
+        _run(command, dry_run=False)
+    else:
+        _run_sudo(command, dry_run=False)
+
+
+def _prepare_libvirt_env(config_path: Path, dry_run: bool) -> None:
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "bench" / "scripts" / "libvirt_env.py"),
+        "prepare",
+        "--config",
+        str(config_path),
+    ]
+    if dry_run:
+        command.append("--dry-run")
+    _run(command, dry_run=False)
+
+
+def _verify_libvirt_env(config_path: Path) -> None:
+    _run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bench" / "scripts" / "libvirt_env.py"),
+            "verify",
+            "--config",
+            str(config_path),
+        ],
+        dry_run=False,
+    )
+
+
+def _restore_libvirt_env(dry_run: bool) -> None:
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "bench" / "scripts" / "libvirt_env.py"),
+        "restore",
+    ]
+    if dry_run:
+        command.append("--dry-run")
+    _run(command, dry_run=False)
 
 
 def _verify_isolation(config: dict[str, Any]) -> None:
@@ -932,7 +804,7 @@ def _sudo_command(command: list[str]) -> list[str]:
 
 
 def _run(command: list[str], dry_run: bool, check: bool = True) -> None:
-    print("+", " ".join(command))
+    print("+", " ".join(command), flush=True)
     if not dry_run:
         subprocess.run(command, check=check)
 

@@ -1,0 +1,26 @@
+[llm]
+base_url = "http://127.0.0.1:7001"
+api_key = "123456"
+model = "gpt-5.5"
+timeout_ms = 30000
+
+[activation]
+socket_path = "/tmp/tuning-agent.sock"
+# timer_interval_ms = 60000
+# ebpf_ringbuf_pin = "/sys/fs/bpf/tuning_agent_events"
+
+[audit]
+path = "logs/audit.jsonl"
+
+[command]
+timeout_ms = 30000
+output_limit_bytes = 65536
+evaluation_output_limit_bytes = 8192
+
+[evaluation]
+default_window_seconds = 10
+min_window_seconds = 3
+max_window_seconds = 60
+default_settle_seconds = 3
+min_settle_seconds = 0
+max_settle_seconds = 10

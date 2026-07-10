@@ -29,6 +29,7 @@ VALID_EXECUTOR_KEYS = {
     "parallel",
     "cpu_source",
     "isolated_cpus",
+    "irq_cpus",
     "smt_policy",
     "pair_policy",
     "memory_guard_gb",
@@ -49,6 +50,8 @@ VALID_LIBVIRT_KEYS = {
     "workdir",
     "guest_output_dir",
     "emulator_cpus",
+    "iothread_cpus",
+    "pin_vhost_threads",
     "timeout_extra_seconds",
     "boot_timeout_seconds",
     "vm_warmup_seconds",
@@ -74,6 +77,7 @@ class RunSpec:
     bench: dict[str, Any]
     metric_profile: dict[str, Any]
     libvirt: dict[str, Any]
+    executor: dict[str, Any]
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -141,6 +145,7 @@ def expand_plan(config: dict[str, Any], plan_name: str) -> list[RunSpec]:
                             bench=_bench_with_defaults(config, bench_name),
                             metric_profile=metric_profile,
                             libvirt=config["libvirt"],
+                            executor=config.get("executor", {}),
                         )
                     )
 
@@ -199,6 +204,16 @@ def _validate_libvirt(config: dict[str, Any]) -> None:
         value = libvirt.get(key)
         if not isinstance(value, str):
             raise ConfigError(f"libvirt.{key} must be a string")
+
+    iothread_cpus = libvirt.get("iothread_cpus")
+    if iothread_cpus is not None:
+        if not isinstance(iothread_cpus, str):
+            raise ConfigError("libvirt.iothread_cpus must be a string or null")
+        parse_cpu_list(iothread_cpus)
+
+    pin_vhost_threads = libvirt.get("pin_vhost_threads", False)
+    if not isinstance(pin_vhost_threads, bool):
+        raise ConfigError("libvirt.pin_vhost_threads must be a boolean")
 
     ssh_host = libvirt.get("ssh_host")
     if ssh_host is not None and not isinstance(ssh_host, str):
@@ -285,6 +300,12 @@ def _validate_executor(config: dict[str, Any]) -> None:
         if not isinstance(isolated_cpus, str):
             raise ConfigError("executor.isolated_cpus must be a string")
         parse_cpu_list(isolated_cpus)
+
+    irq_cpus = executor.get("irq_cpus")
+    if irq_cpus is not None:
+        if not isinstance(irq_cpus, str):
+            raise ConfigError("executor.irq_cpus must be a string or null")
+        parse_cpu_list(irq_cpus)
 
     smt_policy = executor.get("smt_policy", "use_all_siblings")
     if smt_policy != "use_all_siblings":

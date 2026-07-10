@@ -24,6 +24,7 @@ bench/
   scripts/
     prepare_env.py
     run.py
+    libvirt_env.py
     isolation.py
     fetch_workloads.py
 
@@ -107,16 +108,28 @@ Key responsibilities:
 
 - generate `bench/configs/local.config` from `example.config`;
 - derive `libvirt.emulator_cpus` and `executor.isolated_cpus` from host topology;
-- configure `/etc/libvirt/qemu.conf` so QEMU runs as the benchmark user;
 - generate the SSH key used by the guest;
+- call `libvirt_env.py prepare`;
 - call `fetch_workloads.py`;
 - create the libvirt base image;
 - call `isolation.py prepare --no-reboot`;
+- call `libvirt_env.py restore` and `isolation.py restore` from `restore`;
 - verify that the generated environment is usable.
 
-`prepare_env.py` owns machine-local setup. It does not run experiments.
-It also owns restoring the libvirt/QEMU user override through
-`prepare_env.py restore`.
+`prepare_env.py` owns machine-local orchestration. It does not run experiments
+and does not own subsystem-specific host mutations.
+
+### `bench/scripts/libvirt_env.py`
+
+Prepares or restores libvirt/QEMU host settings.
+
+Key responsibilities:
+
+- configure `/etc/libvirt/qemu.conf` so QEMU runs as the benchmark user;
+- back up and restore the original qemu.conf;
+- prepare the libvirt runtime directory permissions;
+- ensure libvirtd and the selected libvirt network are available;
+- verify the libvirt/QEMU host environment.
 
 ### `bench/scripts/isolation.py`
 
@@ -128,6 +141,8 @@ Key responsibilities:
 - save original host state;
 - update GRUB boot parameters;
 - configure fixed CPU frequency through a systemd service;
+- apply IRQ/RPS/XPS runtime isolation;
+- write the runtime isolation report consumed by the runner;
 - restore original host settings.
 
 The runner does not modify host isolation. It only checks that isolation is

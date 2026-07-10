@@ -44,8 +44,9 @@ python3 bench/scripts/run.py \
 bench/configs/local.config
 ```
 
-它也会备份并修改 `/etc/libvirt/qemu.conf`，让 QEMU 以当前测试用户运行，
-避免 `run.py` 读取 VM runtime 文件时需要 sudo。恢复该设置：
+它也会调用 `libvirt_env.py` 备份并修改 `/etc/libvirt/qemu.conf`，让 QEMU
+以当前测试用户运行，避免 `run.py` 读取 VM runtime 文件时需要 sudo。
+恢复所有由初始化流程管理的 host 设置：
 
 ```bash
 python3 bench/scripts/prepare_env.py restore
@@ -214,6 +215,7 @@ executor:
   parallel: auto
   cpu_source: isolated
   isolated_cpus: "2-9"
+  irq_cpus: "0-1"
   smt_policy: use_all_siblings
   pair_policy: sequential
   memory_guard_gb: 16
@@ -232,6 +234,17 @@ machines:
 comparison pair 为单位分配 CPU，同一个 physical core 的所有 logical
 CPU sibling 只会分配给同一个 pair。
 
+`irq_cpus` 是 host 设备 IRQ、RPS 和 XPS 的目标 CPU 集合，必须和
+VM pinned CPU 不重叠。`isolation.py prepare/apply-runtime` 会把
+`/proc/irq/*/smp_affinity_list` 和 `/sys/class/net/*/queues/*/*ps_cpus`
+写到这组 CPU，并在 restore 时恢复原值。
+
+如果内核拒绝迁移某个 IRQ，例如 managed IRQ，`apply-runtime` 会把它
+记录为 `unmovable`，不会在启动 VM 前直接失败。runner 会在 guest
+脚本执行前后比较 host `/proc/interrupts`；只要 unmovable IRQ 在 VM
+pinned CPU 上产生增量，该 run 会被标记为 `INTERRUPT_CONTAMINATED`。
+当前 managed IRQ 策略固定为 `fail_on_delta`。
+
 ## Host 隔离环境
 
 runner 在真实启动 VM 前会严格检查：
@@ -239,6 +252,7 @@ runner 在真实启动 VM 前会严格检查：
 - pinned CPU 是否存在；
 - pinned CPU 是否已经隔离；
 - pinned CPU 是否固定频率。
+- 可迁移 IRQ、RPS 和 XPS 是否仍包含 pinned CPU。
 
 如果检查失败，runner 会拒绝启动 VM。
 
@@ -477,7 +491,9 @@ report.html
 
 - `--baseline` 只是比较基准，不代表必须是内核默认调度器。
 - baseline 和 candidate 都可以是 `builtin` 或 `scx`。
-- libvirt XML 会显式设置 `vcpupin` 和 `emulatorpin`。
+- libvirt XML 会显式设置 `vcpupin`、`emulatorpin` 和可选的
+  `iothreadpin`；启用 `pin_vhost_threads` 时，runner 会记录并尽量 pin
+  host vhost 线程。
 - host CPU 隔离和固定频率需要先通过 `bench/scripts/isolation.py` 准备。
 - runner 会在真实运行前做严格 preflight 检查。
 - run.py 以 comparison pair 为单位调度，资源允许时可以并发运行多个 VM。
