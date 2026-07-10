@@ -22,6 +22,7 @@ from bench.config.parser import RunSpec, parse_cpu_list
 
 _MANIFEST_LOCK = threading.Lock()
 DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
+RUNTIME_ISOLATION_REPORT = Path("/var/lib/scx-bench/runtime-isolation.json")
 
 
 class PreflightError(RuntimeError):
@@ -182,6 +183,8 @@ def _run_one(
     libvirt_stdout = completed["stdout"]
     libvirt_stderr = completed["stderr"]
     status = completed["status"]
+    host_thread_pinning = completed.get("host_thread_pinning", {})
+    host_irq_delta = completed.get("host_irq_delta", {})
 
     finished_at = datetime.now(timezone.utc)
     duration = (finished_at - started_at).total_seconds()
@@ -204,6 +207,8 @@ def _run_one(
             status = "BENCH_FAILED"
         else:
             status = "FAILED"
+        if host_irq_delta.get("contaminated_irqs") and status == "PASS":
+            status = "INTERRUPT_CONTAMINATED"
 
     metadata.update(
         {
@@ -212,6 +217,8 @@ def _run_one(
             "vm_returncode": vm_returncode,
             "libvirt_returncode": vm_returncode,
             "guest_result": guest_result,
+            "host_thread_pinning": host_thread_pinning,
+            "host_irq_delta": host_irq_delta,
             "finished_at": finished_at.isoformat(),
             "duration_seconds": duration,
             "bench_metrics": bench_metrics,
@@ -240,14 +247,18 @@ def _run_libvirt(
     libvirt = spec.libvirt
     status: str | None = None
     returncode: int | None = None
+    host_thread_pinning: dict[str, Any] = {}
+    host_irq_delta: dict[str, Any] = {}
     try:
         _prepare_runtime_dir(runtime_dir, stdout_parts, stderr_parts)
         _create_overlay(libvirt, overlay_path, stdout_parts, stderr_parts)
         _run_command(_virsh(libvirt, ["define", str(domain_xml_path)]), stdout_parts, stderr_parts)
         _run_command(_virsh(libvirt, ["start", domain_name]), stdout_parts, stderr_parts)
+        host_thread_pinning = _apply_host_thread_pinning(libvirt, domain_name)
 
         host, port = _wait_for_ssh(libvirt, domain_name, boot_timeout, progress_interval, heartbeat)
         _scp_to_guest(libvirt, host, port, guest_script, "/tmp/scx-bench-run.sh", stdout_parts, stderr_parts)
+        host_irq_before = _host_interrupt_snapshot()
         completed = _run_guest_command(
             libvirt,
             host,
@@ -259,6 +270,8 @@ def _run_libvirt(
             stdout_parts,
             stderr_parts,
         )
+        host_irq_after = _host_interrupt_snapshot()
+        host_irq_delta = _managed_irq_delta(spec, host_irq_before, host_irq_after)
         _copy_guest_output(
             libvirt,
             host,
@@ -299,7 +312,14 @@ def _run_libvirt(
                 status = "LIBVIRT_FAILED"
             stderr_parts.append(str(exc))
 
-    return _libvirt_result(status, returncode, stdout_parts, stderr_parts)
+    return _libvirt_result(
+        status,
+        returncode,
+        stdout_parts,
+        stderr_parts,
+        host_thread_pinning,
+        host_irq_delta,
+    )
 
 
 def _run_guest_command(
@@ -364,6 +384,161 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
         return
 
 
+def _apply_host_thread_pinning(libvirt: dict[str, Any], domain_name: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "domain": domain_name,
+        "qemu_pid": None,
+        "qemu_threads": [],
+        "vhost_threads": [],
+        "errors": [],
+    }
+    qemu_pid = _find_qemu_pid(domain_name)
+    if qemu_pid is None:
+        result["errors"].append(f"could not find QEMU process for domain {domain_name}")
+        return result
+
+    result["qemu_pid"] = qemu_pid
+    result["qemu_threads"] = _thread_affinities(qemu_pid)
+
+    if libvirt.get("pin_vhost_threads", False):
+        cpuset = libvirt.get("iothread_cpus") or libvirt.get("emulator_cpus")
+        if cpuset:
+            result["vhost_threads"] = _pin_vhost_threads(qemu_pid, parse_cpu_list(cpuset))
+        else:
+            result["errors"].append("pin_vhost_threads is true but no iothread/emulator CPUs are configured")
+    return result
+
+
+def _find_qemu_pid(domain_name: str) -> int | None:
+    for path in sorted(Path("/proc").glob("[0-9]*/cmdline")):
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        text = raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
+        if domain_name not in text:
+            continue
+        if "qemu-system" not in text and "qemu-kvm" not in text:
+            continue
+        return int(path.parent.name)
+    return None
+
+
+def _thread_affinities(pid: int) -> list[dict[str, Any]]:
+    threads: list[dict[str, Any]] = []
+    for task in sorted(Path(f"/proc/{pid}/task").glob("[0-9]*")):
+        tid = int(task.name)
+        comm = _read_optional(task / "comm") or ""
+        try:
+            affinity = sorted(os.sched_getaffinity(tid))
+        except OSError as exc:
+            threads.append({"tid": tid, "comm": comm, "error": str(exc)})
+            continue
+        threads.append({"tid": tid, "comm": comm, "affinity": _format_cpu_list(affinity)})
+    return threads
+
+
+def _pin_vhost_threads(qemu_pid: int, cpus: list[int]) -> list[dict[str, Any]]:
+    pinned: list[dict[str, Any]] = []
+    target = set(cpus)
+    for comm_path in sorted(Path("/proc").glob("[0-9]*/comm")):
+        tid = int(comm_path.parent.name)
+        comm = _read_optional(comm_path) or ""
+        if not _is_vhost_thread_for_qemu(comm, qemu_pid):
+            continue
+        entry: dict[str, Any] = {
+            "tid": tid,
+            "comm": comm,
+            "target_affinity": _format_cpu_list(cpus),
+        }
+        try:
+            before = sorted(os.sched_getaffinity(tid))
+            os.sched_setaffinity(tid, target)
+            after = sorted(os.sched_getaffinity(tid))
+            entry["before_affinity"] = _format_cpu_list(before)
+            entry["after_affinity"] = _format_cpu_list(after)
+        except OSError as exc:
+            entry["error"] = str(exc)
+        pinned.append(entry)
+    return pinned
+
+
+def _is_vhost_thread_for_qemu(comm: str, qemu_pid: int) -> bool:
+    return comm == f"vhost-{qemu_pid}" or comm.startswith(f"vhost-{qemu_pid}-")
+
+
+def _host_interrupt_snapshot() -> dict[str, dict[str, Any]]:
+    path = Path("/proc/interrupts")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    snapshot: dict[str, dict[str, Any]] = {}
+    for line in lines:
+        stripped = line.lstrip()
+        if ":" not in stripped:
+            continue
+        irq, rest = stripped.split(":", 1)
+        if not irq.isdigit():
+            continue
+        tokens = rest.split()
+        counts: list[int] = []
+        index = 0
+        while index < len(tokens) and tokens[index].isdigit():
+            counts.append(int(tokens[index]))
+            index += 1
+        snapshot[irq] = {
+            "counts": counts,
+            "actions": " ".join(tokens[index:]),
+        }
+    return snapshot
+
+
+def _managed_irq_delta(
+    spec: RunSpec,
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    pinned_cpus = parse_cpu_list(spec.machine["pin_cpus"])
+    report = _read_runtime_isolation_report()
+    unmovable_irqs = _unmovable_irqs(report)
+    contaminated: list[dict[str, Any]] = []
+
+    for irq in sorted(unmovable_irqs, key=int):
+        before_counts = before.get(irq, {}).get("counts", [])
+        after_counts = after.get(irq, {}).get("counts", [])
+        per_cpu_delta: dict[str, int] = {}
+        total_delta = 0
+        for cpu in pinned_cpus:
+            before_value = before_counts[cpu] if cpu < len(before_counts) else 0
+            after_value = after_counts[cpu] if cpu < len(after_counts) else 0
+            delta = max(0, after_value - before_value)
+            if delta:
+                per_cpu_delta[str(cpu)] = delta
+                total_delta += delta
+        if total_delta <= 0:
+            continue
+        report_entry = report.get("irqs", {}).get(irq, {})
+        contaminated.append(
+            {
+                "irq": irq,
+                "actions": report_entry.get("actions") or after.get(irq, {}).get("actions", ""),
+                "smp_affinity": report_entry.get("smp_affinity", ""),
+                "effective_affinity": report_entry.get("effective_affinity", ""),
+                "pinned_cpu_delta": per_cpu_delta,
+                "total_pinned_delta": total_delta,
+            }
+        )
+
+    return {
+        "managed_irq_policy": "fail_on_delta",
+        "pinned_cpus": _format_cpu_list(pinned_cpus),
+        "unmovable_irqs": sorted(unmovable_irqs, key=int),
+        "contaminated_irqs": contaminated,
+    }
+
+
 def _bench_command(spec: RunSpec) -> list[str]:
     return [spec.bench["command"], *spec.bench.get("args", [])]
 
@@ -420,12 +595,17 @@ def _domain_xml(
         _memory_mib(spec.machine["memory"])
     )
     ET.SubElement(domain, "vcpu", {"placement": "static"}).text = str(spec.machine["vcpus"])
+    iothread_cpus = libvirt.get("iothread_cpus")
+    if iothread_cpus:
+        ET.SubElement(domain, "iothreads").text = "1"
 
     cputune = ET.SubElement(domain, "cputune")
     pin_cpus = parse_cpu_list(spec.machine["pin_cpus"])
     for index, cpu in enumerate(pin_cpus):
         ET.SubElement(cputune, "vcpupin", {"vcpu": str(index), "cpuset": str(cpu)})
     ET.SubElement(cputune, "emulatorpin", {"cpuset": libvirt["emulator_cpus"]})
+    if iothread_cpus:
+        ET.SubElement(cputune, "iothreadpin", {"iothread": "1", "cpuset": iothread_cpus})
 
     os_node = ET.SubElement(domain, "os")
     ET.SubElement(os_node, "type", {"arch": "x86_64"}).text = "hvm"
@@ -447,13 +627,18 @@ def _domain_xml(
 
     devices = ET.SubElement(domain, "devices")
     disk = ET.SubElement(devices, "disk", {"type": "file", "device": "disk"})
-    ET.SubElement(disk, "driver", {"name": "qemu", "type": "qcow2", "cache": "none"})
+    disk_driver = {"name": "qemu", "type": "qcow2", "cache": "none"}
+    if iothread_cpus:
+        disk_driver.update({"io": "threads", "iothread": "1"})
+    ET.SubElement(disk, "driver", disk_driver)
     ET.SubElement(disk, "source", {"file": str(overlay_path.resolve())})
     ET.SubElement(disk, "target", {"dev": "vda", "bus": "virtio"})
 
     if libvirt.get("network") is not None:
         interface = ET.SubElement(devices, "interface", {"type": "network"})
         ET.SubElement(interface, "source", {"network": libvirt.get("network", "default")})
+        if libvirt.get("pin_vhost_threads", False):
+            ET.SubElement(interface, "driver", {"name": "vhost"})
         ET.SubElement(interface, "model", {"type": "virtio"})
 
     ET.indent(domain)
@@ -710,12 +895,16 @@ def _libvirt_result(
     returncode: int | None,
     stdout_parts: list[str],
     stderr_parts: list[str],
+    host_thread_pinning: dict[str, Any],
+    host_irq_delta: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "status": status,
         "returncode": returncode,
         "stdout": "".join(stdout_parts),
         "stderr": "".join(stderr_parts),
+        "host_thread_pinning": host_thread_pinning,
+        "host_irq_delta": host_irq_delta,
     }
 
 
@@ -780,6 +969,7 @@ def _manifest_entry(
         "bench_config": spec.bench,
         "metric_profile_config": spec.metric_profile,
         "libvirt_config": spec.libvirt,
+        "executor_config": spec.executor,
     }
 
 
@@ -803,6 +993,8 @@ def _preflight_machine(spec: RunSpec) -> None:
     if frequency.get("fixed") is True:
         errors.extend(_check_fixed_frequency(pin_cpus, frequency.get("governor")))
 
+    errors.extend(_check_irq_runtime_isolation(spec, pin_cpus))
+
     if errors:
         raise PreflightError(
             "; ".join(errors)
@@ -820,6 +1012,128 @@ def _read_isolated_cpus() -> list[int]:
     if not text:
         return []
     return parse_cpu_list(text)
+
+
+def _check_irq_runtime_isolation(spec: RunSpec, pin_cpus: list[int]) -> list[str]:
+    errors: list[str] = []
+    irq_cpus_text = spec.executor.get("irq_cpus")
+    if not irq_cpus_text:
+        return errors
+
+    report = _read_runtime_isolation_report()
+    if not report:
+        errors.append(
+            f"runtime isolation report is missing: {RUNTIME_ISOLATION_REPORT}; "
+            "restart scx-bench-isolation.service or run isolation.py apply-runtime"
+        )
+    elif report.get("errors"):
+        errors.append("runtime IRQ isolation errors: " + "; ".join(map(str, report["errors"])))
+
+    irq_cpus = parse_cpu_list(irq_cpus_text)
+    missing = [cpu for cpu in irq_cpus if not Path(f"/sys/devices/system/cpu/cpu{cpu}").exists()]
+    if missing:
+        errors.append(f"IRQ CPU(s) do not exist on host: {missing}")
+    overlap = sorted(set(irq_cpus) & set(pin_cpus))
+    if overlap:
+        errors.append(f"executor.irq_cpus overlaps pinned VM CPU(s): {overlap}")
+
+    irq_mismatches = _irq_affinity_mismatches(pin_cpus, _unmovable_irqs(report), limit=5)
+    if irq_mismatches:
+        errors.append(
+            "IRQ affinity is not fully isolated; examples: "
+            + ", ".join(irq_mismatches)
+        )
+    net_mismatches = _net_queue_mask_mismatches(pin_cpus, limit=5)
+    if net_mismatches:
+        errors.append(
+            "network RPS/XPS masks include pinned VM CPU(s); examples: "
+            + ", ".join(net_mismatches)
+        )
+
+    return errors
+
+
+def _read_runtime_isolation_report() -> dict[str, Any]:
+    if not RUNTIME_ISOLATION_REPORT.exists():
+        return {}
+    try:
+        data = json.loads(RUNTIME_ISOLATION_REPORT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _unmovable_irqs(report: dict[str, Any]) -> set[str]:
+    irqs = report.get("irqs", {})
+    if not isinstance(irqs, dict):
+        return set()
+    return {
+        str(irq)
+        for irq, entry in irqs.items()
+        if isinstance(entry, dict) and entry.get("status") == "unmovable"
+    }
+
+
+def _irq_affinity_mismatches(
+    forbidden_cpus: list[int],
+    unmovable_irqs: set[str],
+    limit: int,
+) -> list[str]:
+    mismatches: list[str] = []
+    forbidden = set(forbidden_cpus)
+    for path in sorted(Path("/proc/irq").glob("[0-9]*/smp_affinity_list")):
+        irq = path.parent.name
+        if irq in unmovable_irqs:
+            continue
+        actual = _read_optional(path)
+        if actual is None:
+            continue
+        try:
+            actual_cpus = set(parse_cpu_list(actual))
+        except ValueError:
+            continue
+        overlap = sorted(actual_cpus & forbidden)
+        if not overlap:
+            continue
+        mismatches.append(f"{irq}={actual} overlaps {overlap}")
+        if len(mismatches) >= limit:
+            break
+    return mismatches
+
+
+def _net_queue_mask_mismatches(forbidden_cpus: list[int], limit: int) -> list[str]:
+    mismatches: list[str] = []
+    forbidden = set(forbidden_cpus)
+    for path in sorted(Path("/sys/class/net").glob("*/queues/*/*ps_cpus")):
+        text = _read_optional(path)
+        if not text:
+            continue
+        actual_cpus = _parse_cpu_mask(text)
+        overlap = sorted(actual_cpus & forbidden)
+        if not overlap:
+            continue
+        mismatches.append(f"{path}={text} overlaps {overlap}")
+        if len(mismatches) >= limit:
+            break
+    return mismatches
+
+
+def _parse_cpu_mask(text: str) -> set[int]:
+    cleaned = text.strip().replace(",", "")
+    if not cleaned:
+        return set()
+    try:
+        value = int(cleaned, 16)
+    except ValueError:
+        return set()
+    cpus: set[int] = set()
+    cpu = 0
+    while value:
+        if value & 1:
+            cpus.add(cpu)
+        value >>= 1
+        cpu += 1
+    return cpus
 
 
 def _check_fixed_frequency(pin_cpus: list[int], expected_governor: str | None) -> list[str]:
@@ -853,10 +1167,28 @@ def _check_fixed_frequency(pin_cpus: list[int], expected_governor: str | None) -
     return errors
 
 
+def _format_cpu_list(cpus: list[int]) -> str:
+    if not cpus:
+        return ""
+    ranges: list[str] = []
+    start = prev = cpus[0]
+    for cpu in cpus[1:]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        ranges.append(f"{start}-{prev}" if start != prev else str(start))
+        start = prev = cpu
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(ranges)
+
+
 def _read_optional(path: Path) -> str | None:
     if not path.exists():
         return None
-    return path.read_text(encoding="utf-8").strip()
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
 
 
 def _ensure_text(value: Any) -> str:
