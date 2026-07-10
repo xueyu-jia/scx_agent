@@ -327,7 +327,7 @@ def _build_local_config(
         "workdir": str(workdir),
         "guest_output_dir": "/scx_bench_out",
         "emulator_cpus": emulator_cpus,
-        "boot_timeout_seconds": 30,
+        "boot_timeout_seconds": 90,
         "timeout_extra_seconds": 120,
         "destroy_on_exit": True,
         "cpu_mode": "host-passthrough",
@@ -702,6 +702,7 @@ network:
       match:
         name: "e*"
       dhcp4: true
+      dhcp-identifier: mac
       dhcp6: false
       optional: true
 EOF
