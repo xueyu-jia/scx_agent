@@ -1,0 +1,610 @@
+libvirt:
+  uri: qemu:///system
+  kernel: /var/lib/libvirt/scx-bench-kernels/bzImage
+  kernel_args: root=/dev/vda1 console=ttyS0 systemd.mask=boot-efi.mount
+  kernel_source: /home/hlsq/linux-6.18
+  initrd: null
+  root_image: /var/lib/libvirt/images/scx-bench-base.qcow2
+  runtime_dir: /var/lib/libvirt/scx-bench-runs
+  network: default
+  ssh_user: root
+  ssh_key: /home/hlsq/.ssh/scx-bench
+  ssh_port: 22
+  workdir: /home/hlsq/Desktop/scx_agent
+  guest_output_dir: /scx_bench_out
+  emulator_cpus: '0'
+  boot_timeout_seconds: 600
+  vm_warmup_seconds: 10
+  timeout_extra_seconds: 120
+  destroy_on_exit: true
+  cpu_mode: host-passthrough
+bench_defaults:
+  warmup_seconds: 2
+  cooldown_seconds: 1
+executor:
+  parallel: auto
+  cpu_source: isolated
+  isolated_cpus: 1-7
+  smt_policy: use_all_siblings
+  pair_policy: sequential
+  memory_guard_gb: 0
+schedulers:
+  default:
+    kind: builtin
+  scx_rlfifo:
+    kind: scx
+    command: schedule/scx/target/release/scx_rlfifo
+    args: []
+    warmup_seconds: 2
+plans:
+  smoke:
+    runs: 3
+    matrix:
+    - machine: small
+      suites:
+      - cpu_smoke
+      - latency_smoke
+      - context_switch
+      - os_bench
+      - ipc
+      - memory_latency
+  full:
+    runs: 3
+    matrix:
+    - machine: small
+      suites:
+      - cpu_bound
+      - sched_ipc
+      - latency
+      - realtime_latency
+machines:
+  small:
+    vcpus: 2
+    memory: 2G
+    pin_cpus: auto
+    exclusive: true
+    frequency:
+      fixed: true
+  medium:
+    vcpus: 4
+    memory: 32G
+    pin_cpus: auto
+    exclusive: true
+    frequency:
+      fixed: true
+  large:
+    vcpus: 8
+    memory: 128G
+    pin_cpus: auto
+    exclusive: true
+    frequency:
+      fixed: true
+suites:
+  cpu_smoke:
+    benches:
+    - hackbench_smoke
+    metric_profile: cpu_throughput
+  latency_smoke:
+    benches:
+    - schbench_smoke
+    metric_profile: latency
+  cpu_bound:
+    benches:
+    - hackbench
+    - stress_ng_cpu
+    metric_profile: cpu_throughput
+  sched_ipc:
+    benches:
+    - perf_sched_pipe
+    - perf_sched_messaging
+    metric_profile: sched_ipc_perf
+  scalability:
+    benches:
+    - will_it_scale_context_switch
+    metric_profile: cpu_throughput
+  io_bound:
+    benches:
+    - fio_randread
+    - fio_randwrite
+    metric_profile: io_perf
+  latency:
+    benches:
+    - schbench
+    metric_profile: latency
+  realtime_latency:
+    benches:
+    - cyclictest
+    metric_profile: realtime_latency
+  service:
+    benches:
+    - redis_benchmark
+    metric_profile: service_perf
+  kernel_build:
+    benches:
+    - kernel_build_bzimage
+    metric_profile: build_perf
+  fairness:
+    benches:
+    - cgroup_fairness
+    metric_profile: fairness
+  context_switch:
+    benches:
+    - ctx_clock
+    metric_profile: context_switch
+  os_bench:
+    benches:
+    - osbench_create_threads
+    - osbench_create_processes
+    - osbench_launch_programs
+    - osbench_create_files
+    - osbench_mem_alloc
+    metric_profile: os_latency
+  ipc:
+    benches:
+    - ipc_pipe
+    - ipc_fifo
+    - ipc_socketpair
+    - ipc_tcp
+    metric_profile: ipc_throughput
+  memory_latency:
+    benches:
+    - pmbench_randread
+    - mutex_lock_unlock
+    metric_profile: memory_latency
+metric_profiles:
+  cpu_throughput:
+    primary:
+    - name: throughput
+      direction: higher
+      unit: ops/s
+      chart: delta_bar
+      regression: -3%
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +3%
+    secondary:
+    - cpu_utilization
+    - context_switches
+    - migrations
+  sched_ipc_perf:
+    primary:
+    - name: throughput
+      direction: higher
+      unit: ops/s
+      chart: delta_bar
+      regression: -5%
+    - name: latency_us_per_op
+      direction: lower
+      unit: us/op
+      chart: latency_bar
+      regression: +5%
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +5%
+    secondary:
+    - context_switches
+    - migrations
+  io_perf:
+    primary:
+    - name: iops
+      direction: higher
+      unit: iops
+      chart: delta_bar
+      regression: -3%
+    - name: p99_latency_us
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +8%
+    secondary:
+    - bandwidth_bytes_per_sec
+    - cpu_utilization
+    - io_pressure
+  latency:
+    primary:
+    - name: p99_latency_us
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +5%
+    - name: p999_latency_us
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +10%
+    secondary:
+    - throughput
+    - context_switches
+    - migrations
+  realtime_latency:
+    primary:
+    - name: max_latency_us
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +10%
+    - name: avg_latency_us
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +5%
+    secondary:
+    - min_latency_us
+    - context_switches
+    - migrations
+  build_perf:
+    primary:
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +5%
+    - name: throughput
+      direction: higher
+      unit: builds/s
+      chart: delta_bar
+      regression: -5%
+    secondary:
+    - cpu_utilization
+    - context_switches
+    - migrations
+  fairness:
+    primary:
+    - name: cpu_share_error
+      direction: lower
+      unit: '%'
+      chart: delta_bar
+      regression: +5%
+    - name: max_wait_time
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +10%
+    secondary:
+    - throughput
+    - p99_latency
+    - per_cgroup_runtime
+  service_perf:
+    primary:
+    - name: throughput
+      direction: higher
+      unit: qps
+      chart: delta_bar
+      regression: -5%
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +5%
+    secondary:
+    - get_qps
+    - set_qps
+  context_switch:
+    primary:
+    - name: context_switch_clocks
+      direction: lower
+      unit: clocks
+      chart: delta_bar
+      regression: +10%
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +10%
+    secondary:
+    - cpu_utilization
+  os_latency:
+    primary:
+    - name: us_per_thread
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +5%
+    - name: us_per_process
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +5%
+    - name: us_per_launch
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +5%
+    - name: us_per_file
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +5%
+    - name: us_per_alloc
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +5%
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +5%
+    secondary:
+    - cpu_utilization
+  ipc_throughput:
+    primary:
+    - name: throughput
+      direction: higher
+      unit: msg/s
+      chart: delta_bar
+      regression: -5%
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +5%
+    secondary:
+    - bandwidth_mb_per_sec
+    - context_switches
+  memory_latency:
+    primary:
+    - name: avg_page_latency_us
+      direction: lower
+      unit: us
+      chart: latency_bar
+      regression: +10%
+    - name: benchmark_mutex_lock_unlock__ns
+      direction: lower
+      unit: ns
+      chart: latency_bar
+      regression: +5%
+    - name: elapsed_time_sec
+      direction: lower
+      unit: s
+      chart: delta_bar
+      regression: +5%
+    secondary:
+    - avg_page_latency_clocks
+    - cpu_utilization
+benches:
+  hackbench_smoke:
+    command: python3
+    args:
+    - bench/benchmarks/hackbench.py
+    - --
+    - '2'
+    - thread
+    - '1000'
+    timeout_seconds: 60
+  schbench_smoke:
+    command: python3
+    args:
+    - bench/benchmarks/schbench.py
+    - --
+    - -m
+    - '1'
+    - -t
+    - '1'
+    - -r
+    - '10'
+    timeout_seconds: 60
+  hackbench:
+    command: python3
+    args:
+    - bench/benchmarks/hackbench.py
+    - --
+    - '16'
+    - thread
+    - '10000'
+    timeout_seconds: 300
+  stress_ng_cpu:
+    command: python3
+    args:
+    - bench/benchmarks/stress_ng.py
+    - --
+    - --cpu
+    - '0'
+    - --timeout
+    - 60s
+    - --metrics-brief
+    timeout_seconds: 120
+  perf_sched_pipe:
+    command: python3
+    args:
+    - bench/benchmarks/perf_sched.py
+    - pipe
+    - --
+    - -l
+    - '10000'
+    timeout_seconds: 120
+  perf_sched_messaging:
+    command: python3
+    args:
+    - bench/benchmarks/perf_sched.py
+    - messaging
+    - --
+    - -l
+    - '1000'
+    - -g
+    - '4'
+    timeout_seconds: 120
+  will_it_scale_context_switch:
+    command: python3
+    args:
+    - bench/benchmarks/will_it_scale.py
+    - --
+    - context_switch1
+    timeout_seconds: 180
+  fio_randread:
+    command: python3
+    args:
+    - bench/benchmarks/fio.py
+    - --
+    - --name=randread
+    - --rw=randread
+    - --bs=4k
+    - --size=1G
+    - --runtime=60
+    - --time_based
+    - --output-format=json
+    timeout_seconds: 120
+  fio_randwrite:
+    command: python3
+    args:
+    - bench/benchmarks/fio.py
+    - --
+    - --name=randwrite
+    - --rw=randwrite
+    - --bs=4k
+    - --size=1G
+    - --runtime=60
+    - --time_based
+    - --output-format=json
+    timeout_seconds: 120
+  schbench:
+    command: python3
+    args:
+    - bench/benchmarks/schbench.py
+    - --
+    - -m
+    - '4'
+    - -t
+    - '16'
+    - -r
+    - '60'
+    timeout_seconds: 120
+  cyclictest:
+    command: python3
+    args:
+    - bench/benchmarks/cyclictest.py
+    - --
+    - -q
+    - -D
+    - 60s
+    - -p
+    - '80'
+    - -i
+    - '1000'
+    timeout_seconds: 120
+  kernel_build_bzimage:
+    command: python3
+    args:
+    - bench/benchmarks/kernel_build.py
+    - --source
+    - /home/hlsq/linux-6.18
+    - --target
+    - bzImage
+    - --jobs
+    - '0'
+    timeout_seconds: 1800
+  cgroup_fairness:
+    command: python3
+    args:
+    - bench/benchmarks/generic.py
+    - --
+    - bench/workloads/cgroup-fairness
+    - --duration
+    - '60'
+    timeout_seconds: 120
+  redis_benchmark:
+    command: python3
+    args:
+    - bench/benchmarks/redis.py
+    - --requests
+    - '10000'
+    - --clients
+    - '50'
+    - --tests
+    - get,set
+    timeout_seconds: 120
+  ctx_clock:
+    command: python3
+    args:
+    - bench/benchmarks/ctx_clock.py
+    timeout_seconds: 30
+  osbench_create_threads:
+    command: python3
+    args:
+    - bench/benchmarks/osbench.py
+    - create_threads
+    timeout_seconds: 30
+  osbench_create_processes:
+    command: python3
+    args:
+    - bench/benchmarks/osbench.py
+    - create_processes
+    timeout_seconds: 30
+  osbench_launch_programs:
+    command: python3
+    args:
+    - bench/benchmarks/osbench.py
+    - launch_programs
+    timeout_seconds: 30
+  osbench_create_files:
+    command: python3
+    args:
+    - bench/benchmarks/osbench.py
+    - create_files
+    timeout_seconds: 30
+  osbench_mem_alloc:
+    command: python3
+    args:
+    - bench/benchmarks/osbench.py
+    - mem_alloc
+    timeout_seconds: 30
+  ipc_pipe:
+    command: python3
+    args:
+    - bench/benchmarks/ipc_benchmark.py
+    - pipe
+    - --
+    - '128'
+    - '9000000'
+    timeout_seconds: 30
+  ipc_fifo:
+    command: python3
+    args:
+    - bench/benchmarks/ipc_benchmark.py
+    - fifo
+    - --
+    - '128'
+    - '9000000'
+    timeout_seconds: 30
+  ipc_socketpair:
+    command: python3
+    args:
+    - bench/benchmarks/ipc_benchmark.py
+    - socketpair
+    - --
+    - '128'
+    - '9000000'
+    timeout_seconds: 30
+  ipc_tcp:
+    command: python3
+    args:
+    - bench/benchmarks/ipc_benchmark.py
+    - tcp
+    - --
+    - '128'
+    - '1000000'
+    timeout_seconds: 30
+  pmbench_randread:
+    command: python3
+    args:
+    - bench/benchmarks/pmbench_wrapper.py
+    - --
+    - -j
+    - '0'
+    - -r
+    - '100'
+    - '15'
+    timeout_seconds: 30
+  mutex_lock_unlock:
+    command: python3
+    args:
+    - bench/benchmarks/mutex_benchmark.py
+    - --
+    - --benchmark_color=false
+    - --benchmark_filter=benchmark_mutex_lock_unlock.std::mutex.
+    - --benchmark_min_time=1s
+    timeout_seconds: 30
