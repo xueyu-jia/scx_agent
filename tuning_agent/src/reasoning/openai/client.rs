@@ -6,11 +6,14 @@ use crate::config::LlmConfig;
 use crate::reasoning::openai::{ChatMessage, OpenAiAssistantOutput, OpenAiProtocol};
 use crate::tools::ToolSpec;
 
+const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct OpenAiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub timeout: Duration,
+    pub retry_count: u32,
 }
 
 impl OpenAiConfig {
@@ -30,6 +33,7 @@ impl OpenAiConfig {
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             timeout: Duration::from_millis(config.timeout_ms),
+            retry_count: config.retry_count,
         })
     }
 
@@ -58,6 +62,12 @@ impl OpenAiCompatibleClient {
         tools: &[ToolSpec],
     ) -> Result<OpenAiAssistantOutput, String> {
         let body = OpenAiProtocol::request_body(&self.config.model, messages, tools);
+        retry_with_delay(self.config.retry_count, RETRY_INTERVAL, || {
+            self.complete_once(&body)
+        })
+    }
+
+    fn complete_once(&self, body: &Value) -> Result<OpenAiAssistantOutput, String> {
         let response = self
             .agent
             .post(&self.config.chat_completions_url())
@@ -81,5 +91,67 @@ impl OpenAiCompatibleClient {
             }
             ureq::Error::Transport(err) => format!("transport error: {err}"),
         }
+    }
+}
+
+fn retry_with_delay<T>(
+    retry_count: u32,
+    retry_delay: Duration,
+    mut operation: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let total_attempts = u64::from(retry_count) + 1;
+
+    for attempt in 1..=total_attempts {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(_) if attempt < total_attempts => std::thread::sleep(retry_delay),
+            Err(err) => {
+                return Err(format!(
+                    "request failed after {total_attempts} attempt(s): {err}"
+                ));
+            }
+        }
+    }
+
+    unreachable!("retry loop always performs at least one attempt")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn retries_every_error_up_to_configured_count() {
+        let attempts = Cell::new(0);
+
+        let result = retry_with_delay(3, Duration::ZERO, || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt <= 3 {
+                Err(format!("failure {attempt}"))
+            } else {
+                Ok("success")
+            }
+        });
+
+        assert_eq!(result.as_deref(), Ok("success"));
+        assert_eq!(attempts.get(), 4);
+    }
+
+    #[test]
+    fn reports_last_error_after_all_attempts_fail() {
+        let attempts = Cell::new(0);
+
+        let error = retry_with_delay::<()>(2, Duration::ZERO, || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            Err(format!("failure {attempt}"))
+        })
+        .expect_err("all attempts should fail");
+
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(error, "request failed after 3 attempt(s): failure 3");
     }
 }

@@ -54,7 +54,41 @@ impl ActivationKernel {
         self.state = AgentState::Cooldown;
     }
 
+    pub fn freeze(&mut self) {
+        self.state = AgentState::Frozen;
+    }
+
     pub fn sleep(&mut self) {
         self.state = AgentState::Sleeping;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activation::EventSource;
+    use crate::types::Scope;
+
+    #[test]
+    fn frozen_kernel_rejects_new_activations() {
+        let mut kernel = ActivationKernel::default();
+        let first = ActivationEvent::new(
+            EventSource::Cli,
+            "first".to_string(),
+            Severity::Info,
+            Scope::Host,
+        );
+        assert!(kernel.accept(&first));
+
+        kernel.freeze();
+
+        let critical = ActivationEvent::new(
+            EventSource::Cli,
+            "critical".to_string(),
+            Severity::Critical,
+            Scope::Host,
+        );
+        assert_eq!(kernel.state(), AgentState::Frozen);
+        assert!(!kernel.accept(&critical));
     }
 }

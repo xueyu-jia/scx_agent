@@ -17,7 +17,7 @@ The LLM may diagnose workloads, choose observations, design experiments, and
 submit a commit claim. The runtime owns all deterministic control points:
 
 - activation
-- read/write boundaries
+- unrestricted shell execution and structured write tracking
 - write state tracking
 - rollback/restore
 - candidate construction
@@ -62,6 +62,7 @@ Top-level sections:
 ```rust
 Config {
     llm,
+    reasoning,
     activation,
     audit,
     command,
@@ -111,15 +112,16 @@ Activation source
   -> finish_episode()
 ```
 
-The current episode loop allows a bounded number of reasoning/tool rounds.
+The episode loop allows `reasoning.max_rounds` reasoning/tool rounds. The value defaults to 4 and must be greater than zero.
 
 Terminal phases:
 
 ```text
 Committed
 Frozen
-Finished
 ```
+
+Episode completion is an audit event, not a phase that overwrites the final outcome.
 
 ## Episode Phase
 
@@ -132,7 +134,6 @@ pub enum EpisodePhase {
     CommitPending,
     Committed,
     Frozen,
-    Finished,
 }
 ```
 
@@ -152,10 +153,8 @@ Committed
   Validation passed and finalize_commit completed.
 
 Frozen
-  A deterministic operation failed in a way that should stop the episode.
-
-Finished
-  Episode has ended.
+  A deterministic operation failed in a way that stops the episode and freezes
+  the global ActivationKernel until the daemon is restarted.
 ```
 
 Reasoning and acting are not phases. They are activities inside an episode.
@@ -175,10 +174,10 @@ commit
 Maps to:
 
 ```rust
-ActKernel::execute_read()
+ActKernel::execute_command()
 ```
 
-It executes a shell command with read-command guardrails.
+It executes a non-empty shell script through `/bin/sh -c` without syntax or side-effect restrictions.
 
 ### experiment_write
 
@@ -212,7 +211,7 @@ src/act/
 
 Primary responsibilities:
 
-- execute read commands
+- execute unrestricted shell scripts
 - validate structured write targets
 - capture original values
 - apply experiment writes
@@ -270,8 +269,13 @@ struct TargetState {
     original_value: String,
     current_value: String,
     experiment_values: BTreeSet<String>,
+    write_state: TargetWriteState,
 }
 ```
+
+`write_state` is `Prepared`, `Applied`, or `RecoveryRequired`. A failed write is
+re-read before rollback is scheduled: unchanged targets are removed from the
+table, while changed or unverifiable targets remain tracked for recovery.
 
 Semantics:
 
@@ -303,12 +307,12 @@ If the target is not in the map, the current value is captured as
 experiment_write(target, value)
   -> validate target
   -> read old_value
-  -> ensure target state
+  -> register Prepared target state
   -> write target=value
-  -> read current_value
-  -> update current_value
-  -> insert value into experiment_values
-  -> return WriteReport
+  -> re-read current_value
+     -> requested value: mark Applied and return WriteReport
+     -> old value: remove new Prepared state and return an ordinary failure
+     -> changed/unverifiable: mark RecoveryRequired and start recovery
 ```
 
 This is the only way model-requested writes enter the system.
@@ -439,7 +443,7 @@ Evaluation now replays only the explicit commit candidate.
 
 ### Measurement Program
 
-The model provides a read-only shell command:
+The model provides an unrestricted shell script that must print one JSON object:
 
 ```json
 {
@@ -617,6 +621,10 @@ Audit records include:
 - act result
 - episode finished
 
+Act results record `rollback_required`, `rollback_attempted`,
+`rollback_succeeded`, and `rollback_error` separately. Episode-finished records
+contain both the final episode phase and the resulting global agent state.
+
 Future improvement: add first-class phase-change and evaluation-subphase records
 instead of only embedding them in tool results.
 
@@ -644,7 +652,7 @@ Do not put authorization into the OpenAI protocol layer.
 
 ```text
 protocol parses tool calls
-ActKernel enforces read/write policy
+ActKernel executes shell scripts and tracks structured write state
 EpisodeController enforces phase policy
 ```
 
@@ -672,7 +680,7 @@ when the code is correct.
 Important tests:
 
 ```text
-ActKernel read command guard
+ActKernel unrestricted shell command execution
 ActKernel keep-only finalization
 Unix IPC activation
 OpenAI-compatible protocol parsing

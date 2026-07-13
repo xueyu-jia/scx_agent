@@ -139,7 +139,7 @@ impl EvaluationKernel {
 }
 
 fn run_measurement(act: &ActKernel, plan: &EvaluationPlan) -> Result<EvaluationSample, String> {
-    let report = act.execute_read(&plan.measurement.request)?;
+    let report = act.execute_command(&plan.measurement.request)?;
     if !report.succeeded() {
         return Err(format!(
             "measurement command failed: status={:?} timed_out={} stderr={}",

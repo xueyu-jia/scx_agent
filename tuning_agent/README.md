@@ -11,7 +11,7 @@
 - Timer 激活
 - eBPF ringbuf 激活接入点
 - OpenAI-compatible LLM 接入
-- 只读诊断命令
+- 不受 shell 语法限制的诊断脚本
 - 结构化内核参数实验写入
 - 自动记录写入前 old value
 - commit 前确定性验证
@@ -72,7 +72,7 @@ commit 的含义是：
 
 如果实验阶段修改了 A、B、C，但 `keep_writes` 只包含 A，那么即使 commit 成功，B 和 C 也会被恢复。
 
-## 安全边界
+## 执行边界
 
 模型负责提出：
 
@@ -85,7 +85,6 @@ commit 的含义是：
 
 系统负责强制执行：
 
-- 读写分离
 - 结构化写入
 - old value 捕获
 - 自动恢复
@@ -93,6 +92,8 @@ commit 的含义是：
 - 只保留 `keep_writes`
 - 系统级 guardrails
 - 审计日志
+
+MVP 阶段的 `probe` 和 commit measurement 会以 daemon 权限直接交给 `/bin/sh -c`，不检查重定向、管道、命令替换、网络命令、后台任务或其他副作用。结构化写入与回滚约束只覆盖 `experiment_write`，不约束 shell 脚本自行产生的修改。
 
 核心不变量：
 
@@ -164,6 +165,10 @@ base_url = "http://127.0.0.1:7001"
 api_key = "123456"
 model = "gpt-5.5"
 timeout_ms = 30000
+retry_count = 3
+
+[reasoning]
+max_rounds = 4
 
 [activation]
 socket_path = "/tmp/tuning-agent.sock"
@@ -187,13 +192,17 @@ min_settle_seconds = 0
 max_settle_seconds = 10
 ```
 
+`llm.retry_count` 表示首次请求失败后的重试次数，默认值为 `3`。所有请求错误都会重试，重试间隔固定为 1 秒；例如配置为 `3` 时最多发起 4 次请求。
+
+`reasoning.max_rounds` 表示每个 episode 最多进行多少轮 reasoning/tool 交互，默认值为 `4`，必须大于 `0`。
+
 说明：当前 eBPF ringbuf 是接入点，真实 ringbuf reader 还需要明确 BPF object/map contract。
 
 ## 模型工具
 
 ### probe
 
-执行只读诊断命令。
+执行不受 shell 语法限制的 `/bin/sh` 脚本。
 
 示例：
 
@@ -206,16 +215,7 @@ max_settle_seconds = 10
 }
 ```
 
-读命令会阻断明显副作用，例如：
-
-- shell 写重定向
-- `sysctl -w`
-- `/proc/sys` 写入
-- `kill` / `pkill`
-- `mount` / `umount`
-- `tc qdisc`
-- `curl` / `wget` / `nc` / `ssh`
-- 后台任务
+命令只要求非空；重定向、管道、`&&`、命令替换、网络访问、后台任务和修改系统状态的命令都会原样交给 `/bin/sh -c`。
 
 ### experiment_write
 

@@ -3,6 +3,10 @@ base_url = "http://127.0.0.1:7001"
 api_key = "123456"
 model = "gpt-5.5"
 timeout_ms = 30000
+retry_count = 3
+
+[reasoning]
+max_rounds = 4
 
 [activation]
 socket_path = "/tmp/tuning-agent.sock"

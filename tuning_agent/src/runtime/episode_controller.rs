@@ -26,6 +26,12 @@ pub struct EpisodeController<'a> {
     audit: &'a mut AuditJournal,
 }
 
+pub struct EpisodeOutcome {
+    pub episode: Episode,
+    pub phase: EpisodePhase,
+    pub act_result: ActResult,
+}
+
 impl<'a> EpisodeController<'a> {
     pub fn new(config: Config, audit: &'a mut AuditJournal) -> Self {
         Self {
@@ -40,7 +46,11 @@ impl<'a> EpisodeController<'a> {
         }
     }
 
-    pub fn run(&mut self, episode: Episode, agent_state: AgentState) -> std::io::Result<()> {
+    pub fn run(
+        &mut self,
+        episode: Episode,
+        agent_state: AgentState,
+    ) -> std::io::Result<EpisodeOutcome> {
         let mut state = EpisodeState::new(episode);
         self.audit
             .record_episode_started(&state.episode, agent_state)?;
@@ -51,7 +61,7 @@ impl<'a> EpisodeController<'a> {
         let mut reasoner = build_reasoner(&self.config.llm);
         let mut tool_results: Vec<ToolResult> = Vec::new();
 
-        for round in 0..4 {
+        for round in 0..self.config.reasoning.max_rounds {
             let reasoning = if round == 0 {
                 reasoner.reason(ReasoningInput::Initial {
                     episode: &state.episode,
@@ -76,14 +86,13 @@ impl<'a> EpisodeController<'a> {
                     }
                 }
                 Plan::DryRun(action) => {
-                    let result = ActResult {
-                        status: ActStatus::DryRun,
-                        message: format!(
+                    let result = ActResult::without_rollback(
+                        ActStatus::DryRun,
+                        format!(
                             "dry-run accepted: {}; expected_effect={}",
                             action.summary, action.expected_effect
                         ),
-                        rollback_performed: false,
-                    };
+                    );
                     self.audit.record_act_result(&state.episode, &result)?;
                     break;
                 }
@@ -93,15 +102,16 @@ impl<'a> EpisodeController<'a> {
         let finish_result = self.finish_episode(&mut state);
         self.audit
             .record_act_result(&state.episode, &finish_result)?;
-        state.set_phase(EpisodePhase::Finished);
-        self.audit
-            .record_episode_finished(&state.episode, agent_state)?;
 
         println!(
             "episode {} finished; phase={:?}",
             state.episode.id, state.phase
         );
-        Ok(())
+        Ok(EpisodeOutcome {
+            episode: state.episode,
+            phase: state.phase,
+            act_result: finish_result,
+        })
     }
 
     fn dispatch_tool_call(
@@ -147,7 +157,7 @@ impl<'a> EpisodeController<'a> {
             }
         };
 
-        match self.act_kernel.execute_read(&request) {
+        match self.act_kernel.execute_command(&request) {
             Ok(report) => ToolResult::ok(
                 invocation.id.clone(),
                 invocation.name.clone(),
@@ -171,10 +181,7 @@ impl<'a> EpisodeController<'a> {
         state: &mut EpisodeState,
         invocation: &ToolInvocation,
     ) -> ToolResult {
-        if matches!(
-            state.phase,
-            EpisodePhase::Committed | EpisodePhase::Frozen | EpisodePhase::Finished
-        ) {
+        if matches!(state.phase, EpisodePhase::Committed | EpisodePhase::Frozen) {
             return ToolResult::rejected(
                 invocation.id.clone(),
                 invocation.name.clone(),
@@ -199,6 +206,22 @@ impl<'a> EpisodeController<'a> {
                         .unwrap_or_else(|err| format!("serialization failed: {err}")),
                 )
             }
+            Err(err) if self.act_kernel.has_recovery_required() => {
+                match self.rollback_to_clean(state) {
+                    Ok(rollback) => ToolResult::failed(
+                        invocation.id.clone(),
+                        invocation.name.clone(),
+                        format!("experiment write failed: {err}; rollback completed: {rollback}"),
+                    ),
+                    Err(rollback_error) => ToolResult::failed(
+                        invocation.id.clone(),
+                        invocation.name.clone(),
+                        format!(
+                            "experiment write failed: {err}; rollback failed: {rollback_error}"
+                        ),
+                    ),
+                }
+            }
             Err(err) => ToolResult::rejected(
                 invocation.id.clone(),
                 invocation.name.clone(),
@@ -212,10 +235,7 @@ impl<'a> EpisodeController<'a> {
         state: &mut EpisodeState,
         invocation: &ToolInvocation,
     ) -> ToolResult {
-        if matches!(
-            state.phase,
-            EpisodePhase::Committed | EpisodePhase::Frozen | EpisodePhase::Finished
-        ) {
+        if matches!(state.phase, EpisodePhase::Committed | EpisodePhase::Frozen) {
             return ToolResult::rejected(
                 invocation.id.clone(),
                 invocation.name.clone(),
@@ -287,17 +307,28 @@ impl<'a> EpisodeController<'a> {
                         )
                     }
                     Err(err) => {
-                        state.set_phase(EpisodePhase::Frozen);
+                        let rollback = self.rollback_to_clean(state);
                         ToolResult::failed(
                             invocation.id.clone(),
                             invocation.name.clone(),
-                            serde_json::json!({
-                                "committed": false,
-                                "validation": "baseline_candidate",
-                                "report": report,
-                                "finalize_error": err,
-                                "phase": format!("{:?}", state.phase),
-                            })
+                            match rollback {
+                                Ok(final_rollback) => serde_json::json!({
+                                    "committed": false,
+                                    "validation": "baseline_candidate",
+                                    "report": report,
+                                    "finalize_error": err,
+                                    "final_rollback": final_rollback,
+                                    "phase": format!("{:?}", state.phase),
+                                }),
+                                Err(rollback_error) => serde_json::json!({
+                                    "committed": false,
+                                    "validation": "baseline_candidate",
+                                    "report": report,
+                                    "finalize_error": err,
+                                    "final_rollback_error": rollback_error,
+                                    "phase": format!("{:?}", state.phase),
+                                }),
+                            }
                             .to_string(),
                         )
                     }
@@ -368,16 +399,26 @@ impl<'a> EpisodeController<'a> {
                 }
             }
             EvaluationOutcome::Frozen(report) => {
-                state.set_phase(EpisodePhase::Frozen);
+                let rollback = self.rollback_to_clean(state);
                 ToolResult::failed(
                     invocation.id.clone(),
                     invocation.name.clone(),
-                    serde_json::json!({
-                        "committed": false,
-                        "validation": "baseline_candidate",
-                        "report": report,
-                        "phase": format!("{:?}", state.phase),
-                    })
+                    match rollback {
+                        Ok(final_rollback) => serde_json::json!({
+                            "committed": false,
+                            "validation": "baseline_candidate",
+                            "report": report,
+                            "final_rollback": final_rollback,
+                            "phase": format!("{:?}", state.phase),
+                        }),
+                        Err(rollback_error) => serde_json::json!({
+                            "committed": false,
+                            "validation": "baseline_candidate",
+                            "report": report,
+                            "final_rollback_error": rollback_error,
+                            "phase": format!("{:?}", state.phase),
+                        }),
+                    }
                     .to_string(),
                 )
             }
@@ -386,42 +427,51 @@ impl<'a> EpisodeController<'a> {
 
     fn finish_episode(&mut self, state: &mut EpisodeState) -> ActResult {
         match state.phase {
-            EpisodePhase::Committed => ActResult {
-                status: ActStatus::Completed,
-                message: "episode committed; uncommitted experiment writes restored".to_string(),
-                rollback_performed: false,
-            },
-            EpisodePhase::Frozen => ActResult {
-                status: ActStatus::Rejected,
-                message: "episode frozen after execution failure".to_string(),
-                rollback_performed: false,
-            },
-            _ if !self.act_kernel.has_experiment_writes() => ActResult {
-                status: ActStatus::Completed,
-                message: format!(
+            EpisodePhase::Committed => Self::act_result_from_state(
+                state,
+                ActStatus::Completed,
+                "episode committed; uncommitted experiment writes restored".to_string(),
+            ),
+            EpisodePhase::Frozen => Self::act_result_from_state(
+                state,
+                ActStatus::Rejected,
+                "episode frozen after execution failure".to_string(),
+            ),
+            _ if !self.act_kernel.has_experiment_writes() => Self::act_result_from_state(
+                state,
+                ActStatus::Completed,
+                format!(
                     "episode ended in {:?}; no experiments to rollback",
                     state.phase
                 ),
-                rollback_performed: false,
-            },
+            ),
             _ => match self.rollback_to_clean(state) {
-                Ok(summary) => ActResult {
-                    status: ActStatus::Completed,
-                    message: format!("episode ended without commit; rollback executed: {summary}"),
-                    rollback_performed: true,
-                },
-                Err(err) => ActResult {
-                    status: ActStatus::Rejected,
-                    message: format!("rollback failed; episode frozen: {err}"),
-                    rollback_performed: true,
-                },
+                Ok(summary) => Self::act_result_from_state(
+                    state,
+                    ActStatus::Completed,
+                    format!("episode ended without commit; rollback executed: {summary}"),
+                ),
+                Err(err) => Self::act_result_from_state(
+                    state,
+                    ActStatus::Rejected,
+                    format!("rollback failed; episode frozen: {err}"),
+                ),
             },
         }
     }
 
     fn rollback_to_clean(&mut self, state: &mut EpisodeState) -> Result<String, String> {
+        let rollback_required = self.act_kernel.has_experiment_writes();
+        if rollback_required {
+            state.rollback_required = true;
+            state.rollback_attempted = true;
+        }
         match self.act_kernel.discard_episode_writes() {
             Ok(report) => {
+                if rollback_required {
+                    state.rollback_succeeded = Some(true);
+                    state.rollback_error = None;
+                }
                 let summary = serde_json::to_string(&report)
                     .unwrap_or_else(|err| format!("serialization failed: {err}"));
                 state.commit_request = None;
@@ -429,9 +479,28 @@ impl<'a> EpisodeController<'a> {
                 Ok(summary)
             }
             Err(err) => {
+                if rollback_required {
+                    state.rollback_succeeded = Some(false);
+                    state.rollback_error = Some(err.clone());
+                }
                 state.set_phase(EpisodePhase::Frozen);
                 Err(err)
             }
+        }
+    }
+
+    fn act_result_from_state(
+        state: &EpisodeState,
+        status: ActStatus,
+        message: String,
+    ) -> ActResult {
+        ActResult {
+            status,
+            message,
+            rollback_required: state.rollback_required,
+            rollback_attempted: state.rollback_attempted,
+            rollback_succeeded: state.rollback_succeeded,
+            rollback_error: state.rollback_error.clone(),
         }
     }
 }
@@ -459,10 +528,7 @@ fn command_request_from_arguments(
 }
 
 fn is_terminal_phase(phase: EpisodePhase) -> bool {
-    matches!(
-        phase,
-        EpisodePhase::Committed | EpisodePhase::Frozen | EpisodePhase::Finished
-    )
+    matches!(phase, EpisodePhase::Committed | EpisodePhase::Frozen)
 }
 
 #[cfg(test)]
@@ -574,6 +640,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
         assert_eq!(state.phase, EpisodePhase::Clean);
         assert!(!controller.act_kernel.has_experiment_writes());
+        let final_result = controller.finish_episode(&mut state);
+        assert!(final_result.rollback_required);
+        assert!(final_result.rollback_attempted);
+        assert_eq!(final_result.rollback_succeeded, Some(true));
+        assert_eq!(final_result.rollback_error, None);
         let _ = std::fs::remove_file(path);
     }
 
@@ -639,6 +710,34 @@ mod tests {
         assert_eq!(state.phase, EpisodePhase::Clean);
         assert!(!controller.act_kernel.has_experiment_writes());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rollback_failure_freezes_episode_and_records_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "tuning-agent-controller-rollback-failure-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "old\n").unwrap();
+        let mut audit = AuditJournal::new(temp_audit_path("rollback-failure"));
+        let mut controller = EpisodeController::new(test_config(), &mut audit);
+        let mut state = EpisodeState::new(test_episode());
+
+        let experiment = experiment_invocation(&path, "experiment", "test rollback failure");
+        let result = controller.execute_experiment_write(&mut state, &experiment);
+        assert!(result.ok);
+        std::fs::remove_file(&path).unwrap();
+
+        let final_result = controller.finish_episode(&mut state);
+
+        assert_eq!(state.phase, EpisodePhase::Frozen);
+        assert!(final_result.rollback_required);
+        assert!(final_result.rollback_attempted);
+        assert_eq!(final_result.rollback_succeeded, Some(false));
+        assert!(final_result
+            .rollback_error
+            .as_deref()
+            .is_some_and(|error| error.contains("failed to read")));
     }
 
     fn experiment_invocation(path: &std::path::Path, value: &str, reason: &str) -> ToolInvocation {

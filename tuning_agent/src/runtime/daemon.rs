@@ -5,7 +5,8 @@ use crate::activation::source::{EbpfRingbufSource, TimerSource, UnixIpcSource};
 use crate::activation::{ActivationEvent, ActivationKernel};
 use crate::audit::AuditJournal;
 use crate::config::Config;
-use crate::runtime::episode_controller::EpisodeController;
+use crate::runtime::episode_controller::{EpisodeController, EpisodeOutcome};
+use crate::runtime::episode_state::EpisodePhase;
 use crate::types::Episode;
 
 pub struct Runtime {
@@ -57,11 +58,27 @@ impl Runtime {
 
         let episode = Episode::new(event);
         let state = self.activation.state();
-        let mut controller = EpisodeController::new(self.config.clone(), &mut self.audit);
-        controller.run(episode, state)?;
+        let EpisodeOutcome {
+            episode,
+            phase,
+            act_result,
+        } = {
+            let mut controller = EpisodeController::new(self.config.clone(), &mut self.audit);
+            controller.run(episode, state)?
+        };
 
-        self.activation.cooldown(Duration::from_secs(30));
-        self.activation.sleep();
+        if phase == EpisodePhase::Frozen {
+            self.activation.freeze();
+        } else {
+            self.activation.cooldown(Duration::from_secs(30));
+            self.activation.sleep();
+        }
+        self.audit.record_episode_finished(
+            &episode,
+            self.activation.state(),
+            phase,
+            &act_result,
+        )?;
 
         Ok(())
     }

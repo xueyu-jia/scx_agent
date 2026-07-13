@@ -7,6 +7,7 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub llm: LlmConfig,
+    pub reasoning: ReasoningConfig,
     pub activation: ActivationConfig,
     pub audit: AuditConfig,
     pub command: CommandConfig,
@@ -31,8 +32,17 @@ impl Config {
     fn load_file(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|err| format!("failed to read config '{}': {err}", path.display()))?;
-        toml::from_str(&content)
-            .map_err(|err| format!("failed to parse config '{}': {err}", path.display()))
+        let config: Self = toml::from_str(&content)
+            .map_err(|err| format!("failed to parse config '{}': {err}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.reasoning.max_rounds == 0 {
+            return Err("reasoning.max_rounds must be greater than zero".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -43,6 +53,7 @@ pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
     pub timeout_ms: u64,
+    pub retry_count: u32,
 }
 
 impl Default for LlmConfig {
@@ -52,7 +63,20 @@ impl Default for LlmConfig {
             api_key: String::new(),
             model: String::new(),
             timeout_ms: 30_000,
+            retry_count: 3,
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ReasoningConfig {
+    pub max_rounds: usize,
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self { max_rounds: 4 }
     }
 }
 
@@ -127,5 +151,26 @@ impl Default for EvaluationConfig {
             min_settle_seconds: 0,
             max_settle_seconds: 10,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_rounds_default_to_four() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.reasoning.max_rounds, 4);
+    }
+
+    #[test]
+    fn zero_reasoning_rounds_are_rejected() {
+        let mut config = Config::default();
+        config.reasoning.max_rounds = 0;
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "reasoning.max_rounds must be greater than zero"
+        );
     }
 }

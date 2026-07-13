@@ -8,7 +8,6 @@ pub enum EpisodePhase {
     CommitPending,
     Committed,
     Frozen,
-    Finished,
 }
 
 pub struct EpisodeState {
@@ -16,6 +15,10 @@ pub struct EpisodeState {
     pub phase: EpisodePhase,
     pub commit_request: Option<EvaluationPlan>,
     pub evaluation_decision: Option<EvaluationDecision>,
+    pub rollback_required: bool,
+    pub rollback_attempted: bool,
+    pub rollback_succeeded: Option<bool>,
+    pub rollback_error: Option<String>,
 }
 
 impl EpisodeState {
@@ -25,6 +28,10 @@ impl EpisodeState {
             phase: EpisodePhase::Clean,
             commit_request: None,
             evaluation_decision: None,
+            rollback_required: false,
+            rollback_attempted: false,
+            rollback_succeeded: None,
+            rollback_error: None,
         }
     }
 

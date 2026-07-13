@@ -6,6 +6,7 @@ use crate::act::ActResult;
 use crate::activation::ActivationEvent;
 use crate::observation::CoreSnapshot;
 use crate::reasoning::ReasoningOutput;
+use crate::runtime::episode_state::EpisodePhase;
 use crate::tools::ToolResult;
 use crate::types::{escape_json, now_ns, AgentState, Episode};
 
@@ -91,14 +92,20 @@ impl AuditJournal {
         episode: &Episode,
         result: &ActResult,
     ) -> std::io::Result<()> {
-        self.append(&format!(
-            "{{\"ts\":{},\"kind\":\"act_result\",\"episode_id\":{},\"status\":\"{:?}\",\"message\":\"{}\",\"rollback_performed\":{}}}",
-            now_ns(),
-            episode.id,
-            result.status,
-            escape_json(&result.message),
-            result.rollback_performed
-        ))
+        self.append(
+            &serde_json::json!({
+                "ts": now_ns(),
+                "kind": "act_result",
+                "episode_id": episode.id,
+                "status": format!("{:?}", result.status),
+                "message": result.message,
+                "rollback_required": result.rollback_required,
+                "rollback_attempted": result.rollback_attempted,
+                "rollback_succeeded": result.rollback_succeeded,
+                "rollback_error": result.rollback_error,
+            })
+            .to_string(),
+        )
     }
 
     pub fn record_tool_result(
@@ -122,13 +129,20 @@ impl AuditJournal {
         &mut self,
         episode: &Episode,
         state: AgentState,
+        phase: EpisodePhase,
+        result: &ActResult,
     ) -> std::io::Result<()> {
-        self.append(&format!(
-            "{{\"ts\":{},\"kind\":\"episode_finished\",\"episode_id\":{},\"state\":\"{:?}\"}}",
-            now_ns(),
-            episode.id,
-            state
-        ))
+        self.append(
+            &serde_json::json!({
+                "ts": now_ns(),
+                "kind": "episode_finished",
+                "episode_id": episode.id,
+                "state": format!("{state:?}"),
+                "phase": format!("{phase:?}"),
+                "status": format!("{:?}", result.status),
+            })
+            .to_string(),
+        )
     }
 
     fn append(&mut self, line: &str) -> std::io::Result<()> {
@@ -141,5 +155,56 @@ impl AuditJournal {
             .open(&self.path)?;
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::act::ActStatus;
+    use crate::activation::{EventSource, Severity};
+    use crate::types::Scope;
+
+    #[test]
+    fn rollback_and_final_state_fields_are_structured() {
+        let path = std::env::temp_dir().join(format!(
+            "tuning-agent-audit-rollback-{}-{}.jsonl",
+            std::process::id(),
+            now_ns()
+        ));
+        let episode = Episode::new(ActivationEvent::new(
+            EventSource::Cli,
+            "test".to_string(),
+            Severity::Info,
+            Scope::Host,
+        ));
+        let result = ActResult {
+            status: ActStatus::Rejected,
+            message: "rollback failed".to_string(),
+            rollback_required: true,
+            rollback_attempted: true,
+            rollback_succeeded: Some(false),
+            rollback_error: Some("permission denied".to_string()),
+        };
+        let mut journal = AuditJournal::new(path.clone());
+
+        journal.record_act_result(&episode, &result).unwrap();
+        journal
+            .record_episode_finished(&episode, AgentState::Frozen, EpisodePhase::Frozen, &result)
+            .unwrap();
+
+        let records = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["rollback_required"], true);
+        assert_eq!(records[0]["rollback_attempted"], true);
+        assert_eq!(records[0]["rollback_succeeded"], false);
+        assert_eq!(records[0]["rollback_error"], "permission denied");
+        assert_eq!(records[1]["state"], "Frozen");
+        assert_eq!(records[1]["phase"], "Frozen");
+        assert_eq!(records[1]["status"], "Rejected");
+        let _ = fs::remove_file(path);
     }
 }

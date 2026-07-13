@@ -65,7 +65,7 @@ impl ToolRegistry {
             tools: vec![
                 ToolSpec {
                     name: "probe".to_string(),
-                    description: "Request observation data by executing a read-only diagnostic shell command. Use experiment_write for kernel parameter changes.".to_string(),
+                    description: "Execute an unrestricted /bin/sh script for diagnosis. Shell syntax including redirection, pipelines, command substitution, network commands, and background jobs is accepted.".to_string(),
                     input_schema: json!({
                         "type": "object",
                         "additionalProperties": false,
@@ -77,7 +77,7 @@ impl ToolRegistry {
                             },
                             "command": {
                                 "type": "string",
-                                "description": "Diagnostic shell command executed as: sh -c <command>."
+                                "description": "Unrestricted shell script executed as: /bin/sh -c <command>."
                             },
                             "timeout_ms": {
                                 "type": "integer",
@@ -139,7 +139,7 @@ impl ToolRegistry {
                 },
                 ToolSpec {
                     name: "commit".to_string(),
-                    description: "Request final commit of explicitly listed experiment writes. Provide keep_writes plus a low-cost read-only measurement command that prints one JSON object. The Evaluation Kernel restores baseline A', samples it, applies only keep_writes as candidate B', samples again, then validates the model claim, workload invariants, regression guards, and fixed system guardrails.".to_string(),
+                    description: "Request final commit of explicitly listed experiment writes. Provide keep_writes plus a low-cost measurement shell script that prints one JSON object. The Evaluation Kernel restores baseline A', samples it, applies only keep_writes as candidate B', samples again, then validates the model claim, workload invariants, regression guards, and fixed system guardrails.".to_string(),
                     input_schema: json!({
                         "type": "object",
                         "additionalProperties": false,
@@ -175,11 +175,11 @@ impl ToolRegistry {
                                 "type": "object",
                                 "additionalProperties": false,
                                 "required": ["command"],
-                                "description": "Low-cost read-only shell command executed for both baseline A' and commit candidate B'. stdout must be a single JSON object.",
+                                "description": "Low-cost unrestricted shell script executed for both baseline A' and commit candidate B'. stdout must be a single JSON object.",
                                 "properties": {
                                     "command": {
                                         "type": "string",
-                                        "description": "Read-only measurement command. It must output exactly one JSON object on stdout."
+                                        "description": "Measurement shell script. It must output exactly one JSON object on stdout."
                                     },
                                     "schema": {
                                         "type": "object",
