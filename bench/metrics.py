@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -44,3 +45,26 @@ def load_bench_metrics(stdout_path: Path) -> dict[str, Any]:
         "metadata": {},
         "parse_status": "legacy_json_object",
     }
+
+
+def load_perf_stat_metrics(path: Path) -> dict[str, float]:
+    if not path.exists():
+        return {}
+
+    names = {
+        "context-switches": "context_switches",
+        "cpu-migrations": "migrations",
+    }
+    metrics: dict[str, float] = {}
+    with path.open(encoding="utf-8", errors="replace", newline="") as stream:
+        for fields in csv.reader(stream):
+            if len(fields) < 3:
+                continue
+            name = names.get(fields[2].strip())
+            if not name:
+                continue
+            try:
+                metrics[name] = float(fields[0].strip())
+            except ValueError:
+                continue
+    return metrics

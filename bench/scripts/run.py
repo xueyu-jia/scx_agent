@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from bench.analysis.compare import build_analysis
 from bench.analysis.loader import load_result_dir
 from bench.analysis.report import write_html_report
+from bench.base_image import BaseImageManifestError, verify_base_image_manifest
 from bench.config.parser import ConfigError, RunSpec, expand_plan, load_config, parse_cpu_list
 from bench.runner import run_specs
 
@@ -55,14 +56,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _log(f"loading config: {args.config}")
+    base_image_manifest: dict[str, Any] | None = None
     try:
         config = load_config(args.config)
+        if not args.dry_run:
+            base_image_manifest = verify_base_image_manifest(
+                config["libvirt"]["root_image"],
+                REPO_ROOT,
+            )
         baseline = _scheduler(config, args.baseline)
         candidate = _scheduler(config, args.candidate)
         specs = expand_plan(config, args.plan)
         parallel = _resolve_parallel(config, args.parallel)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    except BaseImageManifestError as exc:
+        print(f"base image error: {exc}", file=sys.stderr)
         return 2
 
     if args.baseline == args.candidate:
@@ -98,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         "order": args.order,
         "parallel": parallel,
         "dry_run": args.dry_run,
+        "base_image_manifest": base_image_manifest,
         "experiment_dir": str(experiment_dir.resolve()),
         "execution_order": [],
     }
