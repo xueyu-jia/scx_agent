@@ -23,8 +23,26 @@ REQUIRED_TOP_LEVEL_KEYS = (
 VALID_DIRECTIONS = {"higher", "lower"}
 VALID_CHARTS = {"delta_bar", "latency_bar", "summary_table"}
 VALID_SCHEDULER_KINDS = {"builtin", "scx"}
+VALID_BUILTIN_SCHEDULER_KEYS = {"kind"}
+VALID_SCX_SCHEDULER_KEYS = {
+    "kind",
+    "command",
+    "host_command",
+    "host_kconfig",
+    "args",
+    "env",
+    "settle_seconds",
+}
 VALID_MACHINE_KEYS = {"vcpus", "memory", "pin_cpus", "exclusive", "frequency"}
-VALID_BENCH_DEFAULT_KEYS = {"warmup_seconds", "cooldown_seconds"}
+VALID_BENCH_DEFAULT_KEYS = {"post_warmup_settle_seconds", "cooldown_seconds"}
+VALID_BENCH_KEYS = {
+    "measurement",
+    "warmup",
+    "post_warmup_settle_seconds",
+    "cooldown_seconds",
+    "env",
+}
+VALID_COMMAND_KEYS = {"command", "args", "timeout_seconds"}
 VALID_EXECUTOR_KEYS = {
     "parallel",
     "cpu_source",
@@ -54,7 +72,7 @@ VALID_LIBVIRT_KEYS = {
     "pin_vhost_threads",
     "timeout_extra_seconds",
     "boot_timeout_seconds",
-    "vm_warmup_seconds",
+    "vm_settle_seconds",
     "destroy_on_exit",
     "cpu_mode",
 }
@@ -233,9 +251,9 @@ def _validate_libvirt(config: dict[str, Any]) -> None:
     if not isinstance(boot_timeout, int) or boot_timeout < 1:
         raise ConfigError("libvirt.boot_timeout_seconds must be a positive integer")
 
-    vm_warmup = libvirt.get("vm_warmup_seconds", 0)
-    if not isinstance(vm_warmup, int) or vm_warmup < 0:
-        raise ConfigError("libvirt.vm_warmup_seconds must be a non-negative integer")
+    vm_settle = libvirt.get("vm_settle_seconds", 0)
+    if isinstance(vm_settle, bool) or not isinstance(vm_settle, int) or vm_settle < 0:
+        raise ConfigError("libvirt.vm_settle_seconds must be a non-negative integer")
 
     destroy_on_exit = libvirt.get("destroy_on_exit", True)
     if not isinstance(destroy_on_exit, bool):
@@ -255,15 +273,51 @@ def _validate_schedulers(config: dict[str, Any]) -> None:
             raise ConfigError(
                 f"schedulers.{scheduler_name}.kind must be one of {sorted(VALID_SCHEDULER_KINDS)}"
             )
+
+        valid_keys = (
+            VALID_SCX_SCHEDULER_KEYS
+            if kind == "scx"
+            else VALID_BUILTIN_SCHEDULER_KEYS
+        )
+        unknown_keys = set(scheduler) - valid_keys
+        if unknown_keys:
+            raise ConfigError(
+                f"schedulers.{scheduler_name} has unsupported keys: "
+                f"{sorted(unknown_keys)}"
+            )
+
         if kind == "scx":
-            if not isinstance(scheduler.get("command"), str):
-                raise ConfigError(f"schedulers.{scheduler_name}.command must be a string")
+            command = scheduler.get("command")
+            if not isinstance(command, str) or not command:
+                raise ConfigError(
+                    f"schedulers.{scheduler_name}.command must be a non-empty string"
+                )
+            host_command = scheduler.get("host_command")
+            if host_command is not None and (
+                not isinstance(host_command, str) or not host_command
+            ):
+                raise ConfigError(
+                    f"schedulers.{scheduler_name}.host_command must be a non-empty string"
+                )
+            host_kconfig = scheduler.get("host_kconfig")
+            if host_kconfig is not None and (
+                not isinstance(host_kconfig, str) or not host_kconfig
+            ):
+                raise ConfigError(
+                    f"schedulers.{scheduler_name}.host_kconfig must be a non-empty string"
+                )
+            if host_kconfig is not None and host_command is None:
+                raise ConfigError(
+                    f"schedulers.{scheduler_name}.host_kconfig requires host_command"
+                )
             args = scheduler.get("args", [])
             if not isinstance(args, list):
                 raise ConfigError(f"schedulers.{scheduler_name}.args must be a list")
             for arg in args:
-                if not isinstance(arg, str):
-                    raise ConfigError(f"schedulers.{scheduler_name}.args entries must be strings")
+                if not isinstance(arg, str) or not arg:
+                    raise ConfigError(
+                        f"schedulers.{scheduler_name}.args entries must be non-empty strings"
+                    )
         env = scheduler.get("env", {})
         if not isinstance(env, dict):
             raise ConfigError(f"schedulers.{scheduler_name}.env must be a mapping")
@@ -271,10 +325,10 @@ def _validate_schedulers(config: dict[str, Any]) -> None:
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ConfigError(f"schedulers.{scheduler_name}.env entries must be string:string")
 
-        warmup = scheduler.get("warmup_seconds", 0)
-        if not isinstance(warmup, int) or warmup < 0:
+        settle = scheduler.get("settle_seconds", 0)
+        if isinstance(settle, bool) or not isinstance(settle, int) or settle < 0:
             raise ConfigError(
-                f"schedulers.{scheduler_name}.warmup_seconds must be a non-negative integer"
+                f"schedulers.{scheduler_name}.settle_seconds must be a non-negative integer"
             )
 
 
@@ -457,34 +511,32 @@ def _validate_bench_defaults(config: dict[str, Any]) -> None:
 
 def _validate_benches(config: dict[str, Any]) -> None:
     for bench_name, bench in config["benches"].items():
+        prefix = f"benches.{bench_name}"
         if not isinstance(bench, dict):
-            raise ConfigError(f"benches.{bench_name} must be a mapping")
-        if not isinstance(bench.get("command"), str):
-            raise ConfigError(f"benches.{bench_name}.command must be a string")
-
-        args = bench.get("args", [])
-        if not isinstance(args, list):
-            raise ConfigError(f"benches.{bench_name}.args must be a list")
-        for arg in args:
-            if not isinstance(arg, str):
-                raise ConfigError(f"benches.{bench_name}.args entries must be strings")
-
-        timeout = bench.get("timeout_seconds")
-        if timeout is not None and (not isinstance(timeout, int) or timeout < 1):
-            raise ConfigError(f"benches.{bench_name}.timeout_seconds must be a positive integer")
+            raise ConfigError(f"{prefix} must be a mapping")
+        unknown_keys = set(bench) - VALID_BENCH_KEYS
+        if unknown_keys:
+            raise ConfigError(f"{prefix} has unsupported keys: {sorted(unknown_keys)}")
+        if "measurement" not in bench:
+            raise ConfigError(f"{prefix}.measurement is required")
+        _validate_command(bench["measurement"], f"{prefix}.measurement")
+        if "warmup" in bench:
+            _validate_command(bench["warmup"], f"{prefix}.warmup")
 
         _validate_non_negative_seconds(
             bench,
-            f"benches.{bench_name}",
-            ("warmup_seconds", "cooldown_seconds"),
+            prefix,
+            ("post_warmup_settle_seconds", "cooldown_seconds"),
         )
 
         env = bench.get("env", {})
         if not isinstance(env, dict):
-            raise ConfigError(f"benches.{bench_name}.env must be a mapping")
+            raise ConfigError(f"{prefix}.env must be a mapping")
         for key, value in env.items():
             if not isinstance(key, str) or not isinstance(value, str):
-                raise ConfigError(f"benches.{bench_name}.env entries must be string:string")
+                raise ConfigError(f"{prefix}.env entries must be string:string")
+        if "SCX_BENCH_OUT" in env:
+            raise ConfigError(f"{prefix}.env must not override reserved SCX_BENCH_OUT")
 
 
 def _bench_with_defaults(config: dict[str, Any], bench_name: str) -> dict[str, Any]:
@@ -494,6 +546,33 @@ def _bench_with_defaults(config: dict[str, Any], bench_name: str) -> dict[str, A
     }
 
 
+def _validate_command(value: Any, prefix: str) -> None:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{prefix} must be a mapping")
+
+    unknown_keys = set(value) - VALID_COMMAND_KEYS
+    if unknown_keys:
+        raise ConfigError(f"{prefix} has unsupported keys: {sorted(unknown_keys)}")
+
+    for key in ("command", "timeout_seconds"):
+        if key not in value:
+            raise ConfigError(f"{prefix}.{key} is required")
+
+    if not isinstance(value["command"], str) or not value["command"]:
+        raise ConfigError(f"{prefix}.command must be a non-empty string")
+
+    args = value.get("args", [])
+    if not isinstance(args, list):
+        raise ConfigError(f"{prefix}.args must be a list")
+    for arg in args:
+        if not isinstance(arg, str) or not arg:
+            raise ConfigError(f"{prefix}.args entries must be non-empty strings")
+
+    timeout = value["timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+        raise ConfigError(f"{prefix}.timeout_seconds must be a positive integer")
+
+
 def _validate_non_negative_seconds(
     values: dict[str, Any],
     prefix: str,
@@ -501,7 +580,7 @@ def _validate_non_negative_seconds(
 ) -> None:
     for key in keys:
         value = values.get(key, 0)
-        if not isinstance(value, int) or value < 0:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ConfigError(f"{prefix}.{key} must be a non-negative integer")
 
 

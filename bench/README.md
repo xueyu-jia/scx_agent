@@ -137,9 +137,31 @@ bench/benchmarks/perf_sched.py
 bench/benchmarks/will_it_scale.py
 bench/benchmarks/cyclictest.py
 bench/benchmarks/kernel_build.py
+bench/benchmarks/mixed_class.py
 ```
 
+`mixed_class.py` runs schbench while `stress-ng-cpu` workers saturate the VM.
+It reports separate schbench wakeup/request percentiles alongside batch
+throughput from the same mixed run, making it useful for validating
+workload-class isolation and starvation behavior.
+
 通常不需要手动调用该脚本，`prepare_env.py init` 会自动调用。
+
+benchmark wrapper 会随仓库一起固化到 base image，不会在每次 run 时覆盖。
+修改、增加或删除 `bench/benchmarks/` 下的文件后，必须重建镜像：
+
+```bash
+python3 bench/scripts/prepare_env.py rebuild-image
+python3 bench/scripts/prepare_env.py verify
+```
+
+构建完成后会在 qcow2 旁写入
+`<root_image>.scx-bench-manifest.json`，记录镜像 identity 和整个 wrapper
+目录的逐文件 SHA256。写入 manifest 前，base-init VM 会在 guest 内重新计算
+wrapper 哈希并确认与宿主构建快照一致。`verify` 和非 dry-run 的 `run.py` 都会
+比较该 manifest；镜像被替换、manifest 缺失或任一 wrapper 发生变化时，实验会在
+创建 VM 前拒绝运行。`rebuild-image` 只使用现有 `local.config` 重建镜像，不会覆盖
+其中的 plan、scheduler 或 machine 配置。
 
 ## 配置文件
 
@@ -162,7 +184,7 @@ bench/configs/example.config
 
 ```text
 libvirt         VM 内核、base image、SSH 和 libvirt 设置
-bench_defaults  benchmark 默认 warmup / cooldown 设置
+bench_defaults  benchmark 默认 post-warmup settle / cooldown 设置
 executor         pair 并行、自动 CPU pinning 和 host 资源策略
 schedulers       builtin 或 scx 调度器定义
 plans            smoke / full 等测试计划
@@ -182,20 +204,61 @@ schedulers:
   scx_simple:
     kind: scx
     command: bench/schedulers/scx_simple
+    host_command: bench/schedulers/scx_simple
     args: []
-    warmup_seconds: 2
+    settle_seconds: 2
 ```
 
-warmup 当前使用 sleep 实现，正式 benchmark 的 before/after snapshot 只覆盖测量窗口：
+`command` is the path used inside the guest. When `host_command` is present,
+the runner copies that host executable into each fresh VM overlay and executes
+the staged copy instead, ensuring the run uses the current build rather than a
+binary baked into the base image. Relative `host_command` paths are resolved
+from the repository root.
+
+For schedulers with libbpf kconfig externs on a kernel without
+`CONFIG_IKCONFIG`, set `host_kconfig` and pass the staged path explicitly:
+
+```yaml
+    host_kconfig: /path/to/linux/.config
+    args: [--kconfig, /tmp/scx-bench-kconfig]
+```
+
+VM 与调度器准备阶段使用独立的 settle 时间；workload warmup 必须显式配置
+命令。warmup 成功后等待 `post_warmup_settle_seconds`，再采集 before
+snapshot 并启动正式测量：
 
 ```yaml
 libvirt:
-  vm_warmup_seconds: 10
+  vm_settle_seconds: 10
 
 bench_defaults:
-  warmup_seconds: 2
+  post_warmup_settle_seconds: 2
   cooldown_seconds: 1
+
+benches:
+  schbench_latency:
+    env: {}
+    warmup:
+      command: python3
+      args: [bench/benchmarks/schbench.py, --, -m, "4", -t, "16", -r, "10"]
+      timeout_seconds: 30
+    measurement:
+      command: python3
+      args: [bench/benchmarks/schbench.py, --, -m, "4", -t, "16", -r, "60"]
+      timeout_seconds: 120
 ```
+
+`measurement` 必填，`warmup` 可选；两者都使用结构化的 `command`、可选
+`args` 和必填 `timeout_seconds`。warmup 与正式测量共享 benchmark `env`，
+但 warmup 的 `SCX_BENCH_OUT` 指向独立的 `warmup/` 目录，因此它生成的
+wrapper 输出和 `perf_stat.csv` 不会进入正式测量结果。
+
+runner 为每次 run 生成 `guest_plan.json`，再上传固定的 Python guest
+executor。warmup 与 measurement 的 timeout 都在 guest 内执行；超时、非零
+退出或残留进程会被记录为明确状态并清理整个进程组。warmup 失败时不会启动
+measurement。总 host timeout 包含两个命令的 timeout、三个 settle/cooldown
+阶段及额外余量。dry-run 的 `result.json` 与 `manifest.json` 都保存同一份
+`execution_plan`。
 
 某次实验使用哪个 baseline / candidate 由命令行指定：
 
@@ -379,13 +442,16 @@ runs/
       workload_stderr.log
       scheduler_stdout.log
       scheduler_stderr.log
+      warmup/
+        stdout.log
+        stderr.log
       libvirt_stdout.log
       libvirt_stderr.log
       domain.xml
       placement.json
       disk.qcow2
+      guest_plan.json
       guest_result.json
-      run_guest.sh
       snapshots/
 
   <candidate_scheduler>/

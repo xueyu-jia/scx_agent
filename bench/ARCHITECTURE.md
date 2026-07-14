@@ -19,6 +19,7 @@ bench/
   config/
     parser.py
 
+  base_image.py
   runner.py
 
   scripts/
@@ -30,6 +31,7 @@ bench/
 
   collectors/
     guest.py
+    guest_executor.py
 
   benchmarks/
     generic.py
@@ -70,11 +72,12 @@ Executes a provided list of `RunSpec` objects for one scheduler.
 Key responsibilities:
 
 - create per-run directories;
-- generate guest scripts;
+- build and persist a versioned `guest_plan.json`;
 - create a per-run qcow2 overlay;
 - generate libvirt domain XML;
 - define, start, destroy, and undefine libvirt domains;
-- run the guest script over SSH and copy artifacts back;
+- stage the static guest executor and run plan;
+- invoke the executor over SSH and copy artifacts back;
 - enforce host preflight checks;
 - save per-run metadata and raw artifacts;
 - parse wrapper JSON into `bench_metrics.json`.
@@ -89,6 +92,7 @@ Main experiment entry point.
 Key responsibilities:
 
 - read config;
+- reject stale base images before a real experiment starts;
 - select `--baseline` and `--candidate` schedulers;
 - expand the selected plan;
 - build comparison pairs from expanded `RunSpec` objects;
@@ -112,12 +116,26 @@ Key responsibilities:
 - call `libvirt_env.py prepare`;
 - call `fetch_workloads.py`;
 - create the libvirt base image;
+- write and verify base-image provenance;
+- rebuild only the image through `rebuild-image` without replacing local config;
 - call `isolation.py prepare --no-reboot`;
 - call `libvirt_env.py restore` and `isolation.py restore` from `restore`;
 - verify that the generated environment is usable.
 
 `prepare_env.py` owns machine-local orchestration. It does not run experiments
 and does not own subsystem-specific host mutations.
+
+### `bench/base_image.py`
+
+Owns base-image provenance. It hashes every source file under
+`bench/benchmarks/`, excluding generated Python caches, and binds that snapshot
+to the qcow2 device, inode, size, and modification time. The base initialization
+VM recomputes the wrapper hashes after extraction; the manifest is written only
+after that check passes and the VM has shut down.
+
+`prepare_env.py verify` and non-dry-run `scripts/run.py` use the same verifier.
+The per-run runner does not know which benchmark wrappers exist and does not
+copy wrapper source into guests.
 
 ### `bench/scripts/libvirt_env.py`
 
@@ -184,23 +202,40 @@ before falling back to host `perf`.
 
 ### `bench/collectors/guest.py`
 
-Generates the shell script executed inside the libvirt guest.
+Defines the host-side execution-plan model. It converts validated benchmark,
+scheduler, and libvirt configuration into a versioned JSON document and
+calculates the corresponding host timeout budget.
 
-The guest script:
+It does not execute commands or generate shell source.
 
-- waits for VM-level warmup after SSH is ready;
+### `bench/collectors/guest_executor.py`
+
+A standalone, standard-library Python program staged into each guest. It
+validates the uploaded JSON plan independently before executing it. Keeping
+this boundary static makes argv and environment handling structured and keeps
+the guest independent from the host-side `bench` package.
+
+The guest executor:
+
+- waits for the configured VM settle interval after SSH is ready;
 - starts the selected scheduler if `kind: scx`;
-- waits for scheduler and benchmark warmup;
+- waits for the scheduler to settle;
+- runs optional workload warmup in an isolated process group and output directory;
+- rejects warmup failures, guest-enforced timeouts, leaked processes, or an exited scheduler;
+- waits for the post-warmup settle interval;
 - collects `before` snapshot;
-- runs the workload wrapper;
+- runs measurement in its own process group with a guest-enforced timeout;
 - collects `after` snapshot;
-- waits for benchmark cooldown;
+- verifies that an `scx` scheduler survived the measured workload;
+- waits for cooldown;
 - stops the scheduler;
-- writes `guest_result.json`;
+- atomically writes a structured `guest_result.json`;
 - stores dmesg delta and raw logs.
 
-Warmup and cooldown are outside the measured snapshot window. The benchmark
-wrapper's own metric JSON remains the source of workload performance metrics.
+Warmup, settle, and cooldown are outside the measured snapshot window. Warmup
+artifacts are stored below `warmup/`, so its wrapper output and perf files
+cannot be consumed as measurement metrics. The measured benchmark wrapper's
+metric JSON remains the source of workload performance metrics.
 
 Snapshots currently include:
 
@@ -310,10 +345,12 @@ example.config + prepare_env.py init
   -> local.config
 local.config
   -> config parser
+  -> base image + benchmark wrapper manifest verification
   -> RunSpec list
   -> scripts/run.py chooses scheduler order
   -> runner.py executes scheduler + RunSpec batch
-  -> libvirt guest runs generated run_guest.sh over SSH
+  -> runner.py uploads guest_executor.py + guest_plan.json
+  -> libvirt guest validates and executes the plan
   -> per-run raw artifacts
   -> analysis loader
   -> comparison objects
@@ -358,8 +395,8 @@ schedulers:
 
 `kind: builtin` means no `scx` scheduler process is started.
 
-`kind: scx` means the generated guest script starts the scheduler before the
-workload and stops it after the workload.
+`kind: scx` means the guest executor starts the scheduler before warmup and
+stops it after measurement and cooldown.
 
 The framework treats baseline and candidate identically. Either can be builtin
 or `scx`.
@@ -377,6 +414,11 @@ Per-run raw data:
 ```text
 runs/<scheduler>/run_.../
 ```
+
+`guest_result.json` uses its top-level `status` as the authoritative execution
+outcome. Scheduler, warmup, and measurement details live below `phases`; valid
+failure statuses distinguish scheduler failure, warmup failure/timeout,
+measurement failure/timeout, and internal executor errors.
 
 Machine-readable comparison data:
 

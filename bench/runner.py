@@ -14,13 +14,21 @@ from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree as ET
 
-from bench.collectors.guest import GUEST_OUTPUT_DIR, write_guest_script
-from bench.metrics import load_bench_metrics
+from bench.collectors.guest import (
+    GUEST_EXECUTOR_PATH,
+    GUEST_EXECUTOR_SOURCE,
+    GUEST_OUTPUT_DIR,
+    GUEST_PLAN_PATH,
+    build_guest_run_plan,
+    write_guest_plan,
+)
+from bench.metrics import load_bench_metrics, load_perf_stat_metrics
 
 from bench.config.parser import RunSpec, parse_cpu_list
 
 
 _MANIFEST_LOCK = threading.Lock()
+REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 RUNTIME_ISOLATION_REPORT = Path("/var/lib/scx-bench/runtime-isolation.json")
 
@@ -92,18 +100,16 @@ def _run_one(
     run_dir = result_dir / _run_dir_name(spec)
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    guest_script = run_dir / "run_guest.sh"
+    guest_plan_path = run_dir / "guest_plan.json"
     guest_output_dir = spec.libvirt.get("guest_output_dir", GUEST_OUTPUT_DIR)
-    write_guest_script(
-        guest_script,
-        _bench_command(spec),
-        spec.bench.get("env", {}),
-        scheduler=scheduler,
+    guest_scheduler = _guest_scheduler(scheduler)
+    guest_plan = build_guest_run_plan(
+        spec.bench,
+        guest_scheduler,
+        spec.libvirt,
         output_dir=guest_output_dir,
-        vm_warmup_seconds=_vm_warmup_seconds(spec),
-        bench_warmup_seconds=_bench_warmup_seconds(spec),
-        bench_cooldown_seconds=_bench_cooldown_seconds(spec),
     )
+    write_guest_plan(guest_plan_path, guest_plan)
     domain_name = _domain_name(label, spec, run_dir)
     runtime_dir = _runtime_run_dir(spec.libvirt, domain_name)
     overlay_path = runtime_dir / "disk.qcow2"
@@ -125,7 +131,7 @@ def _run_one(
         "runtime_overlay": str(overlay_path),
         "dry_run": dry_run,
         "placement": placement,
-        "warmup": _warmup_metadata(spec, scheduler),
+        "execution_plan": guest_plan.to_dict(),
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -168,16 +174,20 @@ def _run_one(
         domain_name,
         domain_xml_path,
         overlay_path,
-        guest_script,
+        guest_plan_path,
         guest_output_dir,
-        timeout=_vm_timeout(spec, scheduler),
+        scheduler_host_command=scheduler.get("host_command"),
+        scheduler_host_kconfig=scheduler.get("host_kconfig"),
+        timeout=guest_plan.host_timeout_seconds(
+            int(spec.libvirt.get("timeout_extra_seconds", 120))
+        ),
         boot_timeout=_boot_timeout(spec),
         progress_interval=progress_interval,
         heartbeat=lambda elapsed: _emit_progress(
             progress_callback,
             "heartbeat",
             {"label": label, "spec": spec, "elapsed_seconds": elapsed},
-        )
+        ),
     )
     vm_returncode = completed["returncode"]
     libvirt_stdout = completed["stdout"]
@@ -185,6 +195,7 @@ def _run_one(
     status = completed["status"]
     host_thread_pinning = completed.get("host_thread_pinning", {})
     host_irq_delta = completed.get("host_irq_delta", {})
+    guest_executor = completed.get("guest_executor", {})
 
     finished_at = datetime.now(timezone.utc)
     duration = (finished_at - started_at).total_seconds()
@@ -194,21 +205,13 @@ def _run_one(
 
     guest_result = _read_guest_result(run_dir / "guest_result.json")
     bench_metrics = load_bench_metrics(run_dir / "stdout.log")
+    metrics = bench_metrics.setdefault("metrics", {})
+    if isinstance(metrics, dict):
+        metrics.update(load_perf_stat_metrics(run_dir / "perf_stat.csv"))
     _write_json(run_dir / "bench_metrics.json", bench_metrics)
 
     if status is None:
-        bench_returncode = guest_result.get("bench_returncode")
-        scheduler_returncode = guest_result.get("scheduler_start_returncode")
-        if vm_returncode == 0 and scheduler_returncode == 0 and bench_returncode == 0:
-            status = "PASS"
-        elif scheduler_returncode not in (None, 0):
-            status = "SCHEDULER_FAILED"
-        elif bench_returncode not in (None, 0):
-            status = "BENCH_FAILED"
-        else:
-            status = "FAILED"
-        if host_irq_delta.get("contaminated_irqs") and status == "PASS":
-            status = "INTERRUPT_CONTAMINATED"
+        status = _guest_run_status(vm_returncode, guest_result, host_irq_delta)
 
     metadata.update(
         {
@@ -217,8 +220,10 @@ def _run_one(
             "vm_returncode": vm_returncode,
             "libvirt_returncode": vm_returncode,
             "guest_result": guest_result,
+            "failure_reason": guest_result.get("failure_reason", ""),
             "host_thread_pinning": host_thread_pinning,
             "host_irq_delta": host_irq_delta,
+            "guest_executor": guest_executor,
             "finished_at": finished_at.isoformat(),
             "duration_seconds": duration,
             "bench_metrics": bench_metrics,
@@ -235,8 +240,10 @@ def _run_libvirt(
     domain_name: str,
     domain_xml_path: Path,
     overlay_path: Path,
-    guest_script: Path,
+    guest_plan_path: Path,
     guest_output_dir: str,
+    scheduler_host_command: str | None,
+    scheduler_host_kconfig: str | None,
     timeout: int | None,
     boot_timeout: int,
     progress_interval: int,
@@ -249,6 +256,7 @@ def _run_libvirt(
     returncode: int | None = None
     host_thread_pinning: dict[str, Any] = {}
     host_irq_delta: dict[str, Any] = {}
+    guest_executor: dict[str, str] = {}
     try:
         _prepare_runtime_dir(runtime_dir, stdout_parts, stderr_parts)
         _create_overlay(libvirt, overlay_path, stdout_parts, stderr_parts)
@@ -257,13 +265,44 @@ def _run_libvirt(
         host_thread_pinning = _apply_host_thread_pinning(libvirt, domain_name)
 
         host, port = _wait_for_ssh(libvirt, domain_name, boot_timeout, progress_interval, heartbeat)
-        _scp_to_guest(libvirt, host, port, guest_script, "/tmp/scx-bench-run.sh", stdout_parts, stderr_parts)
+        if scheduler_host_command:
+            _stage_scheduler(
+                libvirt,
+                host,
+                port,
+                scheduler_host_command,
+                scheduler_host_kconfig,
+                stdout_parts,
+                stderr_parts,
+            )
+        _scp_to_guest(
+            libvirt,
+            host,
+            port,
+            GUEST_EXECUTOR_SOURCE,
+            GUEST_EXECUTOR_PATH,
+            stdout_parts,
+            stderr_parts,
+        )
+        _scp_to_guest(
+            libvirt,
+            host,
+            port,
+            guest_plan_path,
+            GUEST_PLAN_PATH,
+            stdout_parts,
+            stderr_parts,
+        )
+        guest_executor = {
+            "source": str(GUEST_EXECUTOR_SOURCE),
+            "guest_path": GUEST_EXECUTOR_PATH,
+            "sha256": _sha256_file(GUEST_EXECUTOR_SOURCE),
+        }
         host_irq_before = _host_interrupt_snapshot()
         completed = _run_guest_command(
             libvirt,
             host,
             port,
-            guest_output_dir,
             timeout,
             progress_interval,
             heartbeat,
@@ -319,14 +358,75 @@ def _run_libvirt(
         stderr_parts,
         host_thread_pinning,
         host_irq_delta,
+        guest_executor,
     )
+
+
+def _guest_scheduler(scheduler: dict[str, Any]) -> dict[str, Any]:
+    if scheduler.get("kind") != "scx" or not scheduler.get("host_command"):
+        return scheduler
+
+    guest_scheduler = dict(scheduler)
+    guest_scheduler["command"] = "/tmp/scx-bench-scheduler"
+    return guest_scheduler
+
+
+def _stage_scheduler(
+    libvirt: dict[str, Any],
+    host: str,
+    port: int,
+    host_command: str,
+    host_kconfig: str | None,
+    stdout_parts: list[str],
+    stderr_parts: list[str],
+) -> None:
+    source = _resolve_host_path(host_command)
+    if not source.is_file():
+        raise RuntimeError(f"scheduler host_command does not exist: {source}")
+    if not os.access(source, os.X_OK):
+        raise RuntimeError(f"scheduler host_command is not executable: {source}")
+
+    destination = "/tmp/scx-bench-scheduler"
+    _scp_to_guest(libvirt, host, port, source, destination, stdout_parts, stderr_parts)
+    _run_command(
+        _ssh_command(libvirt, host, port, f"chmod 0755 {shlex.quote(destination)}"),
+        stdout_parts,
+        stderr_parts,
+    )
+    if host_kconfig:
+        kconfig = _resolve_host_path(host_kconfig)
+        if not kconfig.is_file():
+            raise RuntimeError(f"scheduler host_kconfig does not exist: {kconfig}")
+        _scp_to_guest(
+            libvirt,
+            host,
+            port,
+            kconfig,
+            "/tmp/scx-bench-kconfig",
+            stdout_parts,
+            stderr_parts,
+        )
+
+
+def _resolve_host_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.resolve()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _run_guest_command(
     libvirt: dict[str, Any],
     host: str,
     port: int,
-    guest_output_dir: str,
     timeout: int | None,
     progress_interval: int,
     heartbeat: Callable[[float], None],
@@ -334,10 +434,8 @@ def _run_guest_command(
     stderr_parts: list[str],
 ) -> subprocess.CompletedProcess[str]:
     remote = (
-        f"rm -rf {shlex.quote(guest_output_dir)} && "
-        f"mkdir -p {shlex.quote(guest_output_dir)} && "
-        f"cd {shlex.quote(libvirt['workdir'])} && "
-        "/bin/sh /tmp/scx-bench-run.sh"
+        f"python3 {shlex.quote(GUEST_EXECUTOR_PATH)} "
+        f"{shlex.quote(GUEST_PLAN_PATH)}"
     )
     command = _ssh_command(libvirt, host, port, remote)
     started_at = time.monotonic()
@@ -539,46 +637,32 @@ def _managed_irq_delta(
     }
 
 
-def _bench_command(spec: RunSpec) -> list[str]:
-    return [spec.bench["command"], *spec.bench.get("args", [])]
-
-
-def _vm_timeout(spec: RunSpec, scheduler: dict[str, Any]) -> int | None:
-    bench_timeout = spec.bench.get("timeout_seconds")
-    if bench_timeout is None:
-        return None
-    warmup_timeout = (
-        _vm_warmup_seconds(spec)
-        + int(scheduler.get("warmup_seconds", 0))
-        + _bench_warmup_seconds(spec)
-        + _bench_cooldown_seconds(spec)
-    )
-    return bench_timeout + warmup_timeout + spec.libvirt.get("timeout_extra_seconds", 120)
-
-
 def _boot_timeout(spec: RunSpec) -> int:
     return int(spec.libvirt.get("boot_timeout_seconds", 10))
 
 
-def _vm_warmup_seconds(spec: RunSpec) -> int:
-    return int(spec.libvirt.get("vm_warmup_seconds", 0))
-
-
-def _bench_warmup_seconds(spec: RunSpec) -> int:
-    return int(spec.bench.get("warmup_seconds", 0))
-
-
-def _bench_cooldown_seconds(spec: RunSpec) -> int:
-    return int(spec.bench.get("cooldown_seconds", 0))
-
-
-def _warmup_metadata(spec: RunSpec, scheduler: dict[str, Any]) -> dict[str, int]:
-    return {
-        "vm_warmup_seconds": _vm_warmup_seconds(spec),
-        "scheduler_warmup_seconds": int(scheduler.get("warmup_seconds", 0)),
-        "bench_warmup_seconds": _bench_warmup_seconds(spec),
-        "bench_cooldown_seconds": _bench_cooldown_seconds(spec),
+def _guest_run_status(
+    vm_returncode: int | None,
+    guest_result: dict[str, Any],
+    host_irq_delta: dict[str, Any],
+) -> str:
+    guest_status = str(guest_result.get("status", "")).upper()
+    valid_statuses = {
+        "PASS",
+        "SCHEDULER_FAILED",
+        "WARMUP_FAILED",
+        "WARMUP_TIMEOUT",
+        "BENCH_FAILED",
+        "BENCH_TIMEOUT",
+        "INTERNAL_ERROR",
     }
+    status = guest_status if guest_status in valid_statuses else "FAILED"
+    if status == "PASS" and vm_returncode != 0:
+        status = "FAILED"
+
+    if host_irq_delta.get("contaminated_irqs") and status == "PASS":
+        return "INTERRUPT_CONTAMINATED"
+    return status
 
 
 def _domain_xml(
@@ -897,6 +981,7 @@ def _libvirt_result(
     stderr_parts: list[str],
     host_thread_pinning: dict[str, Any],
     host_irq_delta: dict[str, Any],
+    guest_executor: dict[str, str],
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -905,6 +990,7 @@ def _libvirt_result(
         "stderr": "".join(stderr_parts),
         "host_thread_pinning": host_thread_pinning,
         "host_irq_delta": host_irq_delta,
+        "guest_executor": guest_executor,
     }
 
 
@@ -959,6 +1045,12 @@ def _manifest_entry(
         "label": label,
         "scheduler_config": scheduler,
         "placement": placement,
+        "execution_plan": build_guest_run_plan(
+            spec.bench,
+            _guest_scheduler(scheduler or {"kind": "builtin"}),
+            spec.libvirt,
+            output_dir=spec.libvirt.get("guest_output_dir", GUEST_OUTPUT_DIR),
+        ).to_dict(),
         "plan": spec.plan,
         "run_index": spec.run_index,
         "machine": spec.machine_name,

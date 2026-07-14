@@ -26,13 +26,63 @@ def main(argv: list[str] | None = None) -> int:
 
 def parse_metrics(text: str) -> dict[str, float]:
     metrics: dict[str, float] = {}
-    for percentile, value in re.findall(r"([0-9.]+)th:\s*([0-9.]+)", text):
+    wakeup_metrics = parse_section_metrics(
+        text,
+        "Wakeup Latencies percentiles",
+        "Request Latencies percentiles",
+        "wakeup",
+    )
+    request_metrics = parse_section_metrics(
+        text,
+        "Request Latencies percentiles",
+        "RPS percentiles",
+        "request",
+    )
+    metrics.update(wakeup_metrics)
+    metrics.update(request_metrics)
+
+    if request_metrics:
+        metrics.update(
+            {
+                key.removeprefix("request_"): value
+                for key, value in request_metrics.items()
+            }
+        )
+    else:
+        # Retain compatibility with older schbench output without headings.
+        for percentile, value in re.findall(r"([0-9.]+)th:\s*([0-9.]+)", text):
+            key = percentile_key(percentile)
+            if key:
+                metrics[key] = float(value)
+
+    average_rps = re.findall(r"\baverage\s+rps:\s*([0-9.]+)", text, re.IGNORECASE)
+    current_rps = re.findall(r"\bcurrent\s+rps:\s*([0-9.]+)", text, re.IGNORECASE)
+    generic_rps = re.findall(
+        r"\b(?:requests/sec|RPS):\s*([0-9.]+)",
+        text,
+        re.IGNORECASE,
+    )
+    rps_values = average_rps or current_rps or generic_rps
+    if rps_values:
+        metrics["throughput"] = float(rps_values[-1])
+    return metrics
+
+
+def parse_section_metrics(
+    text: str,
+    heading: str,
+    next_heading: str,
+    prefix: str,
+) -> dict[str, float]:
+    sections = text.split(heading)
+    if len(sections) < 2:
+        return {}
+    section = sections[-1].split(next_heading, 1)[0]
+    metrics: dict[str, float] = {}
+    for percentile, value in re.findall(r"([0-9.]+)th:\s*([0-9.]+)", section):
         key = percentile_key(percentile)
         if key:
-            metrics[key] = float(value)
-    rps = re.search(r"\b(?:RPS|requests/sec|Requests/sec):\s*([0-9.]+)", text, re.IGNORECASE)
-    if rps:
-        metrics["throughput"] = float(rps.group(1))
+            metrics[f"{prefix}_{key}"] = float(value)
     return metrics
 
 

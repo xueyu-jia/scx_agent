@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,6 +25,14 @@ try:
 except ImportError as exc:  # pragma: no cover - environment guard
     raise SystemExit("PyYAML is required: install the 'yaml' Python package") from exc
 
+from bench.base_image import (
+    BaseImageManifestError,
+    base_image_manifest_path,
+    benchmark_wrapper_snapshot,
+    build_base_image_manifest,
+    serialize_base_image_manifest,
+    verify_base_image_manifest,
+)
 from bench.config.parser import ConfigError, load_config, parse_cpu_list
 
 
@@ -107,6 +117,18 @@ def main(argv: list[str] | None = None) -> int:
     verify = subparsers.add_parser("verify", help="verify generated local environment")
     verify.add_argument("--config", default=str(DEFAULT_CONFIG))
 
+    rebuild_image = subparsers.add_parser(
+        "rebuild-image",
+        help="rebuild the base image from the existing local config",
+    )
+    rebuild_image.add_argument("--config", default=str(DEFAULT_CONFIG))
+    rebuild_image.add_argument("--cloud-image", default=str(DEFAULT_CLOUD_IMAGE))
+    rebuild_image.add_argument("--seed-image", default=str(DEFAULT_SEED_IMAGE))
+    rebuild_image.add_argument("--image-url", default=DEFAULT_IMAGE_URL)
+    rebuild_image.add_argument("--image-size", default="40G")
+    rebuild_image.add_argument("--no-install-deps", action="store_true")
+    rebuild_image.add_argument("--dry-run", action="store_true")
+
     restore = subparsers.add_parser("restore", help="restore host settings changed by init")
     restore.add_argument("--config", default=str(DEFAULT_CONFIG))
     restore.add_argument("--reboot", action="store_true", help="reboot after restoring isolation")
@@ -118,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
             return init_environment(args)
         if args.action == "verify":
             return verify_environment(args)
+        if args.action == "rebuild-image":
+            return rebuild_base_image(args)
         if args.action == "restore":
             return restore_environment(args)
     except ConfigError as exc:
@@ -208,11 +232,35 @@ def verify_environment(args: argparse.Namespace) -> int:
         if not ok:
             raise RuntimeError(f"missing {name}: {libvirt.get(name)}")
 
+    verify_base_image_manifest(libvirt["root_image"], REPO_ROOT)
     _verify_libvirt_env(config_path)
     _verify_isolation(config)
     _verify_workloads()
 
     print("environment verified")
+    return 0
+
+
+def rebuild_base_image(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    config = load_config(config_path)
+    _check_host_dependencies(
+        commands={"sudo": "sudo", **REQUIRED_COMMANDS},
+        install=not args.no_install_deps,
+        dry_run=args.dry_run,
+    )
+    _prepare_base_image(
+        config=config,
+        cloud_image=Path(args.cloud_image),
+        seed_image=Path(args.seed_image),
+        image_url=args.image_url,
+        image_size=args.image_size,
+        force=True,
+        dry_run=args.dry_run,
+    )
+    print("base image rebuild planned" if args.dry_run else "base image rebuilt")
+    print(f"image: {config['libvirt']['root_image']}")
+    print(f"manifest: {base_image_manifest_path(config['libvirt']['root_image'])}")
     return 0
 
 
@@ -390,17 +438,25 @@ def _prepare_base_image(
 ) -> None:
     libvirt = config["libvirt"]
     root_image = Path(libvirt["root_image"])
+    manifest_path = base_image_manifest_path(root_image)
     if root_image.exists() and not force:
-        print(f"base image exists: {root_image}")
+        verify_base_image_manifest(root_image, REPO_ROOT)
+        print(f"base image is current: {root_image}")
         return
 
     if force:
-        _run_sudo(["rm", "-f", str(root_image)], dry_run=dry_run)
+        _run_sudo(
+            ["rm", "-f", str(root_image), str(manifest_path)],
+            dry_run=dry_run,
+        )
+    else:
+        _run_sudo(["rm", "-f", str(manifest_path)], dry_run=dry_run)
     _download_cloud_image(image_url, cloud_image, dry_run=dry_run)
     _run_sudo(["qemu-img", "convert", "-O", "qcow2", str(cloud_image), str(root_image)], dry_run)
     _run_sudo(["qemu-img", "resize", str(root_image), image_size], dry_run)
     _write_seed_image(libvirt, seed_image, dry_run=dry_run)
-    _initialize_base_vm(libvirt, seed_image, dry_run=dry_run)
+    wrappers = _initialize_base_vm(libvirt, seed_image, dry_run=dry_run)
+    _write_base_image_manifest(root_image, wrappers, dry_run=dry_run)
 
 
 def _download_cloud_image(url: str, path: Path, dry_run: bool) -> None:
@@ -465,7 +521,11 @@ runcmd:
         )
 
 
-def _initialize_base_vm(libvirt: dict[str, Any], seed_image: Path, dry_run: bool) -> None:
+def _initialize_base_vm(
+    libvirt: dict[str, Any],
+    seed_image: Path,
+    dry_run: bool,
+) -> dict[str, Any] | None:
     name = "scx-bench-base-init"
     _run_sudo(["virsh", "--connect", libvirt["uri"], "destroy", name], dry_run=dry_run, check=False)
     _run_sudo(["virsh", "--connect", libvirt["uri"], "undefine", name], dry_run=dry_run, check=False)
@@ -494,17 +554,29 @@ def _initialize_base_vm(libvirt: dict[str, Any], seed_image: Path, dry_run: bool
     ]
     _run_sudo(command, dry_run=dry_run)
     if dry_run:
-        return
+        return None
 
     host = _wait_for_domain_ip(libvirt, name)
     _wait_for_ssh(libvirt, host)
     _ssh(libvirt, host, "cloud-init status --wait")
     _sanitize_guest_image(libvirt, host)
-    _sync_repo_to_guest(libvirt, host)
+    wrappers_before, wrappers_after, guest_wrappers_match = _sync_repo_to_guest(
+        libvirt,
+        host,
+    )
     _ssh(libvirt, host, "sync && poweroff", check=False)
     time.sleep(5)
     _run_sudo(["virsh", "--connect", libvirt["uri"], "destroy", name], dry_run=False, check=False)
     _run_sudo(["virsh", "--connect", libvirt["uri"], "undefine", name], dry_run=False, check=False)
+    if not guest_wrappers_match:
+        raise BaseImageManifestError(
+            "base image benchmark wrappers do not match the host snapshot; rebuild it"
+        )
+    if wrappers_before != wrappers_after:
+        raise BaseImageManifestError(
+            "benchmark wrappers changed while the base image was being built; rebuild it"
+        )
+    return wrappers_before
 
 
 def _sanitize_guest_image(libvirt: dict[str, Any], host: str) -> None:
@@ -539,10 +611,14 @@ systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate
     )
 
 
-def _sync_repo_to_guest(libvirt: dict[str, Any], host: str) -> None:
+def _sync_repo_to_guest(
+    libvirt: dict[str, Any],
+    host: str,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    wrappers_before = benchmark_wrapper_snapshot(REPO_ROOT)
     workdir = Path(libvirt["workdir"])
     remote_parent = str(workdir.parent)
-    _ssh(libvirt, host, f"mkdir -p {remote_parent}")
+    _ssh(libvirt, host, f"mkdir -p {shlex.quote(remote_parent)}")
     with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
         with tarfile.open(tmp.name, "w:gz") as archive:
             archive.add(REPO_ROOT, arcname=".", filter=_tar_filter)
@@ -550,9 +626,93 @@ def _sync_repo_to_guest(libvirt: dict[str, Any], host: str) -> None:
     _ssh(
         libvirt,
         host,
-        f"rm -rf {libvirt['workdir']} && mkdir -p {libvirt['workdir']} && "
-        f"tar -xzf /tmp/scx_agent.tar.gz -C {libvirt['workdir']}",
+        f"rm -rf {shlex.quote(libvirt['workdir'])} && "
+        f"mkdir -p {shlex.quote(libvirt['workdir'])} && "
+        f"tar -xzf /tmp/scx_agent.tar.gz -C {shlex.quote(libvirt['workdir'])} && "
+        "rm -f /tmp/scx_agent.tar.gz",
     )
+    guest_wrappers_match = _verify_guest_wrapper_snapshot(
+        libvirt,
+        host,
+        wrappers_before,
+    )
+    wrappers_after = benchmark_wrapper_snapshot(REPO_ROOT)
+    return wrappers_before, wrappers_after, guest_wrappers_match
+
+
+def _verify_guest_wrapper_snapshot(
+    libvirt: dict[str, Any],
+    host: str,
+    expected: dict[str, Any],
+) -> bool:
+    remote_manifest = "/tmp/scx-bench-wrapper-snapshot.json"
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        delete=False,
+    ) as temporary:
+        json.dump(expected, temporary, sort_keys=True)
+        temporary_path = Path(temporary.name)
+    try:
+        _scp(libvirt, host, temporary_path, remote_manifest)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    code = (
+        "import json, sys; "
+        "from pathlib import Path; "
+        "from bench.base_image import benchmark_wrapper_snapshot; "
+        "expected = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8')); "
+        "actual = benchmark_wrapper_snapshot(sys.argv[2]); "
+        "raise SystemExit(0 if actual == expected else "
+        "'guest benchmark wrappers do not match host snapshot')"
+    )
+    command = shlex.join(
+        ["python3", "-c", code, remote_manifest, libvirt["workdir"]]
+    )
+    cleanup = f"rm -f {shlex.quote(remote_manifest)}"
+    remote = (
+        f"set -eu; trap {shlex.quote(cleanup)} EXIT; "
+        f"cd {shlex.quote(libvirt['workdir'])}; {command}"
+    )
+    ssh_command = _ssh_base(libvirt, host) + [remote]
+    print("+", shlex.join(ssh_command), flush=True)
+    completed = subprocess.run(ssh_command, check=False)
+    return completed.returncode == 0
+
+
+def _write_base_image_manifest(
+    root_image: Path,
+    wrappers: dict[str, Any] | None,
+    *,
+    dry_run: bool,
+) -> None:
+    destination = base_image_manifest_path(root_image)
+    if dry_run:
+        print(f"would write base image manifest: {destination}")
+        return
+    if wrappers is None:
+        raise BaseImageManifestError("base image build did not produce a wrapper snapshot")
+
+    manifest = build_base_image_manifest(
+        root_image,
+        REPO_ROOT,
+        wrappers=wrappers,
+    )
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        delete=False,
+    ) as temporary:
+        temporary.write(serialize_base_image_manifest(manifest))
+        temporary_path = Path(temporary.name)
+    try:
+        _run_sudo(
+            ["install", "-m", "0644", str(temporary_path), str(destination)],
+            dry_run=False,
+        )
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
