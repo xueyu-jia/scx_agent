@@ -1,5 +1,6 @@
+mod bootstrap;
 mod daemon;
-mod episode_controller;
-pub(crate) mod episode_state;
+mod episode;
+mod recovery;
 
 pub use daemon::Runtime;

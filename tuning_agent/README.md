@@ -1,340 +1,229 @@
 # tuning-agent
 
-`tuning-agent` 是一个使用 Rust 编写的 Linux 内核调优 Agent。
+`tuning-agent` 是一个以 Agent 进行 Linux 性能调优、由可信 Runtime 强制执行安全边界的 Rust 服务。
 
-它的目标不是维护一套越来越庞大的调优规则，而是让模型像内核专家一样观察系统、提出假设、执行受控实验，并通过确定性的验证流程决定是否保留调优结果。
-
-## 当前能力
-
-- 常驻 daemon
-- Unix IPC 激活
-- Timer 激活
-- eBPF ringbuf 激活接入点
-- OpenAI-compatible LLM 接入
-- 不受 shell 语法限制的诊断脚本
-- 结构化内核参数实验写入
-- 自动记录写入前 old value
-- commit 前确定性验证
-- commit 只保留显式声明的 `keep_writes`
-- reject / inconclusive / 未 commit 时自动恢复实验写入
-- JSONL 审计日志
-
-## 基本概念
-
-### Episode
-
-一次激活会启动一个 episode。
-
-在一个 episode 中，Agent 可以：
-
-1. 读取系统状态
-2. 执行实验性内核参数写入
-3. 请求 commit
-4. 由系统验证是否保留 commit
-
-如果 episode 没有成功 commit，实验写入会被恢复。
-
-### Experiment Write
-
-`experiment_write` 是一次实验性写入。
-
-模型只提交目标和值，例如：
-
-```json
-{
-  "target": {
-    "kind": "sysctl",
-    "key": "vm.dirty_ratio"
-  },
-  "value": "10",
-  "reason": "reduce dirty page accumulation"
-}
-```
-
-ActKernel 会自动：
-
-- 读取写入前的 old value
-- 写入新值
-- 再次读取确认当前值
-- 记录该 target 在本 episode 中实验过的 value
-
-模型不需要，也不能提供 rollback command。
-
-### Commit
-
-commit 不是“保留当前系统状态”。
-
-commit 的含义是：
+核心原则：
 
 ```text
-如果验证通过，只保留 keep_writes 中明确列出的 target/value。
+LLM 和 capability provider 决定：观察什么、实验什么、哪些证据表示改善。
+可信 Runtime 决定：何时允许、如何记账、如何恢复、证据是否有效、能否提交。
 ```
 
-如果实验阶段修改了 A、B、C，但 `keep_writes` 只包含 A，那么即使 commit 成功，B 和 C 也会被恢复。
+## 工作流
 
-## 执行边界
-
-模型负责提出：
-
-- 需要观察什么
-- 要实验哪些参数
-- commit 时希望保留哪些写入
-- 如何采样验证指标
-- 哪些指标应该改善
-- 哪些指标不能退化
-
-系统负责强制执行：
-
-- 结构化写入
-- old value 捕获
-- 自动恢复
-- commit candidate 验证
-- 只保留 `keep_writes`
-- 系统级 guardrails
-- 审计日志
-
-MVP 阶段的 `probe` 和 commit measurement 会以 daemon 权限直接交给 `/bin/sh -c`，不检查重定向、管道、命令替换、网络命令、后台任务或其他副作用。结构化写入与回滚约束只覆盖 `experiment_write`，不约束 shell 脚本自行产生的修改。
-
-核心不变量：
+Probe 不再是 episode 阶段，而是一类只读能力。一次 episode 的状态只有：
 
 ```text
-没有通过 experiment_write 实验过的 target/value 不能出现在 keep_writes 中。
-没有出现在 keep_writes 中的实验写入不会被保留。
+Clean
+  -> Experimenting
+  -> CommitPending
+       -> Committed
+       -> RollingBack -> Clean
+       -> RecoveryRequired
 ```
+
+物理 phase 与 `Active / Finishing / Finished` 生命周期正交。图中 rollback 后的 `Clean` 是 `Clean + Finished`；只有 episode 初始的 `Clean + Active` 才能继续调用 Agent 工具。
+
+- `Clean`：没有 episode 范围的未提交 transaction 或 measurement session。它不表示目标可以重新定义；Runtime 生命周期内仍始终持有 WAL 目录的进程级独占锁。
+- `Experimenting`：已冻结 evaluation intent，且 Transaction Kernel 已在 WAL 中持久化当前 transaction 的 intent pin；此后才允许 mutation effect。
+- `CommitPending`：candidate、evaluation intent、contract 和 provider 版本均已冻结；所有 Agent tool call 被阻止。
+- `Committed`：固定 A/B 流程判定改善，provider acknowledgement 与中央 commit seal 完成。
+- `RecoveryRequired`：状态无法确定或恢复失败，Activation Kernel 冻结，不再接受新 episode。
+
+episode 以非 `RecoveryRequired` 结果结束后，Activation Kernel 会进入管理员配置的 cooldown；默认 30 秒内拒绝所有新事件，包括 `Critical`。Cooldown 是全局 activation 状态，不是 episode phase。
+
+Agent 可见的工具来自当前 episode 的 `CapabilitySnapshot`：
+
+- `probe_*`：调用一个注册的只读 `ProbeProvider`。
+- `begin_experiment`：在任何 mutation 前一次性冻结 objective 和完整 evaluation contract。
+- `experiment_*`：调用一个注册的可回滚 `MutationDriver`。
+- `request_commit`：提交 Runtime 生成的 `change_id`，请求可信 Runtime 评估。
+- `abort`：恢复全部未提交修改并结束当前实验。
+
+Measurement 和 Comparison capability 不直接暴露为 Agent tool。Agent 只能在 `begin_experiment` 的 schema 中选择它们，Runtime 在 `CommitPending` 内按固定 A/B 协议调用。
+
+### 一个 episode 一个目标
+
+`begin_experiment` 成功后生成不可变的 `FrozenEvaluationIntent`：
+
+```text
+EpisodeId
+  + normalized ObjectiveStatement
+  + FrozenEvaluationContract
+  -> EvaluationIntentPin(episode_id, intent_digest, contract_digest)
+```
+
+Objective 是面向人类和审计的目标陈述；Contract 中的 primary comparison、guardrail、workload invariant 和 sampling plan 是 Runtime 使用的机器可执行成功标准。Runtime 无法判断自然语言与任意插件 specification 是否语义一致，因此最终判定始终以冻结的 Contract 为准。
+
+同一 `EpisodeId` 只允许一次成功冻结。Contract 校验失败不消耗冻结机会；成功后 Objective 或 Contract 都不能替换。根因假设、Probe 选择和同一 transaction 内的 Mutation 方案仍可调整。完整 rollback 只清除 transaction/candidate，不清除 Intent，并结束当前 episode。需要改变 workload、指标、阈值、Measurement、Comparison 或 sampling 时必须创建新 episode。
+
+## 安全边界
+
+### Transaction Kernel
+
+所有 mutation 都必须经过 Transaction Kernel：
+
+1. provider `prepare` 捕获 resource、baseline、desired state 和 provider pin，且不得产生副作用；
+2. WAL 先持久化 intent，再允许 `apply`；
+3. apply 后必须 readback verify，成功后生成 `change_id`；
+4. baseline restore 按修改顺序的逆序执行；
+5. candidate replay 只接受本 episode 中曾成功实验并验证过的 change；
+6. 外部 drift、丢失响应或 WAL 写入失败均 fail-closed；
+7. provider finalize 只是幂等、无系统副作用的 commit acknowledgement；中央 WAL seal 才是 commit point；
+8. `Started` WAL 在任何 mutation effect 前持久化完整 `EvaluationIntentPin`；
+9. `CommitSealed` 原子保存 terminal changes 与 Runtime 签发的 `CommitAuthorization`，后者绑定同一 intent pin、candidate、decision 和完整 evaluation evidence digest。
+
+每个 transaction 使用独立 JSONL WAL。Runtime 在启动 MCP、写 audit 或扫描恢复状态前先独占 WAL 目录。随后先用 builtin/local Registry 尽早恢复当前可处理的 transaction，再 best-effort 加载 MCP，最后执行完整 recovery gate。损坏日志和各个 pending transaction 会逐项处理并汇总失败；任何未恢复状态、MCP bootstrap 失败或 audit 失败最终都会阻止绑定 activation source，但无关插件故障不会延迟已经可执行的本地 rollback。已封口 transaction 会在启动时重放 reconciliation audit。
+
+当前 V2 `Started` record 强制要求 intent pin，不会通过默认值接受旧 WAL。升级前应先用生成旧 WAL 的版本恢复全部 pending transaction；若未来需要在线兼容，必须实现显式的 rollback-only legacy reader，旧记录不能进入新 commit 流程。
+
+### Evaluation Kernel
+
+当前 evaluation mechanism 固定为：
+
+```text
+restore baseline
+  -> settle
+  -> trusted system guardrail measurement A
+  -> selected domain measurement A
+  -> replay exact candidate
+  -> settle
+  -> trusted system guardrail measurement B
+  -> selected domain measurement B
+  -> comparison evidence
+  -> central verdict
+  -> finalize or rollback
+```
+
+固定 PSI/loadavg guardrail 始终由内置、受信任的 core measurement 采集。MCP measurement 即使返回同名指标，也不能覆盖系统 guardrail 证据。Comparison plugin 只返回结构化 evidence，最终 verdict 仍由 `VerdictKernel` 产生。
+
+domain measurement 的 A/B 两侧必须都提供存在且完全相同的可信 `workload_fingerprint`。任一侧缺失或两侧变化都会得到 `Inconclusive`，不能进入 finalize。
+
+Measurement/Comparison specification 在第一个 mutation 之前完成 provider 预验证。Contract 记录所有 provider pin 并计算 SHA-256；外层 Intent 再绑定 EpisodeId、规范化 Objective 和 contract digest。两层对象在反序列化时都会重新计算，不能由 LLM 伪造或跨 episode 重用。
+
+管理员通过 `[safety].evaluation_timeout_ms` 为整个 A/B 流程设置单调时钟总预算，默认 `600000` ms。Runtime 在 contract 冻结时和每次 mutation 前计算两侧 settle、guardrail/domain sampling interval 的全部确定性等待；计划本身超预算时，在任何系统修改前拒绝实验。进入 A/B 后，baseline restore、candidate replay、settle、measurement open/sample/close、comparison 和中央 verdict 的前后都检查同一个 deadline。provider 声明的单次 timeout 无法装入剩余预算时不会启动调用；超预算会触发正常的 transaction rollback。
+
+成功的 measurement `open` 始终优先执行一次 `close`，即使 deadline 已经过期。MCP transport 能强制其请求 timeout；进程内同步 provider 无法被 Rust 安全地抢占，必须合作遵守声明 timeout，Runtime 只能在调用返回后检测越界。不要把可能无限阻塞的本地实现注册为 capability。
+
+```toml
+[safety]
+evaluation_timeout_ms = 600000
+cooldown_ms = 30000
+```
+
+`cooldown_ms` 是成功恢复或提交后的 activation 间隔；设为 `0` 可由管理员显式关闭 cooldown。
+
+### Capability Policy
+
+Registry 将能力分成四个强类型接口：
+
+```text
+ProbeProvider        read-only，Clean / Experimenting
+MutationDriver       reversible + idempotent，Clean / Experimenting
+MeasurementProvider read-only，CommitPending
+ComparisonPolicy     pure + deterministic，CommitPending
+```
+
+空 `allowed_phases` 不代表“全部允许”，而是无权限。当前不接受 irreversible mutation，也不接受 managed-observation provider；后者需要独立 session WAL 和崩溃恢复协议后才能启用。
+
+任意 shell 不是默认 capability。需要命令的观测或 measurement 必须由内部代码或 MCP provider 预先实现、声明 schema，并通过同一 Registry 策略。
+
+crate 对外只暴露高层 `Config`、`Runtime`、activation DTO 和发送函数。Transaction Kernel、WAL、Coordinator、provider execution handle 与具体 adapter 都是 crate-private，避免嵌入方绕过 recovery、A/B 或 commit authority。代码型 capability 作为受信任代码在仓库内实现 SPI，并且只能由 `runtime/bootstrap.rs` 注册；进程外扩展使用 MCP。
+
+## 内置能力
+
+- `builtin/probe.linux-proc-snapshot.v1`：有界读取 loadavg、meminfo 摘要、PSI、CPU 和 scheduler 计数。调用者不能指定路径或命令。
+- `builtin/measurement.core-system.v1`：采集 loadavg 与 CPU/IO/memory PSI，同时作为固定系统 guardrail 数据源。
+- `builtin/comparison.threshold.v1`：执行 typed metric condition，例如 `decrease_percent_ge`、`increase_abs_le`。
+
+本地 mutation 不提供通用路径写入工具。管理员配置的每个条目会生成一个绑定到单一资源的 capability；Agent 只能提供 `value`：
+
+```toml
+[[capabilities.local_mutations]]
+id = "local/vm-dirty-ratio"
+description = "Experiment with vm.dirty_ratio"
+kind = "sysctl"
+key = "vm.dirty_ratio"
+```
+
+还支持显式绑定的 `proc_sys`、`sysfs` 和 `cgroup` 绝对路径。provider 会 canonicalize 路径并确认其位于对应 Linux 根目录下。
+
+## MCP 扩展
+
+MCP Server 通过固定 resource `tuning://capabilities/v1` 发布 tuning capability manifest。普通 `tools/list` 描述或 MCP annotations 不会被当作安全授权。
+
+Runtime 在启动时：
+
+1. 以 stdio 初始化 MCP Server；子进程环境默认清空，只传递配置中的显式 `env`；
+2. 读取并严格解析 manifest，拒绝未知字段和不支持的 schema；
+3. 对照 `tools/list` 验证 manifest 引用的 operation；
+4. 强制将 provider class 设为 `Mcp`，应用全局和 per-server allowlist；
+5. 默认拒绝 MCP mutation，只有 server 配置 `allow_mutations = true` 才可注册；
+6. 将四类 provider 注入同一个 `CapabilityRegistry`。
+
+示例配置：
+
+```toml
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+id = "scheduler-observer"
+enabled = true
+command = "/usr/local/libexec/scheduler-observer-mcp"
+args = []
+request_timeout_ms = 30000
+allowed_capabilities = []
+allow_mutations = false
+
+[mcp.servers.env]
+RUST_LOG = "warn"
+```
+
+Registry 在 episode 开始时生成 immutable snapshot。provider 不会在存在未恢复 mutation 时热更新或卸载。
+
+MCP manifest 是协议与授权输入，不是对恶意进程的 sandbox。Server 仍应以完成其能力所需的最低 OS 用户、capability、cgroup 和文件权限运行；`allow_mutations` 只应授予受审计的 provider。
+
+MCP Server 作者需要遵守的 manifest、operation DTO、schema 与恢复契约见 [`MCP_CAPABILITIES.md`](MCP_CAPABILITIES.md)。
 
 ## 运行
 
-构建：
-
 ```bash
+cd tuning_agent
 cargo build
-```
-
-复制示例配置：
-
-```bash
 cp tuning-agent.example.toml tuning-agent.toml
-```
-
-编辑 `tuning-agent.toml` 后启动 daemon：
-
-```bash
 ./target/debug/tuning-agent --config tuning-agent.toml daemon
 ```
 
-如果当前目录存在 `tuning-agent.toml`，也可以省略 `--config`：
+发送一次激活：
 
 ```bash
-./target/debug/tuning-agent daemon
+cargo run -- --config tuning-agent.toml activate \
+  "diagnose current host performance" info cli
 ```
 
-发送激活事件：
-
-```bash
-cargo run -- --config tuning-agent.toml activate "diagnose current host performance" info cli
-```
-
-如果需要 root 权限运行 daemon，建议先构建再运行二进制：
-
-```bash
-cargo build
-sudo ./target/debug/tuning-agent --config tuning-agent.toml daemon
-```
-
-避免直接 `sudo cargo run`，因为 root 环境中的 Cargo 版本可能无法解析当前 `Cargo.lock`。
-
-## 配置
-
-配置只来自 TOML 文件和默认值，不再读取环境变量。
-
-优先级：
+配置优先级：
 
 ```text
 显式 --config 文件
   > 当前目录 tuning-agent.toml
-  > 默认值
+  > 安全默认值
 ```
 
-如果显式指定 `--config`，但文件不存在或格式错误，程序会直接退出。
+配置使用 `deny_unknown_fields`。V1 的 `[command]`、`[evaluation]`、`experiment_write`、shell measurement 等配置和协议已删除，出现时会直接报错，避免静默使用无效安全设置。
 
-示例：
-
-```toml
-[llm]
-base_url = "http://127.0.0.1:7001"
-api_key = "123456"
-model = "gpt-5.5"
-timeout_ms = 30000
-retry_count = 3
-
-[reasoning]
-max_rounds = 4
-
-[activation]
-socket_path = "/tmp/tuning-agent.sock"
-# timer_interval_ms = 60000
-# ebpf_ringbuf_pin = "/sys/fs/bpf/tuning_agent_events"
-
-[audit]
-path = "logs/audit.jsonl"
-
-[command]
-timeout_ms = 30000
-output_limit_bytes = 65536
-evaluation_output_limit_bytes = 8192
-
-[evaluation]
-default_window_seconds = 10
-min_window_seconds = 3
-max_window_seconds = 60
-default_settle_seconds = 3
-min_settle_seconds = 0
-max_settle_seconds = 10
-```
-
-`llm.retry_count` 表示首次请求失败后的重试次数，默认值为 `3`。所有请求错误都会重试，重试间隔固定为 1 秒；例如配置为 `3` 时最多发起 4 次请求。
-
-`reasoning.max_rounds` 表示每个 episode 最多进行多少轮 reasoning/tool 交互，默认值为 `4`，必须大于 `0`。
-
-说明：当前 eBPF ringbuf 是接入点，真实 ringbuf reader 还需要明确 BPF object/map contract。
-
-## 模型工具
-
-### probe
-
-执行不受 shell 语法限制的 `/bin/sh` 脚本。
-
-示例：
-
-```json
-{
-  "name": "io_pressure",
-  "command": "cat /proc/pressure/io",
-  "timeout_ms": 1000,
-  "working_dir": "/"
-}
-```
-
-命令只要求非空；重定向、管道、`&&`、命令替换、网络访问、后台任务和修改系统状态的命令都会原样交给 `/bin/sh -c`。
-
-### experiment_write
-
-执行结构化实验写入。
-
-示例：
-
-```json
-{
-  "target": {
-    "kind": "sysctl",
-    "key": "vm.dirty_ratio"
-  },
-  "value": "10",
-  "reason": "reduce dirty page accumulation"
-}
-```
-
-支持的 target：
-
-```json
-{ "kind": "sysctl", "key": "vm.dirty_ratio" }
-{ "kind": "proc_sys", "path": "/proc/sys/vm/dirty_ratio" }
-{ "kind": "sysfs", "path": "/sys/..." }
-{ "kind": "cgroup", "path": "/sys/fs/cgroup/..." }
-```
-
-### commit
-
-请求验证并保留明确列出的写入。
-
-示例：
-
-```json
-{
-  "reason": "dirty_ratio reduction should reduce IO pressure",
-  "keep_writes": [
-    {
-      "target": {
-        "kind": "sysctl",
-        "key": "vm.dirty_ratio"
-      },
-      "value": "10"
-    }
-  ],
-  "measurement": {
-    "command": "io=$(awk '/full/ {for(i=1;i<=NF;i++) if($i ~ /^avg10=/){split($i,a,\"=\"); print a[2]}}' /proc/pressure/io); printf '{\"io_full_avg10\":%s}\\n' \"$io\"",
-    "schema": {
-      "io_full_avg10": "number"
-    },
-    "timeout_ms": 1000
-  },
-  "primary_metrics": [
-    {
-      "metric": "io_full_avg10",
-      "op": "decrease_percent_ge",
-      "value": 10
-    }
-  ],
-  "workload_invariants": [
-    {
-      "metric": "loadavg.1m",
-      "op": "change_percent_le",
-      "value": 50
-    }
-  ],
-  "regression_guards": [
-    {
-      "metric": "psi.cpu.full.avg10",
-      "op": "increase_abs_le",
-      "value": 1
-    }
-  ],
-  "window_seconds": 5,
-  "settle_seconds": 1
-}
-```
-
-`measurement.command` 必须输出单个 JSON object。系统会对 baseline A' 和 candidate B' 使用同一个 measurement command。
-
-`window_seconds` 和 `settle_seconds` 是模型对本次 commit 的建议值。实际使用值会被 `[evaluation]` 中的 min/max 边界裁剪，模型不能绕过配置文件设置的验证时间范围。
-
-## Metric Operator
-
-支持：
-
-```text
-decrease_percent_ge
-decrease_abs_ge
-increase_percent_ge
-increase_abs_ge
-increase_percent_le
-increase_abs_le
-decrease_percent_le
-decrease_abs_le
-change_percent_le
-change_abs_le
-current_le
-current_ge
-```
-
-## 内置系统防线
-
-模型可以提供 `regression_guards`，但系统始终额外检查固定 guardrails：
-
-```text
-psi.cpu.full.avg10
-psi.io.full.avg10
-psi.memory.full.avg10
-loadavg.1m
-```
-
-这些指标由系统采集，不依赖模型提供的 measurement。
-
-## 开发检查
+## 验证
 
 ```bash
-cargo fmt -- --check
-cargo check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --check
+cargo test --offline
+cargo clippy --offline --all-targets -- -D warnings
 ```
+
+部分受限 sandbox 会禁止 Unix socket `bind(2)`；这种环境下可以只跳过对应 IPC 测试，其余 transaction、evaluation、provider 和端到端 episode 测试仍应全部运行：
+
+```bash
+cargo test --offline -- --skip activation::source::unix::tests::unix_ipc_source_receives_activation_event
+```
+
+开发者模块边界和扩展契约见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。

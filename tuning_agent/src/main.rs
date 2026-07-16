@@ -1,21 +1,9 @@
-mod act;
-mod activation;
-mod audit;
-mod config;
-mod evaluate;
-mod observation;
-mod reasoning;
-mod runtime;
-mod tools;
-mod types;
-
 use std::path::PathBuf;
 
-use activation::source::send_unix_activation;
-use activation::{ActivationEvent, EventSource, Severity};
-use config::Config;
-use runtime::Runtime;
-use types::Scope;
+use tuning_agent::activation::source::send_unix_activation;
+use tuning_agent::activation::{ActivationEvent, EventSource, Scope, Severity};
+use tuning_agent::config::Config;
+use tuning_agent::runtime::Runtime;
 
 fn main() {
     let args = parse_args();
@@ -29,7 +17,13 @@ fn main() {
 
     match args.command {
         Command::Daemon => {
-            let mut runtime = Runtime::new(config);
+            let mut runtime = match Runtime::new(config) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("runtime initialization error: {err}");
+                    std::process::exit(1);
+                }
+            };
             if let Err(err) = runtime.run_daemon() {
                 eprintln!("tuning-agent error: {err}");
                 std::process::exit(1);
@@ -111,7 +105,6 @@ fn parse_severity(input: &str) -> Severity {
 
 fn parse_source(input: &str) -> EventSource {
     match input {
-        "ebpf" => EventSource::Ebpf,
         "internal" => EventSource::Internal,
         "cli" => EventSource::Cli,
         name => EventSource::Program(name.to_string()),
@@ -122,12 +115,10 @@ fn print_help() {
     println!("usage:");
     println!("  tuning-agent [--config path] daemon");
     println!(
-        "  tuning-agent [--config path] activate [event_type] [info|warning|critical] [cli|ebpf|internal|name] [cgroup_path]"
+        "  tuning-agent [--config path] activate [event_type] [info|warning|critical] [cli|internal|name] [cgroup_path]"
     );
     println!();
-    println!("mvp behavior:");
-    println!(
-        "  daemon listens for Unix IPC activation events, timer events, and the eBPF source hook."
-    );
+    println!("behavior:");
+    println!("  daemon listens for Unix IPC and configured timer activation events.");
     println!("  activate sends one ActivationEvent to the daemon over Unix IPC.");
 }

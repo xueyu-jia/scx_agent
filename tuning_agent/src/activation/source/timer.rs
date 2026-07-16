@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
+use crate::activation::Scope;
 use crate::activation::{ActivationEvent, EventSource, Severity};
-use crate::types::Scope;
 
 pub struct TimerSource {
     interval: Option<Duration>,

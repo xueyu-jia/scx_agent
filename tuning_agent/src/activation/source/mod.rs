@@ -1,7 +1,6 @@
-mod ebpf;
 mod timer;
 mod unix;
 
-pub use ebpf::EbpfRingbufSource;
-pub use timer::TimerSource;
-pub use unix::{send_unix_activation, UnixIpcSource};
+pub(crate) use timer::TimerSource;
+pub use unix::send_unix_activation;
+pub(crate) use unix::UnixIpcSource;

@@ -1,2 +1,4 @@
 /target/
 /logs/
+/state/
+/tuning-agent.toml

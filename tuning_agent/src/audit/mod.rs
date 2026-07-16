@@ -1,3 +1,3 @@
-mod journal;
+mod sink;
 
-pub use journal::AuditJournal;
+pub use sink::{AuditRecord, AuditSink, JsonlAuditSink};

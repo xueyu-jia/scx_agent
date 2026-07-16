@@ -1,85 +1,274 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::activation::source::{EbpfRingbufSource, TimerSource, UnixIpcSource};
+use serde_json::json;
+
+use crate::activation::source::{TimerSource, UnixIpcSource};
 use crate::activation::{ActivationEvent, ActivationKernel};
-use crate::audit::AuditJournal;
+use crate::adapters::openai::OpenAiReasoner;
+use crate::audit::{AuditRecord, AuditSink, JsonlAuditSink};
+use crate::capability::CapabilityRegistry;
 use crate::config::Config;
-use crate::runtime::episode_controller::{EpisodeController, EpisodeOutcome};
-use crate::runtime::episode_state::EpisodePhase;
-use crate::types::Episode;
+use crate::domain::{EpisodeId, EpisodePhase};
+use crate::kernel::transaction::TransactionStore;
+use crate::runtime::bootstrap::{
+    build_local_registry, extend_registry_with_mcp, RegistryBootstrap,
+};
+use crate::runtime::episode::EpisodeCoordinator;
+use crate::runtime::recovery::{
+    recover_available_before_plugin_bootstrap, recover_before_activation,
+};
 
 pub struct Runtime {
     config: Config,
     activation: ActivationKernel,
-    audit: AuditJournal,
+    audit: JsonlAuditSink,
+    capabilities: CapabilityRegistry,
+    transactions: TransactionStore,
 }
 
 impl Runtime {
-    pub fn new(config: Config) -> Self {
-        let audit = AuditJournal::new(config.audit.path.clone());
-        Self {
+    pub fn new(config: Config) -> Result<Self, String> {
+        config.validate()?;
+        // Store construction acquires the process-level WAL directory lock.
+        // It must precede plugin startup, audit writes, and recovery discovery.
+        let transactions = TransactionStore::new(&config.transaction.wal_dir)
+            .map_err(|error| error.to_string())?;
+        let mut bootstrap = build_local_registry(&config.capabilities, &config.mcp);
+        recover_available_before_plugin_bootstrap(&transactions, bootstrap.registry.snapshot());
+        extend_registry_with_mcp(&mut bootstrap, &config.mcp);
+        let RegistryBootstrap {
+            registry: capabilities,
+            notices: bootstrap_notices,
+            failures: bootstrap_failures,
+        } = bootstrap;
+        let mut audit = JsonlAuditSink::new(&config.audit.path);
+        let mut activation_blockers = Vec::new();
+
+        if let Err(error) =
+            recover_before_activation(&transactions, capabilities.snapshot(), &mut audit)
+        {
+            activation_blockers.push(error);
+        }
+
+        for notice in bootstrap_notices {
+            if let Err(error) = audit.record(&AuditRecord::runtime("mcp_server_loaded", notice)) {
+                activation_blockers.push(format!("failed to audit MCP bootstrap: {error}"));
+            }
+        }
+        for failure in bootstrap_failures {
+            activation_blockers.push(format!(
+                "capability bootstrap '{}' failed: {}",
+                failure.component, failure.error
+            ));
+            if let Err(error) = audit.record(&AuditRecord::runtime(
+                "capability_bootstrap_failed",
+                json!({
+                    "component": failure.component,
+                    "error": failure.error,
+                }),
+            )) {
+                activation_blockers.push(format!("failed to audit bootstrap failure: {error}"));
+            }
+        }
+        if let Err(error) = audit.record(&AuditRecord::runtime(
+            "capability_registry_ready",
+            json!({
+                "generation": capabilities.snapshot().generation(),
+                "capability_count": capabilities.len(),
+            }),
+        )) {
+            activation_blockers.push(format!("failed to initialize audit sink: {error}"));
+        }
+
+        if !activation_blockers.is_empty() {
+            return Err(format!(
+                "runtime activation blocked after recovery: {}",
+                activation_blockers.join("; ")
+            ));
+        }
+        Ok(Self {
             config,
             activation: ActivationKernel::default(),
             audit,
-        }
+            capabilities,
+            transactions,
+        })
     }
 
     pub fn run_daemon(&mut self) -> std::io::Result<()> {
         let mut unix_source = UnixIpcSource::bind(self.config.activation.socket_path.clone())?;
         let mut timer_source = TimerSource::new(self.config.activation.timer_interval_ms);
-        let mut ebpf_source =
-            EbpfRingbufSource::new(self.config.activation.ebpf_ringbuf_pin.clone());
 
         println!(
             "tuning-agent daemon listening on {}",
             unix_source.path().display()
         );
-
         loop {
             let mut events = unix_source.poll()?;
             events.extend(timer_source.poll());
-            events.extend(ebpf_source.poll());
-
             for event in events {
                 self.process_activation_event(event)?;
             }
-
             thread::sleep(Duration::from_millis(50));
         }
     }
 
     fn process_activation_event(&mut self, event: ActivationEvent) -> std::io::Result<()> {
         if !self.activation.accept(&event) {
-            self.audit
-                .record_activation_rejected(&event, self.activation.state())?;
+            self.audit.record(&AuditRecord::runtime(
+                "activation_rejected",
+                json!({
+                    "event": event,
+                    "activation_state": format!("{:?}", self.activation.state()),
+                }),
+            ))?;
             return Ok(());
         }
 
-        let episode = Episode::new(event);
-        let state = self.activation.state();
-        let EpisodeOutcome {
-            episode,
-            phase,
-            act_result,
-        } = {
-            let mut controller = EpisodeController::new(self.config.clone(), &mut self.audit);
-            controller.run(episode, state)?
+        let episode_id = next_episode_id();
+        let activation = serde_json::to_value(&event).map_err(std::io::Error::other)?;
+        let mut reasoner = match OpenAiReasoner::new(&self.config.llm) {
+            Ok(reasoner) => reasoner,
+            Err(error) => {
+                self.activation.sleep();
+                self.audit.record(&AuditRecord::episode(
+                    "episode_rejected",
+                    episode_id,
+                    EpisodePhase::Clean,
+                    json!({"error": error}),
+                ))?;
+                return Ok(());
+            }
         };
+        let outcome = EpisodeCoordinator::new(
+            self.config.reasoning.max_rounds,
+            Duration::from_millis(self.config.safety.evaluation_timeout_ms),
+            self.capabilities.snapshot(),
+            &self.transactions,
+            &mut self.audit,
+        )
+        .and_then(|mut coordinator| coordinator.run(episode_id, activation, &mut reasoner))
+        .map_err(std::io::Error::other)?;
 
-        if phase == EpisodePhase::Frozen {
+        if outcome.phase == EpisodePhase::RecoveryRequired {
             self.activation.freeze();
         } else {
-            self.activation.cooldown(Duration::from_secs(30));
-            self.activation.sleep();
+            self.activation
+                .cooldown(Duration::from_millis(self.config.safety.cooldown_ms));
         }
-        self.audit.record_episode_finished(
-            &episode,
-            self.activation.state(),
-            phase,
-            &act_result,
-        )?;
-
+        println!(
+            "episode {} finished; phase={:?}; {}",
+            outcome.episode_id, outcome.phase, outcome.summary
+        );
         Ok(())
+    }
+}
+
+fn next_episode_id() -> EpisodeId {
+    static LAST_ID: AtomicU64 = AtomicU64::new(0);
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default();
+    let mut observed = LAST_ID.load(Ordering::Relaxed);
+    loop {
+        let next = clock.max(observed.saturating_add(1));
+        match LAST_ID.compare_exchange_weak(observed, next, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return EpisodeId::new(next),
+            Err(current) => observed = current,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::transaction::{TransactionWal, WalEntry, WalEvent};
+
+    #[test]
+    fn generated_episode_ids_are_monotonic() {
+        assert!(next_episode_id().get() < next_episode_id().get());
+    }
+
+    #[test]
+    fn a_second_runtime_cannot_share_the_transaction_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "tuning-agent-runtime-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = Config::default();
+        config.transaction.wal_dir = root.join("transactions");
+        config.audit.path = root.join("audit.jsonl");
+        let first = Runtime::new(config.clone()).unwrap();
+        config.mcp.servers.push(crate::config::McpServerConfig {
+            id: "must-not-start".into(),
+            command: "/definitely/missing/mcp-server".into(),
+            request_timeout_ms: 1,
+            ..crate::config::McpServerConfig::default()
+        });
+
+        let error = Runtime::new(config)
+            .err()
+            .expect("second runtime must fail");
+
+        assert!(error.contains("already owned by another runtime"));
+        drop(first);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_bootstrap_failure_does_not_prevent_early_transaction_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "tuning-agent-runtime-recovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = Config::default();
+        config.transaction.wal_dir = root.join("transactions");
+        config.audit.path = root.join("audit.jsonl");
+        config.mcp.servers.push(crate::config::McpServerConfig {
+            id: "unavailable".into(),
+            command: "/definitely/missing/mcp-server".into(),
+            request_timeout_ms: 1,
+            ..crate::config::McpServerConfig::default()
+        });
+        let transaction_id = crate::domain::TransactionId::new("pending").unwrap();
+        let store = TransactionStore::new(&config.transaction.wal_dir).unwrap();
+        let mut wal = store.create(&transaction_id).unwrap();
+        wal.append_durable(&WalEntry {
+            sequence: 0,
+            transaction_id: transaction_id.clone(),
+            event: WalEvent::Started {
+                intent_pin: crate::domain::EvaluationIntentPin::new(
+                    EpisodeId::new(1),
+                    crate::domain::Digest::new("test-intent").unwrap(),
+                    crate::domain::Digest::new("test-contract").unwrap(),
+                ),
+                capability_generation: 0,
+            },
+        })
+        .unwrap();
+        drop(wal);
+        drop(store);
+
+        let error = Runtime::new(config.clone()).err().unwrap();
+
+        assert!(error.contains("mcp_server/unavailable"));
+        let store = TransactionStore::new(&config.transaction.wal_dir).unwrap();
+        let inventory = store.discover().unwrap();
+        assert!(inventory.pending.is_empty());
+        assert_eq!(inventory.sealed.len(), 1);
+        assert_eq!(inventory.sealed[0].transaction_id, transaction_id);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

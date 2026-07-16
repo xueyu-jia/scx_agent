@@ -1,23 +1,17 @@
-use crate::types::{escape_json, now_ns, Scope};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum Scope {
+    Host,
+    Cgroup(String),
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum EventSource {
     Cli,
-    Ebpf,
     Program(String),
     Internal,
-}
-
-impl EventSource {
-    pub fn as_json(&self) -> String {
-        match self {
-            Self::Cli => "\"cli\"".to_string(),
-            Self::Ebpf => "\"ebpf\"".to_string(),
-            Self::Program(name) => format!("{{\"program\":\"{}\"}}", escape_json(name)),
-            Self::Internal => "\"internal\"".to_string(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -25,6 +19,13 @@ pub enum Severity {
     Info,
     Warning,
     Critical,
+}
+
+fn now_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 impl Severity {
