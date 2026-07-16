@@ -8,6 +8,7 @@ from bench.config.parser import (
     _validate_bench_defaults,
     _validate_benches,
     _validate_schedulers,
+    _validate_treatments,
     expand_plan,
 )
 
@@ -102,11 +103,81 @@ class BenchCommandValidationTest(unittest.TestCase):
             )
 
     def test_reserved_output_environment_cannot_be_overridden(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "reserved SCX_BENCH_OUT"):
+        with self.assertRaisesRegex(ConfigError, "reserved variables.*SCX_BENCH_OUT"):
             self._validate(
                 {
                     "measurement": command(),
                     "env": {"SCX_BENCH_OUT": "/tmp/other"},
+                }
+            )
+
+
+class TreatmentConfigTest(unittest.TestCase):
+    def test_treatment_command_policy_and_environment_are_valid(self) -> None:
+        _validate_treatments(
+            {
+                "treatments": {
+                    "agent_tuned": {
+                        **command(["python3", "tune.py"], 600),
+                        "host_command": "bench/treatments/tune.py",
+                        "host_support_files": ["bench/treatments/mock_openai_llm.py"],
+                        "env": {"MODE": "tune"},
+                        "post_treatment_settle_seconds": 5,
+                        "allow_no_commit": True,
+                    }
+                }
+            }
+        )
+
+    def test_treatment_requires_a_bounded_command(self) -> None:
+        with self.assertRaisesRegex(
+            ConfigError,
+            r"treatments\.agent_tuned\.timeout_seconds is required",
+        ):
+            _validate_treatments(
+                {
+                    "treatments": {
+                        "agent_tuned": {
+                            "command": "tune",
+                        }
+                    }
+                }
+            )
+
+    def test_treatment_rejects_invalid_policy_and_reserved_environment(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "allow_no_commit must be a boolean"):
+            _validate_treatments(
+                {
+                    "treatments": {
+                        "agent_tuned": {
+                            **command(),
+                            "allow_no_commit": "yes",
+                        }
+                    }
+                }
+            )
+
+        with self.assertRaisesRegex(ConfigError, "SCX_BENCH_ROLE"):
+            _validate_treatments(
+                {
+                    "treatments": {
+                        "agent_tuned": {
+                            **command(),
+                            "env": {"SCX_BENCH_ROLE": "candidate"},
+                        }
+                    }
+                }
+            )
+
+        with self.assertRaisesRegex(ConfigError, "host_support_files must be a string list"):
+            _validate_treatments(
+                {
+                    "treatments": {
+                        "agent_tuned": {
+                            **command(),
+                            "host_support_files": ["ok", ""],
+                        }
+                    }
                 }
             )
 

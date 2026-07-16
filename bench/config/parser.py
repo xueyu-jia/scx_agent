@@ -43,6 +43,21 @@ VALID_BENCH_KEYS = {
     "env",
 }
 VALID_COMMAND_KEYS = {"command", "args", "timeout_seconds"}
+VALID_TREATMENT_KEYS = {
+    *VALID_COMMAND_KEYS,
+    "host_command",
+    "host_support_files",
+    "env",
+    "post_treatment_settle_seconds",
+    "allow_no_commit",
+}
+RESERVED_GUEST_ENV = {
+    "SCX_BENCH_OUT",
+    "SCX_BENCH_ROLE",
+    "SCX_BENCH_VARIANT",
+    "SCX_BENCH_TREATMENT",
+    "SCX_BENCH_TREATMENT_OUTCOME",
+}
 VALID_EXECUTOR_KEYS = {
     "parallel",
     "cpu_source",
@@ -121,6 +136,7 @@ def validate_config(config: dict[str, Any]) -> None:
 
     _validate_libvirt(config)
     _validate_schedulers(config)
+    _validate_treatments(config)
     _validate_executor(config)
     _validate_plans(config)
     _validate_machines(config)
@@ -324,12 +340,58 @@ def _validate_schedulers(config: dict[str, Any]) -> None:
         for key, value in env.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ConfigError(f"schedulers.{scheduler_name}.env entries must be string:string")
+        _reject_reserved_environment(env, f"schedulers.{scheduler_name}.env")
 
         settle = scheduler.get("settle_seconds", 0)
         if isinstance(settle, bool) or not isinstance(settle, int) or settle < 0:
             raise ConfigError(
                 f"schedulers.{scheduler_name}.settle_seconds must be a non-negative integer"
             )
+
+
+def _validate_treatments(config: dict[str, Any]) -> None:
+    treatments = config.get("treatments", {})
+    if not isinstance(treatments, dict):
+        raise ConfigError("treatments must be a mapping")
+
+    for treatment_name, treatment in treatments.items():
+        prefix = f"treatments.{treatment_name}"
+        if not isinstance(treatment_name, str) or not treatment_name:
+            raise ConfigError("treatment names must be non-empty strings")
+        if not isinstance(treatment, dict):
+            raise ConfigError(f"{prefix} must be a mapping")
+
+        unknown_keys = set(treatment) - VALID_TREATMENT_KEYS
+        if unknown_keys:
+            raise ConfigError(f"{prefix} has unsupported keys: {sorted(unknown_keys)}")
+        _validate_command(treatment, prefix, allowed_keys=VALID_TREATMENT_KEYS)
+        host_command = treatment.get("host_command")
+        if host_command is not None and (
+            not isinstance(host_command, str) or not host_command
+        ):
+            raise ConfigError(f"{prefix}.host_command must be a non-empty string")
+        host_support_files = treatment.get("host_support_files", [])
+        if not isinstance(host_support_files, list) or any(
+            not isinstance(item, str) or not item for item in host_support_files
+        ):
+            raise ConfigError(f"{prefix}.host_support_files must be a string list")
+        _validate_non_negative_seconds(
+            treatment,
+            prefix,
+            ("post_treatment_settle_seconds",),
+        )
+
+        allow_no_commit = treatment.get("allow_no_commit", False)
+        if not isinstance(allow_no_commit, bool):
+            raise ConfigError(f"{prefix}.allow_no_commit must be a boolean")
+
+        env = treatment.get("env", {})
+        if not isinstance(env, dict):
+            raise ConfigError(f"{prefix}.env must be a mapping")
+        for key, value in env.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ConfigError(f"{prefix}.env entries must be string:string")
+        _reject_reserved_environment(env, f"{prefix}.env")
 
 
 def _validate_executor(config: dict[str, Any]) -> None:
@@ -535,8 +597,7 @@ def _validate_benches(config: dict[str, Any]) -> None:
         for key, value in env.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ConfigError(f"{prefix}.env entries must be string:string")
-        if "SCX_BENCH_OUT" in env:
-            raise ConfigError(f"{prefix}.env must not override reserved SCX_BENCH_OUT")
+        _reject_reserved_environment(env, f"{prefix}.env")
 
 
 def _bench_with_defaults(config: dict[str, Any], bench_name: str) -> dict[str, Any]:
@@ -546,11 +607,16 @@ def _bench_with_defaults(config: dict[str, Any], bench_name: str) -> dict[str, A
     }
 
 
-def _validate_command(value: Any, prefix: str) -> None:
+def _validate_command(
+    value: Any,
+    prefix: str,
+    *,
+    allowed_keys: set[str] = VALID_COMMAND_KEYS,
+) -> None:
     if not isinstance(value, dict):
         raise ConfigError(f"{prefix} must be a mapping")
 
-    unknown_keys = set(value) - VALID_COMMAND_KEYS
+    unknown_keys = set(value) - allowed_keys
     if unknown_keys:
         raise ConfigError(f"{prefix} has unsupported keys: {sorted(unknown_keys)}")
 
@@ -571,6 +637,12 @@ def _validate_command(value: Any, prefix: str) -> None:
     timeout = value["timeout_seconds"]
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
         raise ConfigError(f"{prefix}.timeout_seconds must be a positive integer")
+
+
+def _reject_reserved_environment(env: dict[str, Any], prefix: str) -> None:
+    reserved = sorted(set(env) & RESERVED_GUEST_ENV)
+    if reserved:
+        raise ConfigError(f"{prefix} must not override reserved variables: {reserved}")
 
 
 def _validate_non_negative_seconds(

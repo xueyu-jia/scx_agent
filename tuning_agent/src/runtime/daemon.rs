@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
-use crate::activation::source::{TimerSource, UnixIpcSource};
-use crate::activation::{ActivationEvent, ActivationKernel};
+use crate::activation::source::{TimerSource, UnixActivation, UnixIpcSource};
+use crate::activation::{ActivationKernel, ActivationRequest, ActivationResponse};
 use crate::adapters::openai::OpenAiReasoner;
 use crate::audit::{AuditRecord, AuditSink, JsonlAuditSink};
 use crate::capability::CapabilityRegistry;
@@ -106,25 +106,48 @@ impl Runtime {
             unix_source.path().display()
         );
         loop {
-            let mut events = unix_source.poll()?;
-            events.extend(timer_source.poll());
-            for event in events {
-                self.process_activation_event(event)?;
+            for activation in unix_source.poll()? {
+                self.process_unix_activation(activation)?;
+            }
+            for event in timer_source.poll() {
+                let request = ActivationRequest::fire_and_forget(event);
+                let _ = self.process_activation_request(request)?;
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    fn process_activation_event(&mut self, event: ActivationEvent) -> std::io::Result<()> {
+    fn process_unix_activation(&mut self, activation: UnixActivation) -> std::io::Result<()> {
+        let wants_response = activation.wants_response();
+        let request = activation.request.clone();
+        let response = self.process_activation_request(request)?;
+        if wants_response {
+            activation.respond(&response)?;
+        }
+        Ok(())
+    }
+
+    fn process_activation_request(
+        &mut self,
+        request: ActivationRequest,
+    ) -> std::io::Result<ActivationResponse> {
+        let event = request.event.clone();
         if !self.activation.accept(&event) {
             self.audit.record(&AuditRecord::runtime(
                 "activation_rejected",
                 json!({
                     "event": event,
                     "activation_state": format!("{:?}", self.activation.state()),
+                    "request_id": request.request_id,
                 }),
             ))?;
-            return Ok(());
+            return Ok(ActivationResponse::rejected(
+                request.request_id,
+                format!(
+                    "activation rejected while kernel was {:?}",
+                    self.activation.state()
+                ),
+            ));
         }
 
         let episode_id = next_episode_id();
@@ -137,12 +160,15 @@ impl Runtime {
                     "episode_rejected",
                     episode_id,
                     EpisodePhase::Clean,
-                    json!({"error": error}),
+                    json!({
+                        "error": error,
+                        "request_id": request.request_id,
+                    }),
                 ))?;
-                return Ok(());
+                return Ok(ActivationResponse::error(request.request_id, error));
             }
         };
-        let outcome = EpisodeCoordinator::new(
+        let outcome = match EpisodeCoordinator::new(
             self.config.reasoning.max_rounds,
             Duration::from_millis(self.config.safety.evaluation_timeout_ms),
             self.capabilities.snapshot(),
@@ -150,7 +176,16 @@ impl Runtime {
             &mut self.audit,
         )
         .and_then(|mut coordinator| coordinator.run(episode_id, activation, &mut reasoner))
-        .map_err(std::io::Error::other)?;
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.activation.sleep();
+                return Ok(ActivationResponse::error(
+                    request.request_id,
+                    error.to_string(),
+                ));
+            }
+        };
 
         if outcome.phase == EpisodePhase::RecoveryRequired {
             self.activation.freeze();
@@ -162,7 +197,10 @@ impl Runtime {
             "episode {} finished; phase={:?}; {}",
             outcome.episode_id, outcome.phase, outcome.summary
         );
-        Ok(())
+        Ok(ActivationResponse::from_episode(
+            request.request_id,
+            outcome,
+        ))
     }
 }
 

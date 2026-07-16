@@ -60,14 +60,14 @@ Owns config loading, validation, and plan expansion.
 Key responsibilities:
 
 - validate top-level config sections;
-- validate machines, schedulers, suites, benches, and metric profiles;
+- validate machines, schedulers, treatments, suites, benches, and metric profiles;
 - expand a plan into `RunSpec` objects.
 
 It does not run benchmarks and does not decide baseline/candidate order.
 
 ### `bench/runner.py`
 
-Executes a provided list of `RunSpec` objects for one scheduler.
+Executes a provided list of `RunSpec` objects for one scheduler/treatment variant.
 
 Key responsibilities:
 
@@ -93,7 +93,7 @@ Key responsibilities:
 
 - read config;
 - reject stale base images before a real experiment starts;
-- select `--baseline` and `--candidate` schedulers;
+- select baseline/candidate scheduler and optional treatment combinations;
 - expand the selected plan;
 - build comparison pairs from expanded `RunSpec` objects;
 - allocate host CPU placement for `pin_cpus: auto`;
@@ -220,6 +220,9 @@ The guest executor:
 - waits for the configured VM settle interval after SSH is ready;
 - starts the selected scheduler if `kind: scx`;
 - waits for the scheduler to settle;
+- runs the optional treatment in an isolated process group and output directory;
+- validates its bounded structured outcome and applies the configured no-commit policy;
+- rejects `recovery_required` unconditionally and waits for the post-treatment settle interval;
 - runs optional workload warmup in an isolated process group and output directory;
 - rejects warmup failures, guest-enforced timeouts, leaked processes, or an exited scheduler;
 - waits for the post-warmup settle interval;
@@ -232,10 +235,11 @@ The guest executor:
 - atomically writes a structured `guest_result.json`;
 - stores dmesg delta and raw logs.
 
-Warmup, settle, and cooldown are outside the measured snapshot window. Warmup
-artifacts are stored below `warmup/`, so its wrapper output and perf files
-cannot be consumed as measurement metrics. The measured benchmark wrapper's
-metric JSON remains the source of workload performance metrics.
+Treatment, warmup, settle, and cooldown are outside the measured snapshot
+window. Treatment and warmup artifacts are stored below their own directories,
+so their output and perf files cannot be consumed as measurement metrics. The
+measured benchmark wrapper's metric JSON remains the source of workload
+performance metrics.
 
 Snapshots currently include:
 
@@ -395,11 +399,57 @@ schedulers:
 
 `kind: builtin` means no `scx` scheduler process is started.
 
-`kind: scx` means the guest executor starts the scheduler before warmup and
-stops it after measurement and cooldown.
+`kind: scx` means the guest executor starts the scheduler before treatment and
+warmup, then stops it after measurement and cooldown.
 
 The framework treats baseline and candidate identically. Either can be builtin
-or `scx`.
+or `scx` and may independently select a treatment. This permits an experiment
+to keep the scheduler fixed while comparing control and tuned system states.
+
+## Treatment Model
+
+Treatments are named, bounded commands selected independently from schedulers.
+They establish the state that the normal benchmark warmup and measurement will
+exercise. A run variant is therefore:
+
+```text
+RunVariant = Role + Scheduler + Optional<Treatment>
+```
+
+The guest plan carries explicit `baseline`, `candidate`, or `standalone` role
+metadata. Only the treatment receives the corresponding environment variables;
+warmup and measurement cannot branch on experiment role. The executor owns all
+reserved variables and config cannot override them.
+
+Like scheduler staging, an optional treatment `host_command` is copied into the
+fresh overlay, substituted into the guest plan, hashed into run metadata, and
+made executable before the guest executor starts. The original config remains
+in the manifest while the execution plan records the staged guest path.
+Optional treatment `host_support_files` are copied into
+`/tmp/scx-bench-treatment.d/` and hashed into run metadata. They are host-side
+staging inputs only; the guest plan contains neither their host paths nor any
+authority to fetch additional files.
+
+Every configured treatment must atomically write a versioned `outcome.json` to
+the path supplied in `SCX_BENCH_TREATMENT_OUTCOME`. The accepted outcomes are:
+
+```text
+ready              -> continue
+no_commit          -> continue only when allow_no_commit=true
+recovery_required  -> always stop before warmup/measurement
+```
+
+The outcome is operational evidence from the trusted treatment harness, not a
+replacement for the tuning Runtime's commit authority. Missing, oversized,
+malformed, or unknown outcomes fail closed. Treatment timeout, non-zero exit,
+or leaked process-group members are handled with the same cleanup discipline as
+warmup and measurement.
+
+The tuning-agent harness uses `activate --wait --json` as the synchronization
+point with the daemon. The daemon returns `committed`, `no_commit`,
+`recovery_required`, `rejected`, or `error`; the harness maps only the first
+three to treatment outcomes. Rejected activation or protocol errors fail the
+treatment before benchmark warmup.
 
 ## Result Model
 
@@ -412,13 +462,14 @@ bench/results/experiments/<timestamp>__<baseline>_vs_<candidate>/
 Per-run raw data:
 
 ```text
-runs/<scheduler>/run_.../
+runs/<variant>/run_.../
 ```
 
 `guest_result.json` uses its top-level `status` as the authoritative execution
-outcome. Scheduler, warmup, and measurement details live below `phases`; valid
-failure statuses distinguish scheduler failure, warmup failure/timeout,
-measurement failure/timeout, and internal executor errors.
+outcome. Scheduler, treatment, warmup, and measurement details live below
+`phases`; valid failure statuses distinguish scheduler failure, treatment
+failure/timeout/no-commit/recovery-required, warmup failure/timeout, measurement
+failure/timeout, and internal executor errors.
 
 Machine-readable comparison data:
 
@@ -512,6 +563,13 @@ Add new scheduler:
 1. put the binary in `bench/schedulers/`;
 2. add a `schedulers:` entry;
 3. pass it with `--baseline` or `--candidate`.
+
+Add new treatment:
+
+1. implement a bounded guest command that owns and cleans up every child it starts;
+2. write a strict V1 outcome to `SCX_BENCH_TREATMENT_OUTCOME`;
+3. add a `treatments:` entry with timeout, settle, environment, and no-commit policy;
+4. select it with `--baseline-treatment` or `--candidate-treatment`.
 
 Add new metric:
 

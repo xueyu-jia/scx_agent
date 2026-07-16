@@ -15,7 +15,9 @@ from bench.collectors.guest_executor import (
     GuestExecutor,
     Plan,
     PlanError,
+    RunContext,
     Scheduler,
+    Treatment,
 )
 
 
@@ -42,6 +44,39 @@ def scheduler(source: str, startup_grace_seconds: int = 0) -> Scheduler:
         settle_seconds=0,
         startup_grace_seconds=startup_grace_seconds,
     )
+
+
+def treatment(
+    source: str,
+    *,
+    timeout_seconds: int = 5,
+    allow_no_commit: bool = False,
+) -> Treatment:
+    return Treatment(
+        argv=(sys.executable, "-c", source),
+        env={"TREATMENT_ENV": "present"},
+        timeout_seconds=timeout_seconds,
+        allow_no_commit=allow_no_commit,
+    )
+
+
+def outcome_source(status: str, extra_source: str = "") -> str:
+    return f"""
+import json
+import os
+from pathlib import Path
+assert os.environ["SCX_BENCH_ROLE"] == "candidate"
+assert os.environ["SCX_BENCH_VARIANT"] == "test-variant"
+assert os.environ["SCX_BENCH_TREATMENT"] == "test-treatment"
+assert os.environ["TREATMENT_ENV"] == "present"
+outcome = Path(os.environ["SCX_BENCH_TREATMENT_OUTCOME"])
+outcome.write_text(json.dumps({{
+    "version": 1,
+    "status": {status!r},
+    "details": {{"source": "test"}},
+}}))
+{extra_source}
+"""
 
 
 class GuestPlanTest(unittest.TestCase):
@@ -76,6 +111,17 @@ class GuestPlanTest(unittest.TestCase):
                     "vm_settle_seconds": 2,
                 },
                 output_dir=str(root / "output"),
+                role="candidate",
+                variant="scx__agent_tuned",
+                treatment_name="agent_tuned",
+                treatment={
+                    "command": "prepare",
+                    "args": ["--mode", "candidate"],
+                    "env": {"MODE": "tune"},
+                    "timeout_seconds": 11,
+                    "post_treatment_settle_seconds": 2,
+                    "allow_no_commit": False,
+                },
             )
             path = root / "guest_plan.json"
 
@@ -84,12 +130,18 @@ class GuestPlanTest(unittest.TestCase):
 
             self.assertEqual(guest_plan.warmup.argv, ("prime", "--seconds", "5"))
             self.assertEqual(
+                guest_plan.treatment.argv,
+                ("prepare", "--mode", "candidate"),
+            )
+            self.assertEqual(guest_plan.run_context.role, "candidate")
+            self.assertEqual(guest_plan.run_context.treatment, "agent_tuned")
+            self.assertEqual(
                 guest_plan.measurement.argv,
                 ("measure", "--seconds", "10"),
             )
             self.assertEqual(guest_plan.scheduler.argv, ("scheduler", "--test"))
             self.assertEqual(guest_plan.env, {"MODE": "test"})
-            self.assertEqual(host_plan.host_timeout_seconds(extra_seconds=5), 43)
+            self.assertEqual(host_plan.host_timeout_seconds(extra_seconds=5), 56)
             self.assertEqual(json.loads(path.read_text()), host_plan.to_dict())
 
     def test_plan_rejects_legacy_and_unknown_fields(self) -> None:
@@ -140,6 +192,8 @@ class GuestExecutorTest(unittest.TestCase):
         root: Path,
         measurement: Command,
         *,
+        treatment_plan: Treatment | None = None,
+        post_treatment_settle_seconds: int = 0,
         warmup: Command | None = None,
         scheduler_plan: Scheduler | None = None,
         output_dir: Path | None = None,
@@ -147,9 +201,16 @@ class GuestExecutorTest(unittest.TestCase):
         return Plan(
             workdir=root,
             output_dir=output_dir or root / "output",
+            run_context=RunContext(
+                role="candidate",
+                variant="test-variant",
+                treatment="test-treatment" if treatment_plan else None,
+            ),
             env={},
             vm_settle_seconds=0,
             scheduler=scheduler_plan,
+            treatment=treatment_plan,
+            post_treatment_settle_seconds=post_treatment_settle_seconds,
             warmup=warmup,
             post_warmup_settle_seconds=0,
             measurement=measurement,
@@ -162,6 +223,153 @@ class GuestExecutorTest(unittest.TestCase):
             (plan.output_dir / "guest_result.json").read_text(encoding="utf-8")
         )
         return returncode, result
+
+    def test_treatment_precedes_warmup_and_has_isolated_artifacts(self) -> None:
+        treatment_source = outcome_source(
+            "ready",
+            '(Path(os.environ["SCX_BENCH_OUT"]) / "state").write_text("ready")',
+        )
+        warmup_source = """
+import os
+from pathlib import Path
+out = Path(os.environ["SCX_BENCH_OUT"])
+assert (out.parent / "treatment" / "state").read_text() == "ready"
+assert "TREATMENT_ENV" not in os.environ
+assert "SCX_BENCH_ROLE" not in os.environ
+assert "SCX_BENCH_VARIANT" not in os.environ
+assert "SCX_BENCH_TREATMENT" not in os.environ
+assert "SCX_BENCH_TREATMENT_OUTCOME" not in os.environ
+(out / "primed").write_text("yes")
+"""
+        measurement_source = """
+import os
+from pathlib import Path
+out = Path(os.environ["SCX_BENCH_OUT"])
+assert (out / "treatment" / "state").read_text() == "ready"
+assert (out / "warmup" / "primed").read_text() == "yes"
+assert "SCX_BENCH_ROLE" not in os.environ
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            returncode, result = self._run(
+                self._plan(
+                    root,
+                    python_command(measurement_source),
+                    treatment_plan=treatment(treatment_source),
+                    warmup=python_command(warmup_source),
+                )
+            )
+
+            self.assertEqual(returncode, 0)
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["phases"]["treatment"]["status"], "PASS")
+            self.assertEqual(
+                result["phases"]["treatment"]["outcome"]["status"],
+                "ready",
+            )
+            self.assertEqual(result["phases"]["warmup"]["status"], "PASS")
+            self.assertEqual(result["phases"]["measurement"]["status"], "PASS")
+
+    def test_no_commit_policy_controls_measurement_admission(self) -> None:
+        measurement = python_command(
+            'from pathlib import Path; import os; '
+            'Path(os.environ["SCX_BENCH_OUT"], "measurement").write_text("ran")'
+        )
+        for allow_no_commit, expected_status, expected_returncode, measured in (
+            (False, "TREATMENT_NO_COMMIT", 125, False),
+            (True, "PASS", 0, True),
+        ):
+            with (
+                self.subTest(allow_no_commit=allow_no_commit),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                returncode, result = self._run(
+                    self._plan(
+                        root,
+                        measurement,
+                        treatment_plan=treatment(
+                            outcome_source("no_commit"),
+                            allow_no_commit=allow_no_commit,
+                        ),
+                    )
+                )
+
+                self.assertEqual(returncode, expected_returncode)
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(
+                    result["phases"]["treatment"]["outcome"]["status"],
+                    "no_commit",
+                )
+                self.assertEqual(
+                    (root / "output" / "measurement").exists(),
+                    measured,
+                )
+
+    def test_recovery_required_always_blocks_later_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            returncode, result = self._run(
+                self._plan(
+                    root,
+                    python_command("raise AssertionError('must not run')"),
+                    treatment_plan=treatment(
+                        outcome_source("recovery_required"),
+                        allow_no_commit=True,
+                    ),
+                )
+            )
+
+            self.assertEqual(returncode, 125)
+            self.assertEqual(result["status"], "TREATMENT_RECOVERY_REQUIRED")
+            self.assertEqual(
+                result["phases"]["treatment"]["status"],
+                "RECOVERY_REQUIRED",
+            )
+            self.assertEqual(result["phases"]["warmup"]["status"], "SKIPPED")
+            self.assertEqual(result["phases"]["measurement"]["status"], "SKIPPED")
+
+    def test_successful_treatment_command_requires_a_valid_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            returncode, result = self._run(
+                self._plan(
+                    root,
+                    python_command("pass"),
+                    treatment_plan=treatment("pass"),
+                )
+            )
+
+            self.assertEqual(returncode, 125)
+            self.assertEqual(result["status"], "TREATMENT_FAILED")
+            self.assertEqual(result["phases"]["treatment"]["status"], "FAILED")
+            self.assertIn(
+                "cannot stat treatment outcome",
+                result["phases"]["treatment"]["error"],
+            )
+
+    def test_treatment_timeout_cleans_its_process_group(self) -> None:
+        source = """
+import signal
+import time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            returncode, result = self._run(
+                self._plan(
+                    root,
+                    python_command("pass"),
+                    treatment_plan=treatment(source, timeout_seconds=1),
+                )
+            )
+
+            self.assertEqual(returncode, 124)
+            self.assertEqual(result["status"], "TREATMENT_TIMEOUT")
+            self.assertTrue(result["phases"]["treatment"]["timed_out"])
+            self.assertTrue(result["phases"]["treatment"]["process_group_clean"])
+            self.assertEqual(result["phases"]["measurement"]["status"], "SKIPPED")
 
     def test_warmup_artifacts_are_isolated_from_measurement(self) -> None:
         warmup_source = """

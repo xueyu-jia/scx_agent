@@ -4,3 +4,4 @@ mod episode;
 mod recovery;
 
 pub use daemon::Runtime;
+pub use episode::EpisodeOutcome;

@@ -4,7 +4,7 @@
 
 核心目标：
 
-- 使用相同内核和相同机器矩阵运行 baseline / candidate 调度器；
+- 使用相同内核和相同机器矩阵运行 baseline / candidate scheduler-treatment 变体；
 - 自动收集 workload 指标、系统指标、内核指标和调度器诊断数据；
 - 生成 baseline vs candidate 的分析结果和 HTML 报告。
 
@@ -16,7 +16,7 @@
 - host 隔离环境检查；
 - 一键生成本机配置、workload、base image 和 host 隔离配置；
 - 配置化的 machine、suite、bench、metric profile 和 scheduler；
-- baseline / candidate 交替运行；
+- baseline / candidate 变体交替运行；
 - guest 内每次 run 的原始数据收集；
 - 自动生成 `analysis.json` 和 `report.html`。
 
@@ -187,6 +187,7 @@ libvirt         VM 内核、base image、SSH 和 libvirt 设置
 bench_defaults  benchmark 默认 post-warmup settle / cooldown 设置
 executor         pair 并行、自动 CPU pinning 和 host 资源策略
 schedulers       builtin 或 scx 调度器定义
+treatments       measurement 前建立实验状态的可选处理命令
 plans            smoke / full 等测试计划
 machines         VM CPU、内存、pinning、隔离要求
 suites           benchmark 分组
@@ -223,6 +224,133 @@ For schedulers with libbpf kconfig externs on a kernel without
     args: [--kconfig, /tmp/scx-bench-kconfig]
 ```
 
+Treatment 是独立于 scheduler 和 workload warmup 的可选阶段。它在 scheduler
+settle 后运行，用于建立随后要测量的系统状态，例如运行训练负载、启动 tuning
+agent、等待 episode 结束并验证 committed candidate。普通 warmup 仍在 treatment
+之后运行，只负责预热正式 benchmark：
+
+```text
+VM settle
+  -> scheduler start/settle
+  -> optional treatment
+  -> post-treatment settle
+  -> optional benchmark warmup
+  -> post-warmup settle
+  -> before snapshot
+  -> measurement
+  -> after snapshot
+  -> cooldown/cleanup
+```
+
+Treatment 在顶层独立定义，因而 baseline/candidate 可以使用同一个 scheduler，
+只改变 treatment：
+
+```yaml
+treatments:
+  control:
+    command: python3
+    args: [bench/treatments/control.py]
+    timeout_seconds: 600
+    post_treatment_settle_seconds: 5
+
+  agent_tuned:
+    command: /tmp/scx-bench-treatment
+    host_command: bench/treatments/tuning_agent_harness.py
+    host_support_files:
+      - bench/treatments/mock_openai_llm.py
+      - bench/treatments/deterministic_tuning_mcp.py
+    timeout_seconds: 900
+    post_treatment_settle_seconds: 5
+    allow_no_commit: false
+    env:
+      MODE: tune
+```
+
+`command` 是 base image 内的 guest 路径。可选 `host_command` 与 scheduler 的
+同名字段语义一致：runner 将当前 host 上的可执行 treatment 文件复制到每个
+fresh overlay，记录 SHA-256，并执行 staged copy；相对路径从仓库根目录解析。
+这适合频繁修改的自定义 treatment harness，也避免误用 base image 中的旧脚本。
+可选 `host_support_files` 会复制到 guest 的 `/tmp/scx-bench-treatment.d/`，
+用于随 harness 携带 mock LLM、MCP server 或辅助脚本；它们不会进入 guest
+execution plan，避免把 host-only 路径暴露给 guest executor。
+Treatment 配置和 `env` 会进入 `guest_plan.json`、manifest 与结果元数据，不能
+放置 API key 等秘密；秘密应通过不进入结果归档的受控凭据文件或本地代理提供。
+
+guest executor 只向 treatment 注入 run context，避免 benchmark warmup 或正式
+measurement 根据 baseline/candidate 身份分支：
+
+```text
+SCX_BENCH_ROLE       baseline | candidate | standalone
+SCX_BENCH_VARIANT    <scheduler> 或 <scheduler>__<treatment>
+SCX_BENCH_TREATMENT  treatment 名；未配置时为空
+SCX_BENCH_OUT        当前阶段的产物目录
+```
+
+Treatment 还会收到 `SCX_BENCH_TREATMENT_OUTCOME`。命令退出前必须在该路径
+原子写入不超过 64 KiB 的 JSON：
+
+```json
+{
+  "version": 1,
+  "status": "ready",
+  "details": {
+    "episode_id": 123,
+    "verdict": "improved",
+    "candidate_digest": "sha256:..."
+  }
+}
+```
+
+`version`、`status`、`details` 三个字段都必须存在，`details` 可以是空对象；
+未知字段会被拒绝。
+
+`status` 只能是：
+
+- `ready`：目标状态已经建立并经过 treatment 自身验证，可以继续。
+- `no_commit`：Agent 已安全结束但没有 commit。默认阻断后续阶段；只有该
+  treatment 显式设置 `allow_no_commit: true` 时才继续，用于 intention-to-treat
+  实验。
+- `recovery_required`：无法证明系统处于 baseline 或 committed candidate，始终
+  阻断 warmup 和 measurement。
+
+成功退出但缺少/损坏 outcome、超时、非零退出或残留进程都会使 treatment
+失败。Treatment 自己启动的训练负载、agent daemon 和 MCP 子进程必须在命令
+返回前全部停止并等待退出。
+
+### tuning-agent treatment harness
+
+仓库提供 `bench/treatments/tuning_agent_harness.py`，用于 Cgroup-scoped 测试
+tuning-agent。它会：
+
+- 创建临时 cgroup，并把可选训练负载放入该 cgroup；
+- 启动 mock/真实 LLM 代理等 support process；
+- 启动 tuning-agent daemon；
+- 执行 `tuning-agent activate --wait --json ... <cgroup_path>`；
+- 将 `committed` 映射为 `ready`，将 `no_commit` 映射为 `no_commit`，将
+  `recovery_required` 映射为 `recovery_required`。
+
+确定性测试可以使用随仓库提供的 `mock_openai_llm.py` 和
+`deterministic_tuning_mcp.py`。场景由 `SCX_DETERMINISTIC_SCENARIO` 控制：
+`positive` 应 commit，`no_signal` 和 `unsafe` 应 rollback 为 no_commit，
+`recovery` 应阻断正式 warmup/measurement。
+
+真实 workload MCP 接入时，保持同一边界：Agent 内部训练负载和 A/B evaluate
+只用于决定是否 commit；bench 的正式 warmup/measurement 是 held-out 外部测量。
+推荐先用同一个 scheduler 比较 `control` treatment 与 `agent_tuned` treatment，
+再运行真实 LLM 的 paired benchmark：
+
+```bash
+python3 -m bench.scripts.run \
+  --config bench/configs/local.config \
+  --plan smoke \
+  --baseline default --baseline-treatment control \
+  --candidate default --candidate-treatment agent_tuned \
+  --parallel 1
+```
+
+综合效果实验通常设置 `allow_no_commit: true`，这样 no-commit episode 仍计入
+candidate 组；`recovery_required` 无论如何都会阻断正式测量。
+
 VM 与调度器准备阶段使用独立的 settle 时间；workload warmup 必须显式配置
 命令。warmup 成功后等待 `post_warmup_settle_seconds`，再采集 before
 snapshot 并启动正式测量：
@@ -254,9 +382,9 @@ benches:
 wrapper 输出和 `perf_stat.csv` 不会进入正式测量结果。
 
 runner 为每次 run 生成 `guest_plan.json`，再上传固定的 Python guest
-executor。warmup 与 measurement 的 timeout 都在 guest 内执行；超时、非零
-退出或残留进程会被记录为明确状态并清理整个进程组。warmup 失败时不会启动
-measurement。总 host timeout 包含两个命令的 timeout、三个 settle/cooldown
+executor。treatment、warmup 与 measurement 的 timeout 都在 guest 内执行；
+超时、非零退出或残留进程会被记录为明确状态并清理整个进程组。前置阶段失败
+时不会启动 measurement。总 host timeout 包含所有已启用命令、settle/cooldown
 阶段及额外余量。dry-run 的 `result.json` 与 `manifest.json` 都保存同一份
 `execution_plan`。
 
@@ -270,6 +398,21 @@ python3 bench/scripts/run.py \
 ```
 
 baseline 和 candidate 都可以是 `scx` 调度器。
+
+要比较同一个 scheduler 在 control 与 Agent 调优后的表现：
+
+```bash
+python3 bench/scripts/run.py \
+  --plan smoke \
+  --baseline scx_rlfifo \
+  --candidate scx_rlfifo \
+  --baseline-treatment control \
+  --candidate-treatment agent_tuned
+```
+
+没有 treatment 时，原有 scheduler 对比命令和结果目录保持不变。指定
+treatment 后，运行变体标签为 `<scheduler>__<treatment>`；两侧必须选择不同
+的 scheduler/treatment 组合。
 
 自动并行和 CPU pinning 由 `executor` 控制：
 
@@ -431,7 +574,7 @@ bench/results/experiments/
 metadata.json
 
 runs/
-  <baseline_scheduler>/
+  <baseline_variant>/
     manifest.json
     run_001__machine_...__suite_...__bench_.../
       result.json
@@ -442,6 +585,10 @@ runs/
       workload_stderr.log
       scheduler_stdout.log
       scheduler_stderr.log
+      treatment/
+        stdout.log
+        stderr.log
+        outcome.json
       warmup/
         stdout.log
         stderr.log
@@ -454,7 +601,7 @@ runs/
       guest_result.json
       snapshots/
 
-  <candidate_scheduler>/
+  <candidate_variant>/
     manifest.json
     run_001__machine_...__suite_...__bench_.../
       ...
@@ -557,6 +704,7 @@ report.html
 
 - `--baseline` 只是比较基准，不代表必须是内核默认调度器。
 - baseline 和 candidate 都可以是 `builtin` 或 `scx`。
+- 两侧可以选择同一个 scheduler，但必须通过不同 treatment 形成不同运行变体。
 - libvirt XML 会显式设置 `vcpupin`、`emulatorpin` 和可选的
   `iothreadpin`；启用 `pin_vhost_threads` 时，runner 会记录并尽量 pin
   host vhost 线程。

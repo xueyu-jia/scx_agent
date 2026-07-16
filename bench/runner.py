@@ -31,6 +31,8 @@ _MANIFEST_LOCK = threading.Lock()
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 RUNTIME_ISOLATION_REPORT = Path("/var/lib/scx-bench/runtime-isolation.json")
+GUEST_TREATMENT_PATH = "/tmp/scx-bench-treatment"
+GUEST_TREATMENT_SUPPORT_DIR = "/tmp/scx-bench-treatment.d"
 
 
 class PreflightError(RuntimeError):
@@ -51,6 +53,9 @@ def run_specs(
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     progress_interval: int = 30,
     placement: dict[str, Any] | None = None,
+    role: str = "standalone",
+    treatment_name: str | None = None,
+    treatment: dict[str, Any] | None = None,
 ) -> Path:
     started_at = datetime.now(timezone.utc)
     result_dir = Path(output_dir)
@@ -62,11 +67,25 @@ def run_specs(
             "started_at": started_at.isoformat(),
             "dry_run": dry_run,
             "label": label,
+            "role": role,
             "scheduler": scheduler or {"kind": "builtin"},
+            "treatment_name": treatment_name,
+            "treatment": treatment,
             "config": config_path,
             "run_count": len(specs),
             "placement": placement,
-            "runs": [_manifest_entry(spec, label, scheduler, placement) for spec in specs],
+            "runs": [
+                _manifest_entry(
+                    spec,
+                    label,
+                    scheduler,
+                    placement,
+                    role=role,
+                    treatment_name=treatment_name,
+                    treatment=treatment,
+                )
+                for spec in specs
+            ],
         },
     )
 
@@ -81,6 +100,9 @@ def run_specs(
             progress_callback,
             progress_interval,
             placement,
+            role,
+            treatment_name,
+            treatment,
         )
         _emit_progress(progress_callback, "end", {"label": label, "spec": spec, "result": result})
 
@@ -96,6 +118,9 @@ def _run_one(
     progress_callback: Callable[[str, dict[str, Any]], None] | None,
     progress_interval: int,
     placement: dict[str, Any] | None,
+    role: str = "standalone",
+    treatment_name: str | None = None,
+    treatment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_dir = result_dir / _run_dir_name(spec)
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -103,11 +128,16 @@ def _run_one(
     guest_plan_path = run_dir / "guest_plan.json"
     guest_output_dir = spec.libvirt.get("guest_output_dir", GUEST_OUTPUT_DIR)
     guest_scheduler = _guest_scheduler(scheduler)
+    guest_treatment = _guest_treatment(treatment)
     guest_plan = build_guest_run_plan(
         spec.bench,
         guest_scheduler,
         spec.libvirt,
         output_dir=guest_output_dir,
+        role=role,
+        variant=label,
+        treatment_name=treatment_name,
+        treatment=guest_treatment,
     )
     write_guest_plan(guest_plan_path, guest_plan)
     domain_name = _domain_name(label, spec, run_dir)
@@ -124,7 +154,15 @@ def _run_one(
     if placement is not None:
         _write_json(run_dir / "placement.json", placement)
     metadata = {
-        "spec": _manifest_entry(spec, label, scheduler, placement),
+        "spec": _manifest_entry(
+            spec,
+            label,
+            scheduler,
+            placement,
+            role=role,
+            treatment_name=treatment_name,
+            treatment=treatment,
+        ),
         "domain": domain_name,
         "domain_xml": str(domain_xml_path),
         "runtime_dir": str(runtime_dir),
@@ -188,6 +226,12 @@ def _run_one(
             "heartbeat",
             {"label": label, "spec": spec, "elapsed_seconds": elapsed},
         ),
+        treatment_host_command=(
+            treatment.get("host_command") if treatment is not None else None
+        ),
+        treatment_host_support_files=(
+            treatment.get("host_support_files", []) if treatment is not None else []
+        ),
     )
     vm_returncode = completed["returncode"]
     libvirt_stdout = completed["stdout"]
@@ -196,6 +240,7 @@ def _run_one(
     host_thread_pinning = completed.get("host_thread_pinning", {})
     host_irq_delta = completed.get("host_irq_delta", {})
     guest_executor = completed.get("guest_executor", {})
+    treatment_artifact = completed.get("treatment_artifact", {})
 
     finished_at = datetime.now(timezone.utc)
     duration = (finished_at - started_at).total_seconds()
@@ -224,6 +269,7 @@ def _run_one(
             "host_thread_pinning": host_thread_pinning,
             "host_irq_delta": host_irq_delta,
             "guest_executor": guest_executor,
+            "treatment_artifact": treatment_artifact,
             "finished_at": finished_at.isoformat(),
             "duration_seconds": duration,
             "bench_metrics": bench_metrics,
@@ -248,6 +294,8 @@ def _run_libvirt(
     boot_timeout: int,
     progress_interval: int,
     heartbeat: Callable[[float], None],
+    treatment_host_command: str | None = None,
+    treatment_host_support_files: list[str] | None = None,
 ) -> dict[str, Any]:
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -257,6 +305,7 @@ def _run_libvirt(
     host_thread_pinning: dict[str, Any] = {}
     host_irq_delta: dict[str, Any] = {}
     guest_executor: dict[str, str] = {}
+    treatment_artifact: dict[str, Any] = {}
     try:
         _prepare_runtime_dir(runtime_dir, stdout_parts, stderr_parts)
         _create_overlay(libvirt, overlay_path, stdout_parts, stderr_parts)
@@ -272,6 +321,16 @@ def _run_libvirt(
                 port,
                 scheduler_host_command,
                 scheduler_host_kconfig,
+                stdout_parts,
+                stderr_parts,
+            )
+        if treatment_host_command:
+            treatment_artifact = _stage_treatment(
+                libvirt,
+                host,
+                port,
+                treatment_host_command,
+                treatment_host_support_files or [],
                 stdout_parts,
                 stderr_parts,
             )
@@ -359,6 +418,7 @@ def _run_libvirt(
         host_thread_pinning,
         host_irq_delta,
         guest_executor,
+        treatment_artifact,
     )
 
 
@@ -369,6 +429,19 @@ def _guest_scheduler(scheduler: dict[str, Any]) -> dict[str, Any]:
     guest_scheduler = dict(scheduler)
     guest_scheduler["command"] = "/tmp/scx-bench-scheduler"
     return guest_scheduler
+
+
+def _guest_treatment(
+    treatment: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if treatment is None or not treatment.get("host_command"):
+        return treatment
+
+    guest_treatment = dict(treatment)
+    guest_treatment["command"] = GUEST_TREATMENT_PATH
+    guest_treatment.pop("host_command", None)
+    guest_treatment.pop("host_support_files", None)
+    return guest_treatment
 
 
 def _stage_scheduler(
@@ -406,6 +479,92 @@ def _stage_scheduler(
             stdout_parts,
             stderr_parts,
         )
+
+
+def _stage_treatment(
+    libvirt: dict[str, Any],
+    host: str,
+    port: int,
+    host_command: str,
+    host_support_files: list[str],
+    stdout_parts: list[str],
+    stderr_parts: list[str],
+) -> dict[str, Any]:
+    source = _resolve_host_path(host_command)
+    if not source.is_file():
+        raise RuntimeError(f"treatment host_command does not exist: {source}")
+    if not os.access(source, os.X_OK):
+        raise RuntimeError(f"treatment host_command is not executable: {source}")
+
+    _scp_to_guest(
+        libvirt,
+        host,
+        port,
+        source,
+        GUEST_TREATMENT_PATH,
+        stdout_parts,
+        stderr_parts,
+    )
+    _run_command(
+        _ssh_command(
+            libvirt,
+            host,
+            port,
+            f"chmod 0755 {shlex.quote(GUEST_TREATMENT_PATH)}",
+        ),
+        stdout_parts,
+        stderr_parts,
+    )
+    support_artifacts = {}
+    if host_support_files:
+        _run_command(
+            _ssh_command(
+                libvirt,
+                host,
+                port,
+                f"mkdir -p {shlex.quote(GUEST_TREATMENT_SUPPORT_DIR)}",
+            ),
+            stdout_parts,
+            stderr_parts,
+        )
+        for item in host_support_files:
+            support = _resolve_host_path(item)
+            if not support.is_file():
+                raise RuntimeError(
+                    f"treatment host_support_files entry does not exist: {support}"
+                )
+            destination = f"{GUEST_TREATMENT_SUPPORT_DIR}/{support.name}"
+            _scp_to_guest(
+                libvirt,
+                host,
+                port,
+                support,
+                destination,
+                stdout_parts,
+                stderr_parts,
+            )
+            mode = "0755" if os.access(support, os.X_OK) else "0644"
+            _run_command(
+                _ssh_command(
+                    libvirt,
+                    host,
+                    port,
+                    f"chmod {mode} {shlex.quote(destination)}",
+                ),
+                stdout_parts,
+                stderr_parts,
+            )
+            support_artifacts[support.name] = {
+                "source": str(support),
+                "guest_path": destination,
+                "sha256": _sha256_file(support),
+            }
+    return {
+        "source": str(source),
+        "guest_path": GUEST_TREATMENT_PATH,
+        "sha256": _sha256_file(source),
+        "support_files": support_artifacts,
+    }
 
 
 def _resolve_host_path(value: str) -> Path:
@@ -650,6 +809,10 @@ def _guest_run_status(
     valid_statuses = {
         "PASS",
         "SCHEDULER_FAILED",
+        "TREATMENT_FAILED",
+        "TREATMENT_TIMEOUT",
+        "TREATMENT_NO_COMMIT",
+        "TREATMENT_RECOVERY_REQUIRED",
         "WARMUP_FAILED",
         "WARMUP_TIMEOUT",
         "BENCH_FAILED",
@@ -982,6 +1145,7 @@ def _libvirt_result(
     host_thread_pinning: dict[str, Any],
     host_irq_delta: dict[str, Any],
     guest_executor: dict[str, str],
+    treatment_artifact: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -991,6 +1155,7 @@ def _libvirt_result(
         "host_thread_pinning": host_thread_pinning,
         "host_irq_delta": host_irq_delta,
         "guest_executor": guest_executor,
+        "treatment_artifact": treatment_artifact,
     }
 
 
@@ -1040,16 +1205,27 @@ def _manifest_entry(
     label: str | None = None,
     scheduler: dict[str, Any] | None = None,
     placement: dict[str, Any] | None = None,
+    *,
+    role: str = "standalone",
+    treatment_name: str | None = None,
+    treatment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "label": label,
+        "role": role,
         "scheduler_config": scheduler,
+        "treatment_name": treatment_name,
+        "treatment_config": treatment,
         "placement": placement,
         "execution_plan": build_guest_run_plan(
             spec.bench,
             _guest_scheduler(scheduler or {"kind": "builtin"}),
             spec.libvirt,
             output_dir=spec.libvirt.get("guest_output_dir", GUEST_OUTPUT_DIR),
+            role=role,
+            variant=label or "standalone",
+            treatment_name=treatment_name,
+            treatment=_guest_treatment(treatment),
         ).to_dict(),
         "plan": spec.plan,
         "run_index": spec.run_index,
@@ -1338,7 +1514,10 @@ def _append_manifest(result_dir: Path, entry: dict[str, Any]) -> None:
         manifest.update(
             {
                 "label": entry["label"],
+                "role": entry["role"],
                 "scheduler": entry["scheduler"],
+                "treatment_name": entry["treatment_name"],
+                "treatment": entry["treatment"],
                 "config": entry["config"],
                 "dry_run": entry["dry_run"],
                 "run_count": len(all_runs),

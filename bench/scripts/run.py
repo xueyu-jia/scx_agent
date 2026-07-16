@@ -36,6 +36,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline", required=True, help="baseline scheduler name from config.schedulers")
     parser.add_argument("--candidate", required=True, help="candidate scheduler name from config.schedulers")
     parser.add_argument(
+        "--baseline-treatment",
+        help="optional baseline treatment name from config.treatments",
+    )
+    parser.add_argument(
+        "--candidate-treatment",
+        help="optional candidate treatment name from config.treatments",
+    )
+    parser.add_argument(
         "--order",
         choices=("alternating", "sequential"),
         default="alternating",
@@ -64,8 +72,20 @@ def main(argv: list[str] | None = None) -> int:
                 config["libvirt"]["root_image"],
                 REPO_ROOT,
             )
-        baseline = _scheduler(config, args.baseline)
-        candidate = _scheduler(config, args.candidate)
+        baseline = _variant(
+            "baseline",
+            args.baseline,
+            _scheduler(config, args.baseline),
+            args.baseline_treatment,
+            _treatment(config, args.baseline_treatment),
+        )
+        candidate = _variant(
+            "candidate",
+            args.candidate,
+            _scheduler(config, args.candidate),
+            args.candidate_treatment,
+            _treatment(config, args.candidate_treatment),
+        )
         specs = expand_plan(config, args.plan)
         parallel = _resolve_parallel(config, args.parallel)
     except ConfigError as exc:
@@ -75,26 +95,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"base image error: {exc}", file=sys.stderr)
         return 2
 
-    if args.baseline == args.candidate:
-        print("baseline and candidate must be different schedulers", file=sys.stderr)
+    if baseline.label == candidate.label:
+        print(
+            "baseline and candidate must select different scheduler/treatment variants",
+            file=sys.stderr,
+        )
         return 2
 
     experiment_dir = Path(args.output) if args.output else _default_experiment_dir(
-        args.baseline,
-        args.candidate,
+        baseline.label,
+        candidate.label,
     )
     runs_dir = experiment_dir / "runs"
     analysis_dir = experiment_dir / "analysis"
     runs_dir.mkdir(parents=True, exist_ok=True)
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
-    pairs = _build_pairs(specs, args.baseline, baseline, args.candidate, candidate, args.order)
+    pairs = _build_pairs(specs, baseline, candidate, args.order)
     total_runs = len(pairs) * 2
     progress = _Progress(total_runs)
     _log(
         "experiment start: "
         f"plan={args.plan} pairs={len(pairs)} total_runs={total_runs} "
-        f"baseline={args.baseline} candidate={args.candidate} "
+        f"baseline={baseline.label} candidate={candidate.label} "
         f"order={args.order} parallel={parallel}"
     )
     _log(f"output: {experiment_dir}")
@@ -103,8 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "config": str(Path(args.config).resolve()),
         "plan": args.plan,
-        "baseline": args.baseline,
-        "candidate": args.candidate,
+        "baseline": baseline.label,
+        "candidate": candidate.label,
+        "baseline_scheduler": baseline.scheduler_name,
+        "candidate_scheduler": candidate.scheduler_name,
+        "baseline_treatment": baseline.treatment_name,
+        "candidate_treatment": candidate.treatment_name,
         "order": args.order,
         "parallel": parallel,
         "dry_run": args.dry_run,
@@ -133,14 +160,14 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(experiment_dir / "metadata.json", metadata)
 
     _log("analysis: loading run results")
-    baseline_dir = runs_dir / args.baseline
-    candidate_dir = runs_dir / args.candidate
+    baseline_dir = runs_dir / baseline.label
+    candidate_dir = runs_dir / candidate.label
     _log("analysis: building baseline/candidate comparison")
     analysis = build_analysis(
-        load_result_dir(baseline_dir, args.baseline),
-        load_result_dir(candidate_dir, args.candidate),
-        baseline_label=args.baseline,
-        candidate_label=args.candidate,
+        load_result_dir(baseline_dir, baseline.label),
+        load_result_dir(candidate_dir, candidate.label),
+        baseline_label=baseline.label,
+        candidate_label=candidate.label,
     )
     _write_json(analysis_dir / "analysis.json", analysis)
     _write_json(
@@ -165,16 +192,20 @@ def main(argv: list[str] | None = None) -> int:
 
 
 @dataclass(frozen=True)
-class _SchedulerRun:
-    name: str
-    config: dict[str, Any]
+class _RunVariant:
+    role: str
+    label: str
+    scheduler_name: str
+    scheduler: dict[str, Any]
+    treatment_name: str | None
+    treatment: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
 class _ComparisonPair:
     index: int
     spec: RunSpec
-    order: tuple[_SchedulerRun, _SchedulerRun]
+    order: tuple[_RunVariant, _RunVariant]
 
 
 @dataclass(frozen=True)
@@ -409,12 +440,15 @@ def _run_pair(
         f"pair {pair.index} start: {_spec_label(spec)} "
         f"pin_cpus={placement.get('pin_cpus')}"
     )
-    for scheduler in pair.order:
+    for variant in pair.order:
         _append_execution_order(
             execution_order,
             {
                 "pair": pair.index,
-                "scheduler": scheduler.name,
+                "role": variant.role,
+                "variant": variant.label,
+                "scheduler": variant.scheduler_name,
+                "treatment": variant.treatment_name,
                 "run_index": spec.run_index,
                 "machine": spec.machine_name,
                 "suite": spec.suite_name,
@@ -424,14 +458,17 @@ def _run_pair(
         )
         run_specs(
             [spec],
-            output_dir=runs_dir / scheduler.name,
+            output_dir=runs_dir / variant.label,
             dry_run=args.dry_run,
-            label=scheduler.name,
-            scheduler=scheduler.config,
+            label=variant.label,
+            scheduler=variant.scheduler,
             config_path=args.config,
             progress_callback=progress.callback,
             progress_interval=args.progress_interval,
             placement=placement,
+            role=variant.role,
+            treatment_name=variant.treatment_name,
+            treatment=variant.treatment,
         )
     _log(f"pair {pair.index} done: {_spec_label(spec)}")
 
@@ -467,21 +504,17 @@ def _configured_placement(spec: RunSpec) -> dict[str, Any]:
 
 def _build_pairs(
     specs: list[RunSpec],
-    baseline_name: str,
-    baseline: dict[str, Any],
-    candidate_name: str,
-    candidate: dict[str, Any],
+    baseline: _RunVariant,
+    candidate: _RunVariant,
     order: str,
 ) -> list[_ComparisonPair]:
     pairs: list[_ComparisonPair] = []
     for index, spec in enumerate(specs, start=1):
-        baseline_run = _SchedulerRun(baseline_name, baseline)
-        candidate_run = _SchedulerRun(candidate_name, candidate)
         if order == "alternating" and spec.run_index % 2 == 0:
-            scheduler_order = (candidate_run, baseline_run)
+            variant_order = (candidate, baseline)
         else:
-            scheduler_order = (baseline_run, candidate_run)
-        pairs.append(_ComparisonPair(index=index, spec=spec, order=scheduler_order))
+            variant_order = (baseline, candidate)
+        pairs.append(_ComparisonPair(index=index, spec=spec, order=variant_order))
     return pairs
 
 
@@ -505,6 +538,35 @@ def _scheduler(config: dict[str, Any], name: str) -> dict[str, Any]:
     scheduler = dict(schedulers[name])
     scheduler["name"] = name
     return scheduler
+
+
+def _treatment(config: dict[str, Any], name: str | None) -> dict[str, Any] | None:
+    if name is None:
+        return None
+    treatments = config.get("treatments", {})
+    if name not in treatments:
+        raise ConfigError(f"unknown treatment: {name}")
+    return dict(treatments[name])
+
+
+def _variant(
+    role: str,
+    scheduler_name: str,
+    scheduler: dict[str, Any],
+    treatment_name: str | None,
+    treatment: dict[str, Any] | None,
+) -> _RunVariant:
+    label = scheduler_name
+    if treatment_name is not None:
+        label = f"{scheduler_name}__{treatment_name}"
+    return _RunVariant(
+        role=role,
+        label=label,
+        scheduler_name=scheduler_name,
+        scheduler=scheduler,
+        treatment_name=treatment_name,
+        treatment=treatment,
+    )
 
 
 def _default_experiment_dir(baseline: str, candidate: str) -> Path:

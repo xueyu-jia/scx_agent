@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+
+import yaml
 
 from bench.collectors.guest import build_guest_run_plan
 from bench.config.parser import RunSpec
 from bench.runner import (
     REPO_ROOT,
     _guest_scheduler,
+    _guest_treatment,
     _guest_run_status,
     _manifest_entry,
     _resolve_host_path,
     _run_libvirt,
     _run_one,
 )
+from bench.scripts.run import _build_pairs, _variant, main as run_main
 
 
 class RunnerSchedulerStagingTest(unittest.TestCase):
@@ -38,6 +44,51 @@ class RunnerSchedulerStagingTest(unittest.TestCase):
             _resolve_host_path("schedule/scx"),
             (REPO_ROOT / Path("schedule/scx")).resolve(),
         )
+
+    def test_guest_treatment_uses_staged_command_without_mutating_input(self) -> None:
+        treatment = {
+            "command": "guest/tune",
+            "host_command": "bench/treatments/tune",
+            "host_support_files": ["bench/treatments/helper"],
+            "args": ["--test"],
+        }
+
+        guest = _guest_treatment(treatment)
+
+        self.assertEqual(guest["command"], "/tmp/scx-bench-treatment")
+        self.assertEqual(guest["args"], ["--test"])
+        self.assertNotIn("host_command", guest)
+        self.assertNotIn("host_support_files", guest)
+        self.assertEqual(treatment["command"], "guest/tune")
+
+
+class RunnerVariantTest(unittest.TestCase):
+    def test_same_scheduler_can_compare_distinct_treatments(self) -> None:
+        scheduler = {"kind": "builtin", "name": "default"}
+        control = _variant(
+            "baseline",
+            "default",
+            scheduler,
+            "control",
+            {"command": "control"},
+        )
+        tuned = _variant(
+            "candidate",
+            "default",
+            scheduler,
+            "agent_tuned",
+            {"command": "tune"},
+        )
+        spec = RunnerExecutionPlanTest()._spec()
+
+        first = _build_pairs([spec], control, tuned, "alternating")[0]
+        second_spec = RunSpec(**{**spec.__dict__, "run_index": 2})
+        second = _build_pairs([second_spec], control, tuned, "alternating")[0]
+
+        self.assertEqual(control.label, "default__control")
+        self.assertEqual(tuned.label, "default__agent_tuned")
+        self.assertEqual([variant.role for variant in first.order], ["baseline", "candidate"])
+        self.assertEqual([variant.role for variant in second.order], ["candidate", "baseline"])
 
 
 class RunnerExecutionPlanTest(unittest.TestCase):
@@ -103,7 +154,7 @@ class RunnerExecutionPlanTest(unittest.TestCase):
         written_plan = write_guest.call_args.args[1]
         self.assertEqual(written_plan.to_dict(), execution_plan)
         self.assertEqual(
-            _manifest_entry(spec, scheduler=scheduler)["execution_plan"],
+            _manifest_entry(spec, label="dry-run", scheduler=scheduler)["execution_plan"],
             execution_plan,
         )
         run_libvirt.assert_not_called()
@@ -121,9 +172,61 @@ class RunnerExecutionPlanTest(unittest.TestCase):
             43,
         )
 
+    def test_dry_run_carries_treatment_identity_policy_and_timeout(self) -> None:
+        treatment = {
+            "command": "prepare",
+            "host_command": "bench/treatments/prepare",
+            "host_support_files": ["bench/treatments/mock_openai_llm.py"],
+            "args": ["--mode", "agent"],
+            "env": {"MODE": "agent"},
+            "timeout_seconds": 12,
+            "post_treatment_settle_seconds": 3,
+            "allow_no_commit": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = _run_one(
+                self._spec(),
+                Path(temp_dir),
+                True,
+                "scx__agent",
+                {"kind": "builtin"},
+                None,
+                30,
+                None,
+                "candidate",
+                "agent",
+                treatment,
+            )
+
+        execution_plan = result["execution_plan"]
+        self.assertEqual(
+            execution_plan["run_context"],
+            {
+                "role": "candidate",
+                "variant": "scx__agent",
+                "treatment": "agent",
+            },
+        )
+        self.assertEqual(
+            execution_plan["treatment"]["argv"],
+            ["/tmp/scx-bench-treatment", "--mode", "agent"],
+        )
+        self.assertTrue(execution_plan["treatment"]["allow_no_commit"])
+        self.assertEqual(execution_plan["post_treatment_settle_seconds"], 3)
+        self.assertEqual(result["spec"]["treatment_name"], "agent")
+        self.assertEqual(
+            result["spec"]["treatment_config"]["host_command"],
+            "bench/treatments/prepare",
+        )
+        self.assertNotIn("host_support_files", execution_plan["treatment"])
+
     def test_guest_top_level_status_is_authoritative(self) -> None:
         for guest_status in (
             "SCHEDULER_FAILED",
+            "TREATMENT_FAILED",
+            "TREATMENT_TIMEOUT",
+            "TREATMENT_NO_COMMIT",
+            "TREATMENT_RECOVERY_REQUIRED",
             "WARMUP_FAILED",
             "WARMUP_TIMEOUT",
             "BENCH_FAILED",
@@ -282,6 +385,115 @@ class RunnerGuestTransferTest(unittest.TestCase):
         self.assertIn("executor upload failed", result["stderr"])
         scp.assert_called_once()
         run_guest.assert_not_called()
+
+
+class RunScriptTreatmentIntegrationTest(unittest.TestCase):
+    def test_dry_run_compares_treatments_on_the_same_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            kernel_source = root / "linux"
+            (kernel_source / "tools" / "perf").mkdir(parents=True)
+            config_path = root / "bench.yaml"
+            output = root / "results"
+            config = {
+                "libvirt": {
+                    "root_image": str(root / "base.qcow2"),
+                    "kernel_source": str(kernel_source),
+                    "ssh_user": "root",
+                    "ssh_key": str(root / "key"),
+                    "workdir": "/guest/work",
+                    "guest_output_dir": "/scx_bench_out",
+                    "emulator_cpus": "0",
+                    "network": None,
+                },
+                "schedulers": {"default": {"kind": "builtin"}},
+                "treatments": {
+                    "control": {
+                        "command": "control",
+                        "timeout_seconds": 10,
+                    },
+                    "agent": {
+                        "command": "agent",
+                        "timeout_seconds": 20,
+                    },
+                },
+                "plans": {
+                    "test": {
+                        "runs": 1,
+                        "matrix": [{"machine": "small", "suites": ["suite"]}],
+                    }
+                },
+                "machines": {
+                    "small": {
+                        "vcpus": 1,
+                        "memory": "1G",
+                        "pin_cpus": "0",
+                        "exclusive": True,
+                        "frequency": {"fixed": True},
+                    }
+                },
+                "suites": {
+                    "suite": {
+                        "benches": ["bench"],
+                        "metric_profile": "metrics",
+                    }
+                },
+                "metric_profiles": {
+                    "metrics": {
+                        "primary": [
+                            {
+                                "name": "throughput",
+                                "direction": "higher",
+                            }
+                        ]
+                    }
+                },
+                "benches": {
+                    "bench": {
+                        "measurement": {
+                            "command": "measure",
+                            "timeout_seconds": 30,
+                        }
+                    }
+                },
+            }
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            with (
+                patch(
+                    "bench.scripts.run._update_latest_report_link",
+                    return_value=output / "report.html",
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                returncode = run_main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "--plan",
+                        "test",
+                        "--baseline",
+                        "default",
+                        "--candidate",
+                        "default",
+                        "--baseline-treatment",
+                        "control",
+                        "--candidate-treatment",
+                        "agent",
+                        "--output",
+                        str(output),
+                        "--dry-run",
+                        "--parallel",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(returncode, 0)
+            metadata = yaml.safe_load((output / "metadata.json").read_text())
+            self.assertEqual(metadata["baseline"], "default__control")
+            self.assertEqual(metadata["candidate"], "default__agent")
+            self.assertTrue((output / "runs" / "default__control").is_dir())
+            self.assertTrue((output / "runs" / "default__agent").is_dir())
 
 
 if __name__ == "__main__":

@@ -60,3 +60,92 @@ impl ActivationEvent {
         }
     }
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ActivationRequest {
+    pub request_id: String,
+    pub wait: bool,
+    pub event: ActivationEvent,
+}
+
+impl ActivationRequest {
+    pub fn new(request_id: String, wait: bool, event: ActivationEvent) -> Self {
+        Self {
+            request_id,
+            wait,
+            event,
+        }
+    }
+
+    pub fn fire_and_forget(event: ActivationEvent) -> Self {
+        Self {
+            request_id: format!("legacy-{}", event.timestamp_ns),
+            wait: false,
+            event,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationOutcomeStatus {
+    Committed,
+    NoCommit,
+    RecoveryRequired,
+    Rejected,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ActivationResponse {
+    pub version: u32,
+    pub request_id: String,
+    pub status: ActivationOutcomeStatus,
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode: Option<crate::runtime::EpisodeOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ActivationResponse {
+    pub fn rejected(request_id: String, error: String) -> Self {
+        Self {
+            version: 1,
+            request_id,
+            status: ActivationOutcomeStatus::Rejected,
+            accepted: false,
+            episode: None,
+            error: Some(error),
+        }
+    }
+
+    pub fn error(request_id: String, error: String) -> Self {
+        Self {
+            version: 1,
+            request_id,
+            status: ActivationOutcomeStatus::Error,
+            accepted: false,
+            episode: None,
+            error: Some(error),
+        }
+    }
+
+    pub fn from_episode(request_id: String, episode: crate::runtime::EpisodeOutcome) -> Self {
+        let status = match episode.phase {
+            crate::domain::EpisodePhase::Committed => ActivationOutcomeStatus::Committed,
+            crate::domain::EpisodePhase::RecoveryRequired => {
+                ActivationOutcomeStatus::RecoveryRequired
+            }
+            _ => ActivationOutcomeStatus::NoCommit,
+        };
+        Self {
+            version: 1,
+            request_id,
+            status,
+            accepted: true,
+            episode: Some(episode),
+            error: None,
+        }
+    }
+}

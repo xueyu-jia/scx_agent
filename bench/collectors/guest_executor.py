@@ -16,28 +16,49 @@ from pathlib import Path
 from typing import Any
 
 
-PLAN_VERSION = 1
+PLAN_VERSION = 2
+TREATMENT_OUTCOME_VERSION = 1
+MAX_TREATMENT_OUTCOME_BYTES = 64 * 1024
 PLAN_KEYS = {
     "version",
     "workdir",
     "output_dir",
+    "run_context",
     "env",
     "vm_settle_seconds",
     "scheduler",
+    "treatment",
+    "post_treatment_settle_seconds",
     "warmup",
     "post_warmup_settle_seconds",
     "measurement",
     "cooldown_seconds",
 }
 COMMAND_KEYS = {"argv", "timeout_seconds"}
+RUN_CONTEXT_KEYS = {"role", "variant", "treatment"}
+RUN_ROLES = {"baseline", "candidate", "standalone"}
+TREATMENT_KEYS = {"argv", "env", "timeout_seconds", "allow_no_commit"}
+TREATMENT_OUTCOME_KEYS = {"version", "status", "details"}
+TREATMENT_OUTCOMES = {"ready", "no_commit", "recovery_required"}
 SCHEDULER_KEYS = {
     "argv",
     "env",
     "settle_seconds",
     "startup_grace_seconds",
 }
+RESERVED_GUEST_ENV = {
+    "SCX_BENCH_OUT",
+    "SCX_BENCH_ROLE",
+    "SCX_BENCH_VARIANT",
+    "SCX_BENCH_TREATMENT",
+    "SCX_BENCH_TREATMENT_OUTCOME",
+}
 PASS = "PASS"
 SCHEDULER_FAILED = "SCHEDULER_FAILED"
+TREATMENT_FAILED = "TREATMENT_FAILED"
+TREATMENT_TIMEOUT = "TREATMENT_TIMEOUT"
+TREATMENT_NO_COMMIT = "TREATMENT_NO_COMMIT"
+TREATMENT_RECOVERY_REQUIRED = "TREATMENT_RECOVERY_REQUIRED"
 WARMUP_FAILED = "WARMUP_FAILED"
 WARMUP_TIMEOUT = "WARMUP_TIMEOUT"
 BENCH_FAILED = "BENCH_FAILED"
@@ -75,6 +96,116 @@ class Command:
 
 
 @dataclass(frozen=True)
+class RunContext:
+    role: str
+    variant: str
+    treatment: str | None
+
+    @classmethod
+    def from_value(cls, value: Any) -> "RunContext":
+        mapping = _mapping(value, "run_context")
+        _validate_keys(mapping, RUN_CONTEXT_KEYS, "run_context")
+        role = _text(mapping.get("role"), "run_context.role")
+        if role not in RUN_ROLES:
+            raise PlanError(
+                f"run_context.role must be one of {sorted(RUN_ROLES)}, got {role!r}"
+            )
+        return cls(
+            role=role,
+            variant=_text(mapping.get("variant"), "run_context.variant"),
+            treatment=_optional_text(
+                mapping.get("treatment"),
+                "run_context.treatment",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "variant": self.variant,
+            "treatment": self.treatment,
+        }
+
+
+@dataclass(frozen=True)
+class Treatment:
+    argv: tuple[str, ...]
+    env: dict[str, str]
+    timeout_seconds: int
+    allow_no_commit: bool
+
+    @classmethod
+    def from_value(cls, value: Any) -> "Treatment":
+        mapping = _mapping(value, "treatment")
+        _validate_keys(mapping, TREATMENT_KEYS, "treatment")
+        env = _environment(mapping.get("env", {}), "treatment.env")
+        _reject_reserved_environment(env, "treatment.env")
+        allow_no_commit = mapping.get("allow_no_commit")
+        if not isinstance(allow_no_commit, bool):
+            raise PlanError("treatment.allow_no_commit must be a boolean")
+        return cls(
+            argv=_argv(mapping.get("argv"), "treatment.argv"),
+            env=env,
+            timeout_seconds=_positive_int(
+                mapping.get("timeout_seconds"),
+                "treatment.timeout_seconds",
+            ),
+            allow_no_commit=allow_no_commit,
+        )
+
+    def command(self) -> Command:
+        return Command(self.argv, self.timeout_seconds)
+
+
+@dataclass(frozen=True)
+class TreatmentOutcome:
+    status: str
+    details: dict[str, Any]
+
+    @classmethod
+    def load(cls, path: Path) -> "TreatmentOutcome":
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise PlanError(f"cannot stat treatment outcome {path}: {exc}") from exc
+        if size > MAX_TREATMENT_OUTCOME_BYTES:
+            raise PlanError(
+                "treatment outcome exceeds "
+                f"{MAX_TREATMENT_OUTCOME_BYTES} bytes"
+            )
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PlanError(f"cannot read treatment outcome {path}: {exc}") from exc
+
+        mapping = _mapping(value, "treatment outcome")
+        _validate_keys(mapping, TREATMENT_OUTCOME_KEYS, "treatment outcome")
+        version = mapping.get("version")
+        if isinstance(version, bool) or version != TREATMENT_OUTCOME_VERSION:
+            raise PlanError(
+                "treatment outcome.version must be "
+                f"{TREATMENT_OUTCOME_VERSION}, got {version!r}"
+            )
+        status = _text(mapping.get("status"), "treatment outcome.status")
+        if status not in TREATMENT_OUTCOMES:
+            raise PlanError(
+                "treatment outcome.status must be one of "
+                f"{sorted(TREATMENT_OUTCOMES)}, got {status!r}"
+            )
+        details = mapping.get("details", {})
+        if not isinstance(details, dict):
+            raise PlanError("treatment outcome.details must be a mapping")
+        return cls(status=status, details=details)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": TREATMENT_OUTCOME_VERSION,
+            "status": self.status,
+            "details": self.details,
+        }
+
+
+@dataclass(frozen=True)
 class Scheduler:
     argv: tuple[str, ...]
     env: dict[str, str]
@@ -85,9 +216,11 @@ class Scheduler:
     def from_value(cls, value: Any) -> "Scheduler":
         mapping = _mapping(value, "scheduler")
         _validate_keys(mapping, SCHEDULER_KEYS, "scheduler")
+        env = _environment(mapping.get("env", {}), "scheduler.env")
+        _reject_reserved_environment(env, "scheduler.env")
         return cls(
             argv=_argv(mapping.get("argv"), "scheduler.argv"),
-            env=_environment(mapping.get("env", {}), "scheduler.env"),
+            env=env,
             settle_seconds=_non_negative_int(
                 mapping.get("settle_seconds"),
                 "scheduler.settle_seconds",
@@ -103,9 +236,12 @@ class Scheduler:
 class Plan:
     workdir: Path
     output_dir: Path
+    run_context: RunContext
     env: dict[str, str]
     vm_settle_seconds: int
     scheduler: Scheduler | None
+    treatment: Treatment | None
+    post_treatment_settle_seconds: int
     warmup: Command | None
     post_warmup_settle_seconds: int
     measurement: Command
@@ -127,11 +263,33 @@ class Plan:
             )
 
         scheduler_value = mapping.get("scheduler")
+        treatment_value = mapping.get("treatment")
         warmup_value = mapping.get("warmup")
+        run_context = RunContext.from_value(mapping.get("run_context"))
+        env = _environment(mapping.get("env", {}), "plan.env")
+        _reject_reserved_environment(env, "plan.env")
+        treatment = (
+            Treatment.from_value(treatment_value)
+            if treatment_value is not None
+            else None
+        )
+        if (run_context.treatment is None) != (treatment is None):
+            raise PlanError(
+                "run_context.treatment and plan.treatment must either both be set or both be null"
+            )
+        post_treatment_settle_seconds = _non_negative_int(
+            mapping.get("post_treatment_settle_seconds"),
+            "plan.post_treatment_settle_seconds",
+        )
+        if treatment is None and post_treatment_settle_seconds != 0:
+            raise PlanError(
+                "plan.post_treatment_settle_seconds must be zero without a treatment"
+            )
         return cls(
             workdir=_absolute_path(mapping.get("workdir"), "plan.workdir"),
             output_dir=_absolute_path(mapping.get("output_dir"), "plan.output_dir"),
-            env=_environment(mapping.get("env", {}), "plan.env"),
+            run_context=run_context,
+            env=env,
             vm_settle_seconds=_non_negative_int(
                 mapping.get("vm_settle_seconds"),
                 "plan.vm_settle_seconds",
@@ -139,6 +297,8 @@ class Plan:
             scheduler=Scheduler.from_value(scheduler_value)
             if scheduler_value is not None
             else None,
+            treatment=treatment,
+            post_treatment_settle_seconds=post_treatment_settle_seconds,
             warmup=Command.from_value(warmup_value, "warmup")
             if warmup_value is not None
             else None,
@@ -198,6 +358,8 @@ class GuestExecutor:
             "started_at": None,
             "finished_at": None,
         }
+        self.treatment_result = PhaseResult()
+        self.treatment_outcome: TreatmentOutcome | None = None
         self.warmup_result = PhaseResult()
         self.measurement_result = PhaseResult()
         self.snapshot_errors: list[str] = []
@@ -211,6 +373,7 @@ class GuestExecutor:
             self._prepare_output()
             self._sleep(self.plan.vm_settle_seconds)
             self._start_scheduler()
+            self._run_treatment()
 
             if self.plan.warmup is not None:
                 self.warmup_result = self._run_command(
@@ -283,11 +446,73 @@ class GuestExecutor:
         self.output_ready = True
         (self.output_dir / "stdout.log").touch()
         (self.output_dir / "stderr.log").touch()
-        if self.plan.warmup is not None:
-            warmup_dir = self.output_dir / "warmup"
-            warmup_dir.mkdir()
-            (warmup_dir / "stdout.log").touch()
-            (warmup_dir / "stderr.log").touch()
+        for name, enabled in (
+            ("treatment", self.plan.treatment is not None),
+            ("warmup", self.plan.warmup is not None),
+        ):
+            if not enabled:
+                continue
+            phase_dir = self.output_dir / name
+            phase_dir.mkdir()
+            (phase_dir / "stdout.log").touch()
+            (phase_dir / "stderr.log").touch()
+
+    def _run_treatment(self) -> None:
+        treatment = self.plan.treatment
+        if treatment is None:
+            return
+
+        output_dir = self.output_dir / "treatment"
+        outcome_path = output_dir / "outcome.json"
+        self.treatment_result = self._run_command(
+            treatment.command(),
+            output_dir=output_dir,
+            stdout_path=output_dir / "stdout.log",
+            stderr_path=output_dir / "stderr.log",
+            extra_env=treatment.env,
+            treatment_outcome_path=outcome_path,
+            include_run_context=True,
+        )
+        self._check_scheduler("treatment")
+        self._require_phase(
+            self.treatment_result,
+            failed_status=TREATMENT_FAILED,
+            timeout_status=TREATMENT_TIMEOUT,
+            phase_name="treatment",
+        )
+
+        try:
+            self.treatment_outcome = TreatmentOutcome.load(outcome_path)
+        except PlanError as exc:
+            self.treatment_result.status = "FAILED"
+            self.treatment_result.error = str(exc)
+            raise ExecutionFailure(
+                TREATMENT_FAILED,
+                f"treatment outcome is invalid: {exc}",
+            ) from exc
+
+        if self.treatment_outcome.status == "recovery_required":
+            self.treatment_result.status = "RECOVERY_REQUIRED"
+            self.treatment_result.error = (
+                "treatment reported that system state requires recovery"
+            )
+            raise ExecutionFailure(
+                TREATMENT_RECOVERY_REQUIRED,
+                self.treatment_result.error,
+            )
+        if (
+            self.treatment_outcome.status == "no_commit"
+            and not treatment.allow_no_commit
+        ):
+            self.treatment_result.status = "NO_COMMIT"
+            self.treatment_result.error = "treatment completed without a commit"
+            raise ExecutionFailure(
+                TREATMENT_NO_COMMIT,
+                self.treatment_result.error,
+            )
+
+        self._sleep(self.plan.post_treatment_settle_seconds)
+        self._check_scheduler("post-treatment settle")
 
     def _start_scheduler(self) -> None:
         scheduler = self.plan.scheduler
@@ -398,11 +623,20 @@ class GuestExecutor:
         output_dir: Path,
         stdout_path: Path,
         stderr_path: Path,
+        extra_env: dict[str, str] | None = None,
+        treatment_outcome_path: Path | None = None,
+        include_run_context: bool = False,
     ) -> PhaseResult:
         result = PhaseResult(status="RUNNING", started_at=_utc_now())
         started = time.monotonic()
         output_dir.mkdir(parents=True, exist_ok=True)
-        env = self._phase_env(output_dir)
+        env = self._phase_env(
+            output_dir,
+            extra_env,
+            include_run_context=include_run_context,
+        )
+        if treatment_outcome_path is not None:
+            env["SCX_BENCH_TREATMENT_OUTCOME"] = str(treatment_outcome_path)
 
         try:
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
@@ -472,12 +706,31 @@ class GuestExecutor:
         detail = result.error or f"returncode {result.returncode}"
         raise ExecutionFailure(failed_status, f"{phase_name} failed: {detail}")
 
-    def _phase_env(self, output_dir: Path) -> dict[str, str]:
-        return {
+    def _phase_env(
+        self,
+        output_dir: Path,
+        extra_env: dict[str, str] | None = None,
+        *,
+        include_run_context: bool = False,
+    ) -> dict[str, str]:
+        env = {
             **os.environ,
             **self.plan.env,
-            "SCX_BENCH_OUT": str(output_dir),
         }
+        if extra_env:
+            env.update(extra_env)
+        for name in RESERVED_GUEST_ENV:
+            env.pop(name, None)
+        env["SCX_BENCH_OUT"] = str(output_dir)
+        if include_run_context:
+            env.update(
+                {
+                    "SCX_BENCH_ROLE": self.plan.run_context.role,
+                    "SCX_BENCH_VARIANT": self.plan.run_context.variant,
+                    "SCX_BENCH_TREATMENT": self.plan.run_context.treatment or "",
+                }
+            )
+        return env
 
     def _snapshot(self, phase: str) -> None:
         destination = self.output_dir / "snapshots" / phase
@@ -628,16 +881,28 @@ class GuestExecutor:
             "version": PLAN_VERSION,
             "status": self.status,
             "failure_reason": self.failure_reason,
+            "run_context": self.plan.run_context.to_dict(),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "phases": {
                 "scheduler": self.scheduler_result,
+                "treatment": {
+                    **self.treatment_result.to_dict(),
+                    "outcome": (
+                        self.treatment_outcome.to_dict()
+                        if self.treatment_outcome is not None
+                        else None
+                    ),
+                },
                 "warmup": self.warmup_result.to_dict(),
                 "measurement": self.measurement_result.to_dict(),
             },
             "snapshot_errors": list(self.snapshot_errors),
             "timing": {
                 "vm_settle_seconds": self.plan.vm_settle_seconds,
+                "post_treatment_settle_seconds": (
+                    self.plan.post_treatment_settle_seconds
+                ),
                 "post_warmup_settle_seconds": self.plan.post_warmup_settle_seconds,
                 "cooldown_seconds": self.plan.cooldown_seconds,
             },
@@ -654,9 +919,14 @@ class GuestExecutor:
     def _exit_code(self) -> int:
         if self.status == PASS:
             return 0
-        if self.status in {WARMUP_TIMEOUT, BENCH_TIMEOUT}:
+        if self.status in {TREATMENT_TIMEOUT, WARMUP_TIMEOUT, BENCH_TIMEOUT}:
             return 124
-        phase = self.warmup_result if self.status == WARMUP_FAILED else self.measurement_result
+        if self.status == TREATMENT_FAILED:
+            phase = self.treatment_result
+        elif self.status == WARMUP_FAILED:
+            phase = self.warmup_result
+        else:
+            phase = self.measurement_result
         if phase.returncode is not None and 1 <= phase.returncode <= 255:
             return phase.returncode
         return 125
@@ -747,6 +1017,30 @@ def _environment(value: Any, prefix: str) -> dict[str, str]:
     ):
         raise PlanError(f"{prefix} must contain string:string entries")
     return dict(mapping)
+
+
+def _reject_reserved_environment(value: dict[str, str], prefix: str) -> None:
+    reserved = sorted(set(value) & RESERVED_GUEST_ENV)
+    if reserved:
+        raise PlanError(f"{prefix} contains reserved variables: {reserved}")
+
+
+def _text(value: Any, prefix: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 256
+        or value.strip() != value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise PlanError(f"{prefix} must be a valid non-empty string")
+    return value
+
+
+def _optional_text(value: Any, prefix: str) -> str | None:
+    if value is None:
+        return None
+    return _text(value, prefix)
 
 
 def _string(value: Any, prefix: str) -> str:

@@ -202,6 +202,18 @@ cargo run -- --config tuning-agent.toml activate \
   "diagnose current host performance" info cli
 ```
 
+等待 episode 完成并输出结构化结果：
+
+```bash
+cargo run -- --config tuning-agent.toml activate \
+  --wait --json --timeout-seconds 900 \
+  "bench treatment" info scx-bench /sys/fs/cgroup/my-workload
+```
+
+`--wait --json` 返回 `ActivationResponse`，其中 `status` 只表达 runtime 结果分类：
+`committed`、`no_commit`、`recovery_required`、`rejected` 或 `error`。它不会授予
+调用方 commit 权限；commit 仍只能由 Runtime 在固定 A/B evaluate 后完成。
+
 配置优先级：
 
 ```text
