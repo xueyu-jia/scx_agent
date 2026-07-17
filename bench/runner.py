@@ -1316,7 +1316,7 @@ def _preflight_machine(spec: RunSpec) -> None:
 
     frequency = spec.machine.get("frequency", {})
     if frequency.get("fixed") is True:
-        errors.extend(_check_fixed_frequency(pin_cpus, frequency.get("governor")))
+        errors.extend(_check_fixed_frequency(pin_cpus, frequency))
 
     errors.extend(_check_irq_runtime_isolation(spec, pin_cpus))
 
@@ -1461,10 +1461,16 @@ def _parse_cpu_mask(text: str) -> set[int]:
     return cpus
 
 
-def _check_fixed_frequency(pin_cpus: list[int], expected_governor: str | None) -> list[str]:
+def _check_fixed_frequency(
+    pin_cpus: list[int],
+    frequency: dict[str, Any],
+    sysfs_cpu_root: Path = Path("/sys/devices/system/cpu"),
+) -> list[str]:
     errors: list[str] = []
+    expected_governor = frequency.get("governor")
+    target_khz = frequency.get("target_khz")
     for cpu in pin_cpus:
-        cpufreq = Path(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq")
+        cpufreq = sysfs_cpu_root / f"cpu{cpu}" / "cpufreq"
         if not cpufreq.exists():
             errors.append(f"CPU {cpu} does not expose cpufreq controls")
             continue
@@ -1479,6 +1485,10 @@ def _check_fixed_frequency(pin_cpus: list[int], expected_governor: str | None) -
                 f"CPU {cpu} frequency is not fixed: scaling_min_freq={min_freq}, "
                 f"scaling_max_freq={max_freq}"
             )
+        elif target_khz is not None and min_freq != str(target_khz):
+            errors.append(
+                f"CPU {cpu} fixed frequency is {min_freq} kHz, expected {target_khz} kHz"
+            )
 
         if expected_governor is not None:
             governor = _read_optional(cpufreq / "scaling_governor")
@@ -1489,6 +1499,22 @@ def _check_fixed_frequency(pin_cpus: list[int], expected_governor: str | None) -
                 errors.append(
                     f"CPU {cpu} governor is {governor}, expected {expected_governor}"
                 )
+
+    expected_turbo = frequency.get("turbo")
+    if expected_turbo is not None:
+        no_turbo = _read_optional(sysfs_cpu_root / "intel_pstate" / "no_turbo")
+        boost = _read_optional(sysfs_cpu_root / "cpufreq" / "boost")
+        if no_turbo is not None:
+            turbo_enabled = no_turbo == "0"
+        elif boost is not None:
+            turbo_enabled = boost == "1"
+        else:
+            errors.append("host does not expose a turbo/boost control")
+            turbo_enabled = expected_turbo
+        if turbo_enabled != expected_turbo:
+            state = "enabled" if turbo_enabled else "disabled"
+            expected = "enabled" if expected_turbo else "disabled"
+            errors.append(f"CPU turbo is {state}, expected {expected}")
     return errors
 
 

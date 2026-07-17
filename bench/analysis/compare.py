@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .loader import RunMetricSet
+from .paired import compare_paired_runs
 
 
 VALID_STATUSES = {"PASS"}
@@ -125,6 +126,14 @@ def _build_comparison(
     baseline_stats = _stats(baseline_values, baseline_run_summary)
     candidate_stats = _stats(candidate_values, candidate_run_summary)
     delta_pct = _delta_pct(baseline_stats.get("mean"), candidate_stats.get("mean"))
+    paired = compare_paired_runs(
+        baseline_group,
+        candidate_group,
+        metric_spec.name,
+        metric_spec.direction,
+        baseline_group[0].label if baseline_group else "baseline",
+        candidate_group[0].label if candidate_group else "candidate",
+    )
 
     return {
         "machine": machine,
@@ -141,6 +150,7 @@ def _build_comparison(
         "run_status": run_status,
         "failure_reason": _failure_reason(baseline_run_summary, candidate_run_summary),
         "delta_pct": delta_pct,
+        "paired": paired,
         "verdict": _verdict(
             metric_spec,
             baseline_values,

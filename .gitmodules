@@ -1,3 +1,4 @@
 [submodule "schedule/scx"]
 	path = schedule/scx
-	url = https://github.com/sched-ext/scx.git
+	url = https://github.com/xueyu-jia/scx.git
+	branch = main

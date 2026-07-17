@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .compare import build_analysis
 from .loader import load_result_dir
+from .paired import write_paired_csv
 from .report import write_html_report
 
 DEFAULT_COMPARISONS_ROOT = Path("bench/results/comparisons")
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
     write_html_report(analysis, output / "report.html")
+    write_paired_csv(analysis, output / "paired")
 
     summary = analysis["summary"]
     print(

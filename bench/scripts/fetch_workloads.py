@@ -23,9 +23,10 @@ class Workload:
     name: str
     repo: str
     ref: str
-    source_type: str = "git"  # "git" or "archive"
+    source_type: str = "git"  # "git", "archive", or "local"
     archive_url: str = ""
     archive_extract_dir: str = ""  # subdirectory inside the archive
+    local_path: str = ""
 
 
 WORKLOADS = {
@@ -124,6 +125,13 @@ WORKLOADS = {
         repo="https://github.com/google/benchmark.git",
         ref="main",
     ),
+    "batch-microbench": Workload(
+        name="batch-microbench",
+        repo="",
+        ref="",
+        source_type="local",
+        local_path="bench/workloads/local/batch_microbench",
+    ),
 }
 
 
@@ -155,10 +163,17 @@ def main(argv: list[str] | None = None) -> int:
         if name == "perf":
             build_perf(Path(config["libvirt"]["kernel_source"]))
             continue
-        source = SRC / workload.name
-        if args.force and source.exists():
+        source = (
+            ROOT / workload.local_path
+            if workload.source_type == "local"
+            else SRC / workload.name
+        )
+        if args.force and source.exists() and workload.source_type != "local":
             shutil.rmtree(source)
-        if workload.source_type == "archive":
+        if workload.source_type == "local":
+            if not source.exists():
+                raise RuntimeError(f"local workload source does not exist: {source}")
+        elif workload.source_type == "archive":
             fetch_archive(workload, source)
         else:
             clone_or_update(workload, source)
@@ -209,6 +224,7 @@ def build(name: str, source: Path) -> None:
         "mutex-benchmark": build_mutex_benchmark,
         "t-test1": build_t_test1,
         "google-benchmark": build_google_benchmark,
+        "batch-microbench": build_batch_microbench,
     }
     builders[name](source)
 
@@ -285,6 +301,7 @@ def build_perf(kernel_source: Path) -> None:
             f"-j{os.cpu_count() or 1}",
             "NO_LIBTRACEEVENT=1",
             "NO_LIBTRACEFS=1",
+            "NO_LIBLLVM=1",
         ]
     )
     install(build_dir / "perf", BIN / "perf")
@@ -381,6 +398,11 @@ def build_t_test1(source: Path) -> None:
         if matches:
             src_file = matches[0]
     run(["gcc", "-O2", "-pthread", "-o", str(BIN / "t-test1"), str(src_file)])
+
+
+def build_batch_microbench(source: Path) -> None:
+    run(["make", f"-j{os.cpu_count() or 1}"], cwd=source)
+    install(source / "batch_microbench", BIN / "batch_microbench")
 
 
 def install(src: Path, dst: Path) -> None:

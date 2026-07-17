@@ -57,6 +57,9 @@ class SchbenchMetricsTest(unittest.TestCase):
     def test_final_average_rps_is_preferred(self) -> None:
         self.assertEqual(parse_metrics(SCHBENCH_OUTPUT)["throughput"], 492.8)
 
+    def test_final_request_count_is_reported(self) -> None:
+        self.assertEqual(parse_metrics(SCHBENCH_OUTPUT)["request_count"], 101.0)
+
 
 if __name__ == "__main__":
     unittest.main()

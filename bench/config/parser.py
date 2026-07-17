@@ -500,6 +500,21 @@ def _validate_machines(config: dict[str, Any]) -> None:
             raise ConfigError(f"machines.{machine_name}.frequency must be a mapping")
         if frequency.get("fixed") is not True:
             raise ConfigError(f"machines.{machine_name}.frequency.fixed must be true")
+        governor = frequency.get("governor")
+        if governor is not None and (not isinstance(governor, str) or not governor):
+            raise ConfigError(
+                f"machines.{machine_name}.frequency.governor must be a non-empty string"
+            )
+        target_khz = frequency.get("target_khz")
+        if target_khz is not None and (
+            not isinstance(target_khz, int) or isinstance(target_khz, bool) or target_khz <= 0
+        ):
+            raise ConfigError(
+                f"machines.{machine_name}.frequency.target_khz must be a positive integer"
+            )
+        turbo = frequency.get("turbo")
+        if turbo is not None and not isinstance(turbo, bool):
+            raise ConfigError(f"machines.{machine_name}.frequency.turbo must be a boolean")
 
 
 def _validate_suites(config: dict[str, Any]) -> None:

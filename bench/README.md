@@ -723,13 +723,21 @@ python3 -m bench.analysis.run \
   --output /tmp/scx-analysis
 ```
 
-输出：
+输出同时包含 HTML 比较和按 `run_index` 的配对统计：
 
 ```text
 metadata.json
 analysis.json
 report.html
+paired/pairs.csv
+paired/summary.csv
 ```
+
+正式的交替顺序实验会按相同 `run_index` 配对，而不是只比较两组独立均值。
+聚合比较与配对比较复用同一组 result loader、metric profile 和 comparison group，
+并统一写入 `analysis.json` 与 HTML；`pairs.csv` 和 `summary.csv` 是同一分析模型的
+表格化导出。分析层只读取 `bench_metrics.json` 中已经规范化的指标，不解析 workload
+日志。置信区间是配对变化均值的 95% Student-t 区间。
 
 ## 注意事项
 
