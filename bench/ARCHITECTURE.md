@@ -336,7 +336,16 @@ It does not recompute verdicts or metrics.
 
 ### `bench/analysis/run.py`
 
-Standalone analysis CLI for re-analyzing existing result directories.
+Standalone analysis CLI and output coordinator. It loads each result directory
+once, builds one analysis model, and renders JSON, HTML, and paired CSV views.
+
+### `bench/analysis/paired.py`
+
+Contains only run-index pairing, paired-change statistics, and CSV projection.
+It operates on the shared `RunMetricSet` groups and metric definitions selected
+by `compare.py`; it does not load artifacts, classify workloads, or define a
+parallel metric registry. Formal result metrics come from `bench_metrics.json`,
+while workload parsing remains the benchmark adapter's responsibility.
 
 ## Data Flow
 

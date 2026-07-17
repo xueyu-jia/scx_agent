@@ -12,6 +12,7 @@ class RunMetricSet:
     run_dir: Path
     label: str
     status: str
+    run_index: int
     plan: str
     machine: str
     suite: str
@@ -58,6 +59,7 @@ def _load_one(
         run_dir=run_dir,
         label=label,
         status=str(result.get("status", "UNKNOWN")),
+        run_index=_as_int(spec.get("run_index")) or 0,
         plan=str(spec.get("plan", "")),
         machine=str(spec.get("machine", "")),
         suite=str(spec.get("suite", "")),

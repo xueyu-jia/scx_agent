@@ -80,6 +80,7 @@ DEFAULT_WORKLOADS = (
     "rt-tests",
     "will-it-scale",
     "perf",
+    "batch-microbench",
 )
 
 
@@ -827,6 +828,7 @@ def _verify_workloads() -> None:
         "stress-ng",
         "fio",
         "perf",
+        "batch_microbench",
     ]
     missing = [
         name for name in required if not (REPO_ROOT / "bench" / "workloads" / "bin" / name).exists()

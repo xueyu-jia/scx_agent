@@ -173,6 +173,7 @@ def _comparison_table(comparisons: list[dict[str, Any]]) -> str:
             f"<td>{_fmt_stat(item.get('baseline'), item.get('unit'))}</td>"
             f"<td>{_fmt_stat(item.get('candidate'), item.get('unit'))}</td>"
             f"<td>{_fmt_delta(item.get('delta_pct'), item.get('verdict'))}</td>"
+            f"<td>{_fmt_paired(item.get('paired'))}</td>"
             f"<td>{_bar(item.get('delta_pct'), item.get('verdict'))}</td>"
             "</tr>"
         )
@@ -180,7 +181,7 @@ def _comparison_table(comparisons: list[dict[str, Any]]) -> str:
     return (
         "<table><thead><tr>"
         "<th>Machine</th><th>Suite</th><th>Bench</th><th>Metric</th><th>Role</th>"
-        "<th>Baseline</th><th>Candidate</th><th>Delta</th><th>Chart</th>"
+        "<th>Baseline</th><th>Candidate</th><th>Delta</th><th>Paired Δ</th><th>Chart</th>"
         "</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
@@ -241,6 +242,23 @@ def _fmt_delta(value: Any, verdict: Any = None) -> str:
         return '<span class="muted">missing</span>'
     sign = "+" if value > 0 else ""
     return f'<span class="delta-{_h(verdict)}">{sign}{value:.2f}%</span>'
+
+
+def _fmt_paired(paired: Any) -> str:
+    if not isinstance(paired, dict):
+        return '<span class="muted">missing</span>'
+    stats = paired.get("percent")
+    if not isinstance(stats, dict):
+        return '<span class="muted">missing</span>'
+    mean = stats.get("mean")
+    low = stats.get("ci95_low")
+    high = stats.get("ci95_high")
+    if not isinstance(mean, (int, float)):
+        return '<span class="muted">missing</span>'
+    interval = (
+        f" [{low:.2f}, {high:.2f}]" if isinstance(low, (int, float)) and isinstance(high, (int, float)) else ""
+    )
+    return f"{mean:+.2f}% <span class=\"muted\">n={_h(stats.get('n', 0))}{interval}</span>"
 
 
 def _bar(value: Any, verdict: Any = None) -> str:

@@ -55,6 +55,13 @@ def parse_metrics(text: str) -> dict[str, float]:
             if key:
                 metrics[key] = float(value)
 
+    request_counts = re.findall(
+        r"Request Latencies percentiles[^\n]*\(([0-9,]+) total samples\)",
+        text,
+    )
+    if request_counts:
+        metrics["request_count"] = float(request_counts[-1].replace(",", ""))
+
     average_rps = re.findall(r"\baverage\s+rps:\s*([0-9.]+)", text, re.IGNORECASE)
     current_rps = re.findall(r"\bcurrent\s+rps:\s*([0-9.]+)", text, re.IGNORECASE)
     generic_rps = re.findall(

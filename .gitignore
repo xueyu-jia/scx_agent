@@ -2,7 +2,11 @@ __pycache__/
 *.py[cod]
 
 bench/results/
-bench/workloads/
+bench/workloads/bin/
+bench/workloads/build/
+bench/workloads/src/
+bench/workloads/local/*/*.o
+bench/workloads/local/*/batch_microbench
 bench/configs/local.config
 
 .venv/

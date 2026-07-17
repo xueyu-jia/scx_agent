@@ -47,24 +47,70 @@ def load_bench_metrics(stdout_path: Path) -> dict[str, Any]:
     }
 
 
+def _perf_event_name(raw_name: str) -> tuple[str | None, bool]:
+    name = raw_name.strip()
+    aliases = {
+        "context-switches": ("context_switches", False),
+        "cpu-migrations": ("migrations", False),
+        "task-clock": ("task_clock_msec", False),
+        "page-faults": ("page_faults", False),
+        "cycles": ("cycles", True),
+        "instructions": ("instructions", True),
+        "cache-misses": ("cache_misses", True),
+        "LLC-load-misses": ("llc_load_misses", True),
+        "dTLB-load-misses": ("dtlb_load_misses", True),
+    }
+    if name in aliases:
+        return aliases[name]
+
+    # Hybrid Intel PMUs qualify generic event names as cpu_core/event/ or
+    # cpu_atom/event/. Aggregate either spelling into one stable metric.
+    if name.endswith("/") and "/" in name:
+        qualified = name.rsplit("/", 2)[-2]
+        if qualified in aliases:
+            metric, _ = aliases[qualified]
+            return metric, True
+    return None, False
+
+
 def load_perf_stat_metrics(path: Path) -> dict[str, float]:
     if not path.exists():
         return {}
 
-    names = {
-        "context-switches": "context_switches",
-        "cpu-migrations": "migrations",
-    }
     metrics: dict[str, float] = {}
+    hardware_seen = False
+    invalid_hardware = 0
+    running_percentages: list[float] = []
     with path.open(encoding="utf-8", errors="replace", newline="") as stream:
         for fields in csv.reader(stream):
             if len(fields) < 3:
                 continue
-            name = names.get(fields[2].strip())
+            name, hardware = _perf_event_name(fields[2])
             if not name:
                 continue
             try:
-                metrics[name] = float(fields[0].strip())
+                value = float(fields[0].strip())
             except ValueError:
+                if hardware:
+                    hardware_seen = True
+                    invalid_hardware += 1
                 continue
+            metrics[name] = metrics.get(name, 0.0) + value
+            if hardware:
+                hardware_seen = True
+                if value <= 0:
+                    invalid_hardware += 1
+                if len(fields) >= 5:
+                    try:
+                        running_percentages.append(float(fields[4].strip()))
+                    except ValueError:
+                        pass
+
+    if hardware_seen:
+        running_min = min(running_percentages, default=0.0)
+        metrics["perf_hardware_invalid_events"] = float(invalid_hardware)
+        metrics["perf_hardware_running_pct_min"] = running_min
+        metrics["perf_hardware_events_valid"] = float(
+            invalid_hardware == 0 and running_min >= 90.0
+        )
     return metrics
