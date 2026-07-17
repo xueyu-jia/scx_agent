@@ -33,6 +33,7 @@ DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 RUNTIME_ISOLATION_REPORT = Path("/var/lib/scx-bench/runtime-isolation.json")
 GUEST_TREATMENT_PATH = "/tmp/scx-bench-treatment"
 GUEST_TREATMENT_SUPPORT_DIR = "/tmp/scx-bench-treatment.d"
+GUEST_BENCH_SUPPORT_DIR = "/tmp/scx-bench-workload.d"
 
 
 class PreflightError(RuntimeError):
@@ -232,6 +233,7 @@ def _run_one(
         treatment_host_support_files=(
             treatment.get("host_support_files", []) if treatment is not None else []
         ),
+        bench_host_support_files=spec.bench.get("host_support_files", []),
     )
     vm_returncode = completed["returncode"]
     libvirt_stdout = completed["stdout"]
@@ -241,6 +243,7 @@ def _run_one(
     host_irq_delta = completed.get("host_irq_delta", {})
     guest_executor = completed.get("guest_executor", {})
     treatment_artifact = completed.get("treatment_artifact", {})
+    benchmark_artifact = completed.get("benchmark_artifact", {})
 
     finished_at = datetime.now(timezone.utc)
     duration = (finished_at - started_at).total_seconds()
@@ -270,6 +273,7 @@ def _run_one(
             "host_irq_delta": host_irq_delta,
             "guest_executor": guest_executor,
             "treatment_artifact": treatment_artifact,
+            "benchmark_artifact": benchmark_artifact,
             "finished_at": finished_at.isoformat(),
             "duration_seconds": duration,
             "bench_metrics": bench_metrics,
@@ -296,6 +300,7 @@ def _run_libvirt(
     heartbeat: Callable[[float], None],
     treatment_host_command: str | None = None,
     treatment_host_support_files: list[str] | None = None,
+    bench_host_support_files: list[str] | None = None,
 ) -> dict[str, Any]:
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -306,6 +311,7 @@ def _run_libvirt(
     host_irq_delta: dict[str, Any] = {}
     guest_executor: dict[str, str] = {}
     treatment_artifact: dict[str, Any] = {}
+    benchmark_artifact: dict[str, Any] = {}
     try:
         _prepare_runtime_dir(runtime_dir, stdout_parts, stderr_parts)
         _create_overlay(libvirt, overlay_path, stdout_parts, stderr_parts)
@@ -324,6 +330,20 @@ def _run_libvirt(
                 stdout_parts,
                 stderr_parts,
             )
+        if bench_host_support_files:
+            benchmark_artifact = {
+                "guest_dir": GUEST_BENCH_SUPPORT_DIR,
+                "support_files": _stage_support_files(
+                    libvirt,
+                    host,
+                    port,
+                    bench_host_support_files,
+                    GUEST_BENCH_SUPPORT_DIR,
+                    "benchmark",
+                    stdout_parts,
+                    stderr_parts,
+                ),
+            }
         if treatment_host_command:
             treatment_artifact = _stage_treatment(
                 libvirt,
@@ -419,6 +439,7 @@ def _run_libvirt(
         host_irq_delta,
         guest_executor,
         treatment_artifact,
+        benchmark_artifact,
     )
 
 
@@ -515,56 +536,90 @@ def _stage_treatment(
         stdout_parts,
         stderr_parts,
     )
-    support_artifacts = {}
-    if host_support_files:
-        _run_command(
-            _ssh_command(
-                libvirt,
-                host,
-                port,
-                f"mkdir -p {shlex.quote(GUEST_TREATMENT_SUPPORT_DIR)}",
-            ),
-            stdout_parts,
-            stderr_parts,
-        )
-        for item in host_support_files:
-            support = _resolve_host_path(item)
-            if not support.is_file():
-                raise RuntimeError(
-                    f"treatment host_support_files entry does not exist: {support}"
-                )
-            destination = f"{GUEST_TREATMENT_SUPPORT_DIR}/{support.name}"
-            _scp_to_guest(
-                libvirt,
-                host,
-                port,
-                support,
-                destination,
-                stdout_parts,
-                stderr_parts,
-            )
-            mode = "0755" if os.access(support, os.X_OK) else "0644"
-            _run_command(
-                _ssh_command(
-                    libvirt,
-                    host,
-                    port,
-                    f"chmod {mode} {shlex.quote(destination)}",
-                ),
-                stdout_parts,
-                stderr_parts,
-            )
-            support_artifacts[support.name] = {
-                "source": str(support),
-                "guest_path": destination,
-                "sha256": _sha256_file(support),
-            }
+    support_artifacts = _stage_support_files(
+        libvirt,
+        host,
+        port,
+        host_support_files,
+        GUEST_TREATMENT_SUPPORT_DIR,
+        "treatment",
+        stdout_parts,
+        stderr_parts,
+    )
     return {
         "source": str(source),
         "guest_path": GUEST_TREATMENT_PATH,
         "sha256": _sha256_file(source),
         "support_files": support_artifacts,
     }
+
+
+def _stage_support_files(
+    libvirt: dict[str, Any],
+    host: str,
+    port: int,
+    host_support_files: list[str],
+    guest_dir: str,
+    owner: str,
+    stdout_parts: list[str],
+    stderr_parts: list[str],
+) -> dict[str, dict[str, str]]:
+    if not host_support_files:
+        return {}
+
+    sources: dict[str, Path] = {}
+    for item in host_support_files:
+        source = _resolve_host_path(item)
+        if not source.is_file():
+            raise RuntimeError(
+                f"{owner} host_support_files entry does not exist: {source}"
+            )
+        if source.name in sources:
+            raise RuntimeError(
+                f"{owner} host_support_files contains duplicate basename "
+                f"{source.name!r}: {sources[source.name]} and {source}"
+            )
+        sources[source.name] = source
+
+    _run_command(
+        _ssh_command(
+            libvirt,
+            host,
+            port,
+            f"mkdir -p {shlex.quote(guest_dir)}",
+        ),
+        stdout_parts,
+        stderr_parts,
+    )
+    artifacts = {}
+    for name, source in sources.items():
+        destination = f"{guest_dir}/{name}"
+        _scp_to_guest(
+            libvirt,
+            host,
+            port,
+            source,
+            destination,
+            stdout_parts,
+            stderr_parts,
+        )
+        mode = "0755" if os.access(source, os.X_OK) else "0644"
+        _run_command(
+            _ssh_command(
+                libvirt,
+                host,
+                port,
+                f"chmod {mode} {shlex.quote(destination)}",
+            ),
+            stdout_parts,
+            stderr_parts,
+        )
+        artifacts[name] = {
+            "source": str(source),
+            "guest_path": destination,
+            "sha256": _sha256_file(source),
+        }
+    return artifacts
 
 
 def _resolve_host_path(value: str) -> Path:
@@ -811,8 +866,8 @@ def _guest_run_status(
         "SCHEDULER_FAILED",
         "TREATMENT_FAILED",
         "TREATMENT_TIMEOUT",
-        "TREATMENT_NO_COMMIT",
-        "TREATMENT_RECOVERY_REQUIRED",
+        "TREATMENT_STOPPED",
+        "TREATMENT_UNSAFE_STATE",
         "WARMUP_FAILED",
         "WARMUP_TIMEOUT",
         "BENCH_FAILED",
@@ -1146,6 +1201,7 @@ def _libvirt_result(
     host_irq_delta: dict[str, Any],
     guest_executor: dict[str, str],
     treatment_artifact: dict[str, Any],
+    benchmark_artifact: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -1156,6 +1212,7 @@ def _libvirt_result(
         "host_irq_delta": host_irq_delta,
         "guest_executor": guest_executor,
         "treatment_artifact": treatment_artifact,
+        "benchmark_artifact": benchmark_artifact,
     }
 
 

@@ -33,6 +33,21 @@ bench/
     guest.py
     guest_executor.py
 
+  integrations/
+    tuning_agent/
+      adapter.py
+      deterministic_mcp.py
+      mock_llm.py
+
+  scenarios/
+    cgroup_cpu/
+      common.py
+      fixture.py
+      workload.py
+      mcp_server.py
+      mock_llm.py
+      matrix.py
+
   benchmarks/
     generic.py
 
@@ -44,6 +59,7 @@ bench/
 
   configs/
     example.config
+    cgroup_cpu_tuning.config
     local.config  # generated, ignored by git
 
   workloads/
@@ -221,8 +237,9 @@ The guest executor:
 - starts the selected scheduler if `kind: scx`;
 - waits for the scheduler to settle;
 - runs the optional treatment in an isolated process group and output directory;
-- validates its bounded structured outcome and applies the configured no-commit policy;
-- rejects `recovery_required` unconditionally and waits for the post-treatment settle interval;
+- validates its bounded Outcome V2 and interprets only `proceed`, `stop`, or `unsafe`;
+- continues after `proceed`, controlled-stops after `stop`, and blocks unsafe state after `unsafe`;
+- waits for the post-treatment settle interval only after `proceed`;
 - runs optional workload warmup in an isolated process group and output directory;
 - rejects warmup failures, guest-enforced timeouts, leaked processes, or an exited scheduler;
 - waits for the post-warmup settle interval;
@@ -253,6 +270,21 @@ Snapshots currently include:
 dmesg
 /sys/kernel/debug/sched_ext/*
 ```
+
+### `bench/integrations/`
+
+Owns adapters for external domain systems. An adapter may interpret private
+states and policy, but it must return only Outcome V2 to Bench Core. The
+tuning-agent adapter also owns support-process cleanup and cgroup handoff
+verification.
+
+### `bench/scenarios/`
+
+Owns self-contained experiment assets that are not generic framework code.
+The cgroup CPU scenario contains its fixture, held-out workload, MCP server,
+mock LLM, matrix runner, and scenario-specific config references. Scenario
+workloads use benchmark staging; training and adapter dependencies use
+treatment staging.
 
 ### `bench/benchmarks/generic.py`
 
@@ -430,26 +462,34 @@ Optional treatment `host_support_files` are copied into
 staging inputs only; the guest plan contains neither their host paths nor any
 authority to fetch additional files.
 
+Benchmark `host_support_files` are owned and staged independently under
+`/tmp/scx-bench-workload.d/`. Warmup and measurement may consume these files
+without depending on whether a treatment exists or which treatment ran.
+
 Every configured treatment must atomically write a versioned `outcome.json` to
-the path supplied in `SCX_BENCH_TREATMENT_OUTCOME`. The accepted outcomes are:
+the path supplied in `SCX_BENCH_TREATMENT_OUTCOME`. Outcome V2 contains a
+`disposition`, a structured `reason`, and opaque `details`. Core interprets only:
 
 ```text
-ready              -> continue
-no_commit          -> continue only when allow_no_commit=true
-recovery_required  -> always stop before warmup/measurement
+proceed -> verified state; continue into settle/warmup/measurement
+stop    -> verified safe state; intentionally stop without measurement
+unsafe  -> unsafe or unverifiable state; hard-block measurement
 ```
 
-The outcome is operational evidence from the trusted treatment harness, not a
-replacement for the tuning Runtime's commit authority. Missing, oversized,
-malformed, or unknown outcomes fail closed. Treatment timeout, non-zero exit,
-or leaked process-group members are handled with the same cleanup discipline as
-warmup and measurement.
+`reason.code`, `reason.message`, and `details` are evidence for humans and
+domain tooling; Core never branches on them. Missing, oversized, malformed, or
+unknown outcomes produce `TREATMENT_FAILED`. Treatment timeout produces
+`TREATMENT_TIMEOUT`; `stop` produces `TREATMENT_STOPPED`; and `unsafe` produces
+`TREATMENT_UNSAFE_STATE`. A non-zero exit or leaked process-group member
+overrides even a previously written `proceed` outcome.
 
-The tuning-agent harness uses `activate --wait --json` as the synchronization
-point with the daemon. The daemon returns `committed`, `no_commit`,
-`recovery_required`, `rejected`, or `error`; the harness maps only the first
-three to treatment outcomes. Rejected activation or protocol errors fail the
-treatment before benchmark warmup.
+The tuning-agent adapter under `bench/integrations/tuning_agent/` owns the
+domain workflow. It uses `activate --wait --json` as the synchronization point,
+stops all support processes, verifies the cgroup handoff, then maps private
+states into Outcome V2. A verified `committed` state maps to `proceed`; verified
+`no_commit` maps to `proceed` or `stop` according to adapter policy; unverified
+state and `recovery_required` map to `unsafe`. Rejected activation and protocol
+errors fail before an outcome is admitted.
 
 ## Result Model
 
@@ -468,7 +508,7 @@ runs/<variant>/run_.../
 `guest_result.json` uses its top-level `status` as the authoritative execution
 outcome. Scheduler, treatment, warmup, and measurement details live below
 `phases`; valid failure statuses distinguish scheduler failure, treatment
-failure/timeout/no-commit/recovery-required, warmup failure/timeout, measurement
+failure/timeout/stopped/unsafe-state, warmup failure/timeout, measurement
 failure/timeout, and internal executor errors.
 
 Machine-readable comparison data:
@@ -567,9 +607,10 @@ Add new scheduler:
 Add new treatment:
 
 1. implement a bounded guest command that owns and cleans up every child it starts;
-2. write a strict V1 outcome to `SCX_BENCH_TREATMENT_OUTCOME`;
-3. add a `treatments:` entry with timeout, settle, environment, and no-commit policy;
-4. select it with `--baseline-treatment` or `--candidate-treatment`.
+2. verify the final system state and write a strict Outcome V2;
+3. keep private domain states and policy inside an integration adapter;
+4. add a `treatments:` entry with timeout, settle, and environment;
+5. select it with `--baseline-treatment` or `--candidate-treatment`.
 
 Add new metric:
 

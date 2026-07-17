@@ -48,8 +48,8 @@ class RunnerSchedulerStagingTest(unittest.TestCase):
     def test_guest_treatment_uses_staged_command_without_mutating_input(self) -> None:
         treatment = {
             "command": "guest/tune",
-            "host_command": "bench/treatments/tune",
-            "host_support_files": ["bench/treatments/helper"],
+            "host_command": "bench/integrations/tuning_agent/adapter.py",
+            "host_support_files": ["bench/integrations/tuning_agent/mock_llm.py"],
             "args": ["--test"],
         }
 
@@ -103,6 +103,7 @@ class RunnerExecutionPlanTest(unittest.TestCase):
             machine={"memory": "1G", "vcpus": 1, "pin_cpus": "0"},
             suite={},
             bench={
+                "host_support_files": ["bench/scenarios/cgroup_cpu/workload.py"],
                 "measurement": {
                     "command": "measure",
                     "args": ["--seconds", "10"],
@@ -151,6 +152,11 @@ class RunnerExecutionPlanTest(unittest.TestCase):
         self.assertEqual(execution_plan["warmup"]["argv"], ["prime", "--seconds", "5"])
         self.assertEqual(execution_plan["warmup"]["timeout_seconds"], 7)
         self.assertEqual(execution_plan["post_warmup_settle_seconds"], 3)
+        self.assertNotIn("host_support_files", execution_plan)
+        self.assertEqual(
+            result["spec"]["bench_config"]["host_support_files"],
+            ["bench/scenarios/cgroup_cpu/workload.py"],
+        )
         written_plan = write_guest.call_args.args[1]
         self.assertEqual(written_plan.to_dict(), execution_plan)
         self.assertEqual(
@@ -172,16 +178,15 @@ class RunnerExecutionPlanTest(unittest.TestCase):
             43,
         )
 
-    def test_dry_run_carries_treatment_identity_policy_and_timeout(self) -> None:
+    def test_dry_run_carries_treatment_identity_and_timeout(self) -> None:
         treatment = {
             "command": "prepare",
-            "host_command": "bench/treatments/prepare",
-            "host_support_files": ["bench/treatments/mock_openai_llm.py"],
+            "host_command": "bench/integrations/tuning_agent/adapter.py",
+            "host_support_files": ["bench/integrations/tuning_agent/mock_llm.py"],
             "args": ["--mode", "agent"],
             "env": {"MODE": "agent"},
             "timeout_seconds": 12,
             "post_treatment_settle_seconds": 3,
-            "allow_no_commit": True,
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             result = _run_one(
@@ -211,12 +216,11 @@ class RunnerExecutionPlanTest(unittest.TestCase):
             execution_plan["treatment"]["argv"],
             ["/tmp/scx-bench-treatment", "--mode", "agent"],
         )
-        self.assertTrue(execution_plan["treatment"]["allow_no_commit"])
         self.assertEqual(execution_plan["post_treatment_settle_seconds"], 3)
         self.assertEqual(result["spec"]["treatment_name"], "agent")
         self.assertEqual(
             result["spec"]["treatment_config"]["host_command"],
-            "bench/treatments/prepare",
+            "bench/integrations/tuning_agent/adapter.py",
         )
         self.assertNotIn("host_support_files", execution_plan["treatment"])
 
@@ -225,8 +229,8 @@ class RunnerExecutionPlanTest(unittest.TestCase):
             "SCHEDULER_FAILED",
             "TREATMENT_FAILED",
             "TREATMENT_TIMEOUT",
-            "TREATMENT_NO_COMMIT",
-            "TREATMENT_RECOVERY_REQUIRED",
+            "TREATMENT_STOPPED",
+            "TREATMENT_UNSAFE_STATE",
             "WARMUP_FAILED",
             "WARMUP_TIMEOUT",
             "BENCH_FAILED",

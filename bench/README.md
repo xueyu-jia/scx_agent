@@ -248,20 +248,20 @@ Treatment 在顶层独立定义，因而 baseline/candidate 可以使用同一�
 ```yaml
 treatments:
   control:
-    command: python3
-    args: [bench/treatments/control.py]
+    command: /usr/local/bin/control-treatment
+    args: []
     timeout_seconds: 600
     post_treatment_settle_seconds: 5
 
   agent_tuned:
     command: /tmp/scx-bench-treatment
-    host_command: bench/treatments/tuning_agent_harness.py
+    host_command: bench/integrations/tuning_agent/adapter.py
     host_support_files:
-      - bench/treatments/mock_openai_llm.py
-      - bench/treatments/deterministic_tuning_mcp.py
+      - bench/integrations/tuning_agent/mock_llm.py
+      - bench/integrations/tuning_agent/deterministic_mcp.py
+    args: [--no-commit-disposition, proceed]
     timeout_seconds: 900
     post_treatment_settle_seconds: 5
-    allow_no_commit: false
     env:
       MODE: tune
 ```
@@ -291,8 +291,12 @@ Treatment 还会收到 `SCX_BENCH_TREATMENT_OUTCOME`。命令退出前必须在�
 
 ```json
 {
-  "version": 1,
-  "status": "ready",
+  "version": 2,
+  "disposition": "proceed",
+  "reason": {
+    "code": "tuning_agent.committed",
+    "message": "candidate committed and state verified"
+  },
   "details": {
     "episode_id": 123,
     "verdict": "improved",
@@ -301,55 +305,82 @@ Treatment 还会收到 `SCX_BENCH_TREATMENT_OUTCOME`。命令退出前必须在�
 }
 ```
 
-`version`、`status`、`details` 三个字段都必须存在，`details` 可以是空对象；
-未知字段会被拒绝。
+`version`、`disposition`、`reason`、`details` 都必须存在。`reason` 必须只包含
+非空的 `code` 和 `message`，`details` 可以是空对象；未知字段会被拒绝。
+Bench Core 只解释 `disposition`，不会根据 `reason.code` 或 `details` 分支：
 
-`status` 只能是：
+- `proceed`：treatment 已验证可测量状态，进入 post-treatment settle、warmup 和
+  measurement；phase status 记录为 `PROCEEDED`。
+- `stop`：系统状态安全，但本次 run 按 treatment 策略不应测量；run status 为
+  `TREATMENT_STOPPED`，phase status 为 `STOPPED`。
+- `unsafe`：系统状态不安全或无法验证，必须阻断测量；run status 为
+  `TREATMENT_UNSAFE_STATE`，phase status 为 `UNSAFE`。
 
-- `ready`：目标状态已经建立并经过 treatment 自身验证，可以继续。
-- `no_commit`：Agent 已安全结束但没有 commit。默认阻断后续阶段；只有该
-  treatment 显式设置 `allow_no_commit: true` 时才继续，用于 intention-to-treat
-  实验。
-- `recovery_required`：无法证明系统处于 baseline 或 committed candidate，始终
-  阻断 warmup 和 measurement。
+`stop` 和 `unsafe` 都以 125 结束 guest executor，并跳过后续阶段，但语义不同：
+前者是有意的安全停止，后者表示无法证明测量安全。命令非零退出、缺少或损坏
+outcome、或残留进程产生 `TREATMENT_FAILED`；超时产生 `TREATMENT_TIMEOUT`。
+即使命令已经写出 `proceed`，非零退出或残留进程仍优先判为失败。
 
-成功退出但缺少/损坏 outcome、超时、非零退出或残留进程都会使 treatment
-失败。Treatment 自己启动的训练负载、agent daemon 和 MCP 子进程必须在命令
-返回前全部停止并等待退出。
+Treatment 自己启动的训练负载、agent daemon 和 MCP 子进程必须在写 outcome
+之前全部停止并等待退出。
 
-### tuning-agent treatment harness
+### tuning-agent adapter
 
-仓库提供 `bench/treatments/tuning_agent_harness.py`，用于 Cgroup-scoped 测试
-tuning-agent。它会：
+仓库提供 `bench/integrations/tuning_agent/adapter.py`，负责 Cgroup-scoped
+tuning-agent 领域流程和私有状态到通用 outcome 的转换。它会：
 
 - 创建临时 cgroup，并把可选训练负载放入该 cgroup；
 - 启动 mock/真实 LLM 代理等 support process；
 - 启动 tuning-agent daemon；
 - 执行 `tuning-agent activate --wait --json ... <cgroup_path>`；
-- 将 `committed` 映射为 `ready`，将 `no_commit` 映射为 `no_commit`，将
-  `recovery_required` 映射为 `recovery_required`。
+- 停止并等待全部辅助进程，验证保留的 cgroup 与 CPU 状态；
+- 原子写入 Outcome V2。
 
-确定性测试可以使用随仓库提供的 `mock_openai_llm.py` 和
-`deterministic_tuning_mcp.py`。场景由 `SCX_DETERMINISTIC_SCENARIO` 控制：
+私有状态映射如下：
+
+```text
+committed + state verified                 -> proceed
+no_commit + baseline verified + ITT policy -> proceed
+no_commit + baseline verified + strict     -> stop
+no_commit + baseline unverified             -> unsafe
+recovery_required                           -> unsafe
+```
+
+`--no-commit-disposition proceed|stop` 是 adapter 的领域策略；
+`recovery_required -> unsafe` 不可配置。激活响应、验证证据和私有状态保存在
+`details` 中供审计，Bench Core 不解释这些内容。
+
+确定性测试可以使用 `bench/integrations/tuning_agent/mock_llm.py` 和
+`bench/integrations/tuning_agent/deterministic_mcp.py`。场景由
+`SCX_DETERMINISTIC_SCENARIO` 控制：
 `positive` 应 commit，`no_signal` 和 `unsafe` 应 rollback 为 no_commit，
 `recovery` 应阻断正式 warmup/measurement。
 
 真实 workload MCP 接入时，保持同一边界：Agent 内部训练负载和 A/B evaluate
 只用于决定是否 commit；bench 的正式 warmup/measurement 是 held-out 外部测量。
-推荐先用同一个 scheduler 比较 `control` treatment 与 `agent_tuned` treatment，
-再运行真实 LLM 的 paired benchmark：
+benchmark 自有的 `host_support_files` 会独立复制到
+`/tmp/scx-bench-workload.d/`，不能依赖 treatment staging：
 
-```bash
-python3 -m bench.scripts.run \
-  --config bench/configs/local.config \
-  --plan smoke \
-  --baseline default --baseline-treatment control \
-  --candidate default --candidate-treatment agent_tuned \
-  --parallel 1
+```yaml
+benches:
+  cgroup_cpu_share:
+    host_support_files:
+      - bench/scenarios/cgroup_cpu/workload.py
+      - bench/scenarios/cgroup_cpu/common.py
+    measurement:
+      command: python3
+      args: [/tmp/scx-bench-workload.d/workload.py]
+      timeout_seconds: 30
 ```
 
-综合效果实验通常设置 `allow_no_commit: true`，这样 no-commit episode 仍计入
-candidate 组；`recovery_required` 无论如何都会阻断正式测量。
+完整的 cgroup CPU 场景位于 `bench/configs/cgroup_cpu_tuning.config`，本地配置
+完成初始化后可运行 paired matrix：
+
+```bash
+python3 -m bench.scenarios.cgroup_cpu.matrix \
+  --config bench/configs/local.config \
+  --plan cgroup_cpu_smoke
+```
 
 VM 与调度器准备阶段使用独立的 settle 时间；workload warmup 必须显式配置
 命令。warmup 成功后等待 `post_warmup_settle_seconds`，再采集 before

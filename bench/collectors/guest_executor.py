@@ -17,7 +17,7 @@ from typing import Any
 
 
 PLAN_VERSION = 2
-TREATMENT_OUTCOME_VERSION = 1
+TREATMENT_OUTCOME_VERSION = 2
 MAX_TREATMENT_OUTCOME_BYTES = 64 * 1024
 PLAN_KEYS = {
     "version",
@@ -37,9 +37,10 @@ PLAN_KEYS = {
 COMMAND_KEYS = {"argv", "timeout_seconds"}
 RUN_CONTEXT_KEYS = {"role", "variant", "treatment"}
 RUN_ROLES = {"baseline", "candidate", "standalone"}
-TREATMENT_KEYS = {"argv", "env", "timeout_seconds", "allow_no_commit"}
-TREATMENT_OUTCOME_KEYS = {"version", "status", "details"}
-TREATMENT_OUTCOMES = {"ready", "no_commit", "recovery_required"}
+TREATMENT_KEYS = {"argv", "env", "timeout_seconds"}
+TREATMENT_OUTCOME_KEYS = {"version", "disposition", "reason", "details"}
+TREATMENT_REASON_KEYS = {"code", "message"}
+TREATMENT_DISPOSITIONS = {"proceed", "stop", "unsafe"}
 SCHEDULER_KEYS = {
     "argv",
     "env",
@@ -57,8 +58,8 @@ PASS = "PASS"
 SCHEDULER_FAILED = "SCHEDULER_FAILED"
 TREATMENT_FAILED = "TREATMENT_FAILED"
 TREATMENT_TIMEOUT = "TREATMENT_TIMEOUT"
-TREATMENT_NO_COMMIT = "TREATMENT_NO_COMMIT"
-TREATMENT_RECOVERY_REQUIRED = "TREATMENT_RECOVERY_REQUIRED"
+TREATMENT_STOPPED = "TREATMENT_STOPPED"
+TREATMENT_UNSAFE_STATE = "TREATMENT_UNSAFE_STATE"
 WARMUP_FAILED = "WARMUP_FAILED"
 WARMUP_TIMEOUT = "WARMUP_TIMEOUT"
 BENCH_FAILED = "BENCH_FAILED"
@@ -132,7 +133,6 @@ class Treatment:
     argv: tuple[str, ...]
     env: dict[str, str]
     timeout_seconds: int
-    allow_no_commit: bool
 
     @classmethod
     def from_value(cls, value: Any) -> "Treatment":
@@ -140,9 +140,6 @@ class Treatment:
         _validate_keys(mapping, TREATMENT_KEYS, "treatment")
         env = _environment(mapping.get("env", {}), "treatment.env")
         _reject_reserved_environment(env, "treatment.env")
-        allow_no_commit = mapping.get("allow_no_commit")
-        if not isinstance(allow_no_commit, bool):
-            raise PlanError("treatment.allow_no_commit must be a boolean")
         return cls(
             argv=_argv(mapping.get("argv"), "treatment.argv"),
             env=env,
@@ -150,7 +147,6 @@ class Treatment:
                 mapping.get("timeout_seconds"),
                 "treatment.timeout_seconds",
             ),
-            allow_no_commit=allow_no_commit,
         )
 
     def command(self) -> Command:
@@ -159,7 +155,8 @@ class Treatment:
 
 @dataclass(frozen=True)
 class TreatmentOutcome:
-    status: str
+    disposition: str
+    reason: dict[str, str]
     details: dict[str, Any]
 
     @classmethod
@@ -186,21 +183,38 @@ class TreatmentOutcome:
                 "treatment outcome.version must be "
                 f"{TREATMENT_OUTCOME_VERSION}, got {version!r}"
             )
-        status = _text(mapping.get("status"), "treatment outcome.status")
-        if status not in TREATMENT_OUTCOMES:
+        disposition = _text(
+            mapping.get("disposition"),
+            "treatment outcome.disposition",
+        )
+        if disposition not in TREATMENT_DISPOSITIONS:
             raise PlanError(
-                "treatment outcome.status must be one of "
-                f"{sorted(TREATMENT_OUTCOMES)}, got {status!r}"
+                "treatment outcome.disposition must be one of "
+                f"{sorted(TREATMENT_DISPOSITIONS)}, got {disposition!r}"
             )
-        details = mapping.get("details", {})
+        reason = _mapping(mapping.get("reason"), "treatment outcome.reason")
+        _validate_keys(reason, TREATMENT_REASON_KEYS, "treatment outcome.reason")
+        normalized_reason = {
+            "code": _text(reason.get("code"), "treatment outcome.reason.code"),
+            "message": _text(
+                reason.get("message"),
+                "treatment outcome.reason.message",
+            ),
+        }
+        details = mapping.get("details")
         if not isinstance(details, dict):
             raise PlanError("treatment outcome.details must be a mapping")
-        return cls(status=status, details=details)
+        return cls(
+            disposition=disposition,
+            reason=normalized_reason,
+            details=details,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": TREATMENT_OUTCOME_VERSION,
-            "status": self.status,
+            "disposition": self.disposition,
+            "reason": dict(self.reason),
             "details": self.details,
         }
 
@@ -491,26 +505,23 @@ class GuestExecutor:
                 f"treatment outcome is invalid: {exc}",
             ) from exc
 
-        if self.treatment_outcome.status == "recovery_required":
-            self.treatment_result.status = "RECOVERY_REQUIRED"
-            self.treatment_result.error = (
-                "treatment reported that system state requires recovery"
-            )
+        disposition = self.treatment_outcome.disposition
+        if disposition == "unsafe":
+            self.treatment_result.status = "UNSAFE"
+            self.treatment_result.error = self.treatment_outcome.reason["message"]
             raise ExecutionFailure(
-                TREATMENT_RECOVERY_REQUIRED,
+                TREATMENT_UNSAFE_STATE,
                 self.treatment_result.error,
             )
-        if (
-            self.treatment_outcome.status == "no_commit"
-            and not treatment.allow_no_commit
-        ):
-            self.treatment_result.status = "NO_COMMIT"
-            self.treatment_result.error = "treatment completed without a commit"
+        if disposition == "stop":
+            self.treatment_result.status = "STOPPED"
+            self.treatment_result.error = self.treatment_outcome.reason["message"]
             raise ExecutionFailure(
-                TREATMENT_NO_COMMIT,
+                TREATMENT_STOPPED,
                 self.treatment_result.error,
             )
 
+        self.treatment_result.status = "PROCEEDED"
         self._sleep(self.plan.post_treatment_settle_seconds)
         self._check_scheduler("post-treatment settle")
 

@@ -50,17 +50,15 @@ def treatment(
     source: str,
     *,
     timeout_seconds: int = 5,
-    allow_no_commit: bool = False,
 ) -> Treatment:
     return Treatment(
         argv=(sys.executable, "-c", source),
         env={"TREATMENT_ENV": "present"},
         timeout_seconds=timeout_seconds,
-        allow_no_commit=allow_no_commit,
     )
 
 
-def outcome_source(status: str, extra_source: str = "") -> str:
+def outcome_source(disposition: str, extra_source: str = "") -> str:
     return f"""
 import json
 import os
@@ -71,8 +69,9 @@ assert os.environ["SCX_BENCH_TREATMENT"] == "test-treatment"
 assert os.environ["TREATMENT_ENV"] == "present"
 outcome = Path(os.environ["SCX_BENCH_TREATMENT_OUTCOME"])
 outcome.write_text(json.dumps({{
-    "version": 1,
-    "status": {status!r},
+    "version": 2,
+    "disposition": {disposition!r},
+    "reason": {{"code": "test.outcome", "message": "test treatment outcome"}},
     "details": {{"source": "test"}},
 }}))
 {extra_source}
@@ -120,7 +119,6 @@ class GuestPlanTest(unittest.TestCase):
                     "env": {"MODE": "tune"},
                     "timeout_seconds": 11,
                     "post_treatment_settle_seconds": 2,
-                    "allow_no_commit": False,
                 },
             )
             path = root / "guest_plan.json"
@@ -226,7 +224,7 @@ class GuestExecutorTest(unittest.TestCase):
 
     def test_treatment_precedes_warmup_and_has_isolated_artifacts(self) -> None:
         treatment_source = outcome_source(
-            "ready",
+            "proceed",
             '(Path(os.environ["SCX_BENCH_OUT"]) / "state").write_text("ready")',
         )
         warmup_source = """
@@ -262,25 +260,25 @@ assert "SCX_BENCH_ROLE" not in os.environ
 
             self.assertEqual(returncode, 0)
             self.assertEqual(result["status"], "PASS")
-            self.assertEqual(result["phases"]["treatment"]["status"], "PASS")
+            self.assertEqual(result["phases"]["treatment"]["status"], "PROCEEDED")
             self.assertEqual(
-                result["phases"]["treatment"]["outcome"]["status"],
-                "ready",
+                result["phases"]["treatment"]["outcome"]["disposition"],
+                "proceed",
             )
             self.assertEqual(result["phases"]["warmup"]["status"], "PASS")
             self.assertEqual(result["phases"]["measurement"]["status"], "PASS")
 
-    def test_no_commit_policy_controls_measurement_admission(self) -> None:
+    def test_treatment_disposition_controls_measurement_admission(self) -> None:
         measurement = python_command(
             'from pathlib import Path; import os; '
             'Path(os.environ["SCX_BENCH_OUT"], "measurement").write_text("ran")'
         )
-        for allow_no_commit, expected_status, expected_returncode, measured in (
-            (False, "TREATMENT_NO_COMMIT", 125, False),
-            (True, "PASS", 0, True),
+        for disposition, expected_status, phase_status, expected_returncode, measured in (
+            ("stop", "TREATMENT_STOPPED", "STOPPED", 125, False),
+            ("proceed", "PASS", "PROCEEDED", 0, True),
         ):
             with (
-                self.subTest(allow_no_commit=allow_no_commit),
+                self.subTest(disposition=disposition),
                 tempfile.TemporaryDirectory() as temp_dir,
             ):
                 root = Path(temp_dir)
@@ -289,8 +287,7 @@ assert "SCX_BENCH_ROLE" not in os.environ
                         root,
                         measurement,
                         treatment_plan=treatment(
-                            outcome_source("no_commit"),
-                            allow_no_commit=allow_no_commit,
+                            outcome_source(disposition),
                         ),
                     )
                 )
@@ -298,15 +295,16 @@ assert "SCX_BENCH_ROLE" not in os.environ
                 self.assertEqual(returncode, expected_returncode)
                 self.assertEqual(result["status"], expected_status)
                 self.assertEqual(
-                    result["phases"]["treatment"]["outcome"]["status"],
-                    "no_commit",
+                    result["phases"]["treatment"]["outcome"]["disposition"],
+                    disposition,
                 )
+                self.assertEqual(result["phases"]["treatment"]["status"], phase_status)
                 self.assertEqual(
                     (root / "output" / "measurement").exists(),
                     measured,
                 )
 
-    def test_recovery_required_always_blocks_later_phases(self) -> None:
+    def test_unsafe_treatment_always_blocks_later_phases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             returncode, result = self._run(
@@ -314,17 +312,16 @@ assert "SCX_BENCH_ROLE" not in os.environ
                     root,
                     python_command("raise AssertionError('must not run')"),
                     treatment_plan=treatment(
-                        outcome_source("recovery_required"),
-                        allow_no_commit=True,
+                        outcome_source("unsafe"),
                     ),
                 )
             )
 
             self.assertEqual(returncode, 125)
-            self.assertEqual(result["status"], "TREATMENT_RECOVERY_REQUIRED")
+            self.assertEqual(result["status"], "TREATMENT_UNSAFE_STATE")
             self.assertEqual(
                 result["phases"]["treatment"]["status"],
-                "RECOVERY_REQUIRED",
+                "UNSAFE",
             )
             self.assertEqual(result["phases"]["warmup"]["status"], "SKIPPED")
             self.assertEqual(result["phases"]["measurement"]["status"], "SKIPPED")

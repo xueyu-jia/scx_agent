@@ -52,7 +52,6 @@ class TreatmentPlan:
     argv: tuple[str, ...]
     env: dict[str, str]
     timeout_seconds: int
-    allow_no_commit: bool
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "TreatmentPlan":
@@ -60,7 +59,6 @@ class TreatmentPlan:
             argv=(config["command"], *config.get("args", [])),
             env=dict(config.get("env", {})),
             timeout_seconds=int(config["timeout_seconds"]),
-            allow_no_commit=bool(config.get("allow_no_commit", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -68,7 +66,6 @@ class TreatmentPlan:
             "argv": list(self.argv),
             "env": dict(self.env),
             "timeout_seconds": self.timeout_seconds,
-            "allow_no_commit": self.allow_no_commit,
         }
 
 

@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+
+import yaml
 
 from bench.config.parser import (
     ConfigError,
     _bench_with_defaults,
     _validate_bench_defaults,
     _validate_benches,
+    _validate_metric_profiles,
+    _validate_plans,
     _validate_schedulers,
+    _validate_suites,
     _validate_treatments,
     expand_plan,
 )
+from bench.scripts.prepare_env import _patch_kernel_build_source
 
 
 def command(argv: list[str] | None = None, timeout_seconds: int = 30) -> dict[str, object]:
@@ -34,6 +41,7 @@ class BenchCommandValidationTest(unittest.TestCase):
                 "post_warmup_settle_seconds": 2,
                 "cooldown_seconds": 1,
                 "env": {"MODE": "test"},
+                "host_support_files": ["bench/scenarios/example.py"],
             }
         )
 
@@ -111,19 +119,38 @@ class BenchCommandValidationTest(unittest.TestCase):
                 }
             )
 
+    def test_local_config_patches_kernel_source_inside_measurement(self) -> None:
+        config = {
+            "benches": {
+                "kernel_build_bzimage": {
+                    "measurement": {
+                        "args": ["wrapper.py", "--source", None, "--target", "bzImage"]
+                    }
+                }
+            }
+        }
+
+        _patch_kernel_build_source(config, Path("/kernel/source"))
+
+        self.assertEqual(
+            config["benches"]["kernel_build_bzimage"]["measurement"]["args"][2],
+            "/kernel/source",
+        )
+
 
 class TreatmentConfigTest(unittest.TestCase):
-    def test_treatment_command_policy_and_environment_are_valid(self) -> None:
+    def test_treatment_command_support_files_and_environment_are_valid(self) -> None:
         _validate_treatments(
             {
                 "treatments": {
                     "agent_tuned": {
                         **command(["python3", "tune.py"], 600),
-                        "host_command": "bench/treatments/tune.py",
-                        "host_support_files": ["bench/treatments/mock_openai_llm.py"],
+                        "host_command": "bench/integrations/tuning_agent/adapter.py",
+                        "host_support_files": [
+                            "bench/integrations/tuning_agent/mock_llm.py"
+                        ],
                         "env": {"MODE": "tune"},
                         "post_treatment_settle_seconds": 5,
-                        "allow_no_commit": True,
                     }
                 }
             }
@@ -144,19 +171,7 @@ class TreatmentConfigTest(unittest.TestCase):
                 }
             )
 
-    def test_treatment_rejects_invalid_policy_and_reserved_environment(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "allow_no_commit must be a boolean"):
-            _validate_treatments(
-                {
-                    "treatments": {
-                        "agent_tuned": {
-                            **command(),
-                            "allow_no_commit": "yes",
-                        }
-                    }
-                }
-            )
-
+    def test_treatment_rejects_reserved_environment_and_invalid_support_files(self) -> None:
         with self.assertRaisesRegex(ConfigError, "SCX_BENCH_ROLE"):
             _validate_treatments(
                 {
@@ -181,6 +196,29 @@ class TreatmentConfigTest(unittest.TestCase):
                 }
             )
 
+    def test_example_cgroup_cpu_matrix_is_internally_consistent(self) -> None:
+        config = yaml.safe_load(
+            Path("bench/configs/cgroup_cpu_tuning.config").read_text(encoding="utf-8")
+        )
+
+        _validate_treatments(config)
+        _validate_benches(
+            {"benches": {"cgroup_cpu_share": config["benches"]["cgroup_cpu_share"]}}
+        )
+        _validate_metric_profiles(config)
+        _validate_suites(config)
+        _validate_plans(config)
+
+        self.assertEqual(config["plans"]["cgroup_cpu_smoke"]["runs"], 1)
+        self.assertEqual(config["plans"]["cgroup_cpu"]["runs"], 10)
+        self.assertNotIn(
+            "--no-commit-disposition",
+            config["treatments"]["cgroup_cpu_agent_positive"].get("args", []),
+        )
+        self.assertEqual(
+            config["treatments"]["cgroup_cpu_agent_no_signal"]["args"],
+            ["--no-commit-disposition", "proceed"],
+        )
 
 class BenchTimingTest(unittest.TestCase):
     def test_defaults_are_merged_and_bench_values_override_them(self) -> None:

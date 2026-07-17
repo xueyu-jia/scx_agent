@@ -38,6 +38,7 @@ VALID_BENCH_DEFAULT_KEYS = {"post_warmup_settle_seconds", "cooldown_seconds"}
 VALID_BENCH_KEYS = {
     "measurement",
     "warmup",
+    "host_support_files",
     "post_warmup_settle_seconds",
     "cooldown_seconds",
     "env",
@@ -49,7 +50,6 @@ VALID_TREATMENT_KEYS = {
     "host_support_files",
     "env",
     "post_treatment_settle_seconds",
-    "allow_no_commit",
 }
 RESERVED_GUEST_ENV = {
     "SCX_BENCH_OUT",
@@ -381,10 +381,6 @@ def _validate_treatments(config: dict[str, Any]) -> None:
             ("post_treatment_settle_seconds",),
         )
 
-        allow_no_commit = treatment.get("allow_no_commit", False)
-        if not isinstance(allow_no_commit, bool):
-            raise ConfigError(f"{prefix}.allow_no_commit must be a boolean")
-
         env = treatment.get("env", {})
         if not isinstance(env, dict):
             raise ConfigError(f"{prefix}.env must be a mapping")
@@ -584,6 +580,12 @@ def _validate_benches(config: dict[str, Any]) -> None:
         _validate_command(bench["measurement"], f"{prefix}.measurement")
         if "warmup" in bench:
             _validate_command(bench["warmup"], f"{prefix}.warmup")
+
+        host_support_files = bench.get("host_support_files", [])
+        if not isinstance(host_support_files, list) or any(
+            not isinstance(item, str) or not item for item in host_support_files
+        ):
+            raise ConfigError(f"{prefix}.host_support_files must be a string list")
 
         _validate_non_negative_seconds(
             bench,

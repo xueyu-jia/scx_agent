@@ -395,7 +395,8 @@ def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> Non
     bench = data.get("benches", {}).get("kernel_build_bzimage")
     if not isinstance(bench, dict):
         return
-    args = bench.get("args")
+    measurement = bench.get("measurement")
+    args = measurement.get("args") if isinstance(measurement, dict) else bench.get("args")
     if not isinstance(args, list):
         return
     for index, value in enumerate(args[:-1]):
