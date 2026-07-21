@@ -33,11 +33,11 @@ from bench.base_image import (
     serialize_base_image_manifest,
     verify_base_image_manifest,
 )
-from bench.config.parser import ConfigError, load_config, parse_cpu_list
+from bench.config.parser import CONFIG_PARTS, ConfigError, load_config, load_config_data, parse_cpu_list
 
 
-DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local.config"
-TEMPLATE_CONFIG = REPO_ROOT / "bench" / "configs" / "example.config"
+DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local_config"
+TEMPLATE_CONFIG = REPO_ROOT / "bench" / "configs" / "example_config"
 DEFAULT_ROOT_IMAGE = Path("/var/lib/libvirt/images/scx-bench-base.qcow2")
 DEFAULT_CLOUD_IMAGE = Path("/var/lib/libvirt/images/scx-bench-cloudimg.qcow2")
 DEFAULT_SEED_IMAGE = Path("/var/lib/libvirt/images/scx-bench-seed.iso")
@@ -350,9 +350,10 @@ def _build_local_config(
     emulator_cpus: str,
     isolated_cpus: str,
 ) -> dict[str, Any]:
-    data = yaml.safe_load(template_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise RuntimeError(f"template config is invalid: {template_path}")
+    try:
+        data = load_config_data(template_path)
+    except ConfigError as exc:
+        raise RuntimeError(f"template config is invalid: {exc}") from exc
 
     data["libvirt"] = {
         **data.get("libvirt", {}),
@@ -395,7 +396,11 @@ def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> Non
     bench = data.get("benches", {}).get("kernel_build_bzimage")
     if not isinstance(bench, dict):
         return
-    args = bench.get("args")
+    measurement = bench.get("measurement")
+    if isinstance(measurement, dict):
+        args = measurement.get("args")
+    else:
+        args = bench.get("args")
     if not isinstance(args, list):
         return
     for index, value in enumerate(args[:-1]):
@@ -405,15 +410,83 @@ def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> Non
 
 
 def _write_config(path: Path, data: dict[str, Any], force: bool, dry_run: bool) -> None:
-    if path.exists() and not force:
-        raise RuntimeError(f"config already exists: {path}; use --force to overwrite")
-    text = yaml.safe_dump(data, sort_keys=False)
+    _write_split_config(path, data, force=force, dry_run=dry_run)
+
+
+def _write_split_config(path: Path, data: dict[str, Any], force: bool, dry_run: bool) -> None:
+    if path.exists() and not path.is_dir():
+        raise RuntimeError(f"config path exists and is not a directory: {path}")
+
+    parts = {
+        "environment.config": _select_keys(data, ("libvirt", "executor", "machines")),
+        "benches.config": _select_keys(data, ("bench_defaults", "metric_profiles", "benches")),
+        "plan.config": _select_keys(data, ("schedulers", "plans", "suites")),
+    }
+    for name in CONFIG_PARTS:
+        part_path = path / name
+        if part_path.exists() and not force:
+            raise RuntimeError(f"config already exists: {part_path}; use --force to overwrite")
+
     if dry_run:
-        print(f"would write config: {path}")
-        print(text)
+        print(f"would write config directory: {path}")
+        for name in CONFIG_PARTS:
+            print(f"--- {path / name}")
+            print(_dump_config_part(parts[name]), end="")
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+
+    path.mkdir(parents=True, exist_ok=True)
+    for name in CONFIG_PARTS:
+        (path / name).write_text(
+            _dump_config_part(parts[name]),
+            encoding="utf-8",
+        )
+
+
+def _dump_config_part(data: dict[str, Any]) -> str:
+    text = yaml.safe_dump(data, sort_keys=False)
+    return _add_config_spacing(text)
+
+
+def _add_config_spacing(text: str) -> str:
+    spaced_sections = {
+        "schedulers",
+        "plans",
+        "machines",
+        "suites",
+        "metric_profiles",
+        "benches",
+    }
+    lines = text.splitlines()
+    output: list[str] = []
+    current_section: str | None = None
+    seen_section_items: set[str] = set()
+
+    for line in lines:
+        if line and not line.startswith(" "):
+            if output and output[-1] != "":
+                output.append("")
+            current_section = line.split(":", 1)[0]
+            output.append(line)
+            continue
+
+        if (
+            current_section in spaced_sections
+            and line.startswith("  ")
+            and not line.startswith("    ")
+            and line.endswith(":")
+            and line.strip() != "-"
+        ):
+            if current_section in seen_section_items and output and output[-1] != "":
+                output.append("")
+            seen_section_items.add(current_section)
+
+        output.append(line)
+
+    return "\n".join(output) + "\n"
+
+
+def _select_keys(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: data[key] for key in keys if key in data}
 
 
 def _fetch_workloads(config_path: Path, workloads: list[str], dry_run: bool) -> None:

@@ -19,6 +19,11 @@ REQUIRED_TOP_LEVEL_KEYS = (
     "metric_profiles",
     "benches",
 )
+CONFIG_PARTS = (
+    "environment.config",
+    "benches.config",
+    "plan.config",
+)
 
 VALID_DIRECTIONS = {"higher", "lower"}
 VALID_CHARTS = {"delta_bar", "latency_bar", "summary_table"}
@@ -100,15 +105,45 @@ class RunSpec:
 
 def load_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
-    with config_path.open("r", encoding="utf-8") as f:
+    data = load_config_data(config_path)
+    validate_config(data)
+    return data
+
+
+def load_config_data(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.is_dir():
+        raise ConfigError(f"config path must be a directory: {config_path}")
+    return _load_config_dir(config_path)
+
+
+def _load_config_dir(path: Path) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    owners: dict[str, Path] = {}
+    for name in CONFIG_PARTS:
+        part_path = path / name
+        if not part_path.is_file():
+            raise ConfigError(f"missing config part: {part_path}")
+        part = _load_config_file(part_path)
+        for key, value in part.items():
+            if key in merged:
+                raise ConfigError(
+                    f"duplicate top-level key {key!r} in {part_path}; "
+                    f"already defined in {owners[key]}"
+                )
+            merged[key] = value
+            owners[key] = part_path
+    return merged
+
+
+def _load_config_file(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     if data is None:
-        raise ConfigError(f"{config_path} is empty")
+        raise ConfigError(f"{path} is empty")
     if not isinstance(data, dict):
-        raise ConfigError(f"{config_path} must contain a mapping at the top level")
-
-    validate_config(data)
+        raise ConfigError(f"{path} must contain a mapping at the top level")
     return data
 
 

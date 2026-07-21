@@ -36,7 +36,7 @@ BOOT_ARG_KEYS = {
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare or restore host isolation for scx bench")
     parser.add_argument("action", choices=("prepare", "restore", "status", "apply-runtime"))
-    parser.add_argument("--config", default="bench/configs/local.config")
+    parser.add_argument("--config", default="bench/configs/local_config")
     parser.add_argument("--plan", help="only use machines referenced by this plan")
     parser.add_argument("--state", default=str(STATE_PATH))
     parser.add_argument("--grub", default=str(GRUB_PATH))
