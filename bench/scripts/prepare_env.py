@@ -57,6 +57,14 @@ DEFAULT_PACKAGES = (
     "libseccomp2",
     "libstdc++6",
     "zlib1g",
+    "make",
+    "gcc",
+    "binutils",
+    "flex",
+    "bison",
+    "bc",
+    "libssl-dev",
+    "libelf-dev",
 )
 REQUIRED_COMMANDS = {
     "cloud-localds": "cloud-image-utils",
@@ -393,20 +401,19 @@ def _build_local_config(
 
 
 def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> None:
-    bench = data.get("benches", {}).get("kernel_build_bzimage")
-    if not isinstance(bench, dict):
-        return
-    measurement = bench.get("measurement")
-    if isinstance(measurement, dict):
-        args = measurement.get("args")
-    else:
-        args = bench.get("args")
-    if not isinstance(args, list):
-        return
-    for index, value in enumerate(args[:-1]):
-        if value == "--source":
-            args[index + 1] = str(kernel_source)
-            return
+    for bench in data.get("benches", {}).values():
+        if not isinstance(bench, dict):
+            continue
+        measurement = bench.get("measurement")
+        if isinstance(measurement, dict):
+            args = measurement.get("args")
+        else:
+            args = bench.get("args")
+        if not isinstance(args, list):
+            continue
+        for index, value in enumerate(args[:-1]):
+            if value == "--source" and args[index + 1] is None:
+                args[index + 1] = str(kernel_source)
 
 
 def _write_config(path: Path, data: dict[str, Any], force: bool, dry_run: bool) -> None:
@@ -637,6 +644,7 @@ def _initialize_base_vm(
         libvirt,
         host,
     )
+    _sync_kernel_source_to_guest(libvirt, host)
     _ssh(libvirt, host, "sync && poweroff", check=False)
     time.sleep(5)
     _run_sudo(["virsh", "--connect", libvirt["uri"], "destroy", name], dry_run=False, check=False)
@@ -711,6 +719,26 @@ def _sync_repo_to_guest(
     )
     wrappers_after = benchmark_wrapper_snapshot(REPO_ROOT)
     return wrappers_before, wrappers_after, guest_wrappers_match
+
+
+def _sync_kernel_source_to_guest(libvirt: dict[str, Any], host: str) -> None:
+    source = Path(libvirt.get("kernel_source", ""))
+    if not source.exists():
+        return
+    remote_path = shlex.quote(str(source))
+    remote_parent = shlex.quote(str(source.parent))
+    _ssh(libvirt, host, f"mkdir -p {remote_parent}")
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
+        with tarfile.open(tmp.name, "w:gz") as archive:
+            archive.add(source, arcname=source.name)
+        _scp(libvirt, host, Path(tmp.name), "/tmp/scx-bench-kernel-source.tar.gz")
+    _ssh(
+        libvirt,
+        host,
+        f"rm -rf {remote_path} && "
+        f"tar -xzf /tmp/scx-bench-kernel-source.tar.gz -C {remote_parent} && "
+        "rm -f /tmp/scx-bench-kernel-source.tar.gz",
+    )
 
 
 def _verify_guest_wrapper_snapshot(
@@ -794,6 +822,12 @@ def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
     if ".git" in parts:
         return None
     if name == "bench/results" or name.startswith("bench/results/"):
+        return None
+    if name == ".local-tools" or name.startswith(".local-tools/"):
+        return None
+    if name == ".local-debs" or name.startswith(".local-debs/"):
+        return None
+    if name == "tuning_agent/target" or name.startswith("tuning_agent/target/"):
         return None
     if name == "bench/workloads/src" or name.startswith("bench/workloads/src/"):
         return None
