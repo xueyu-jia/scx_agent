@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 import yaml
 
 from bench.core.guest_plan import build_guest_run_plan
-from bench.core.config import RunSpec
+from bench.core.config import CONFIG_PART_KEYS, RunSpec
 from bench.core.runner import (
     GUEST_SCHEDULER_KCONFIG_PATH,
     GUEST_SCHEDULER_PATH,
@@ -513,7 +513,7 @@ class RunScriptTreatmentIntegrationTest(unittest.TestCase):
             root = Path(temp_dir)
             kernel_source = root / "linux"
             (kernel_source / "tools" / "perf").mkdir(parents=True)
-            config_path = root / "bench.yaml"
+            config_path = root / "config"
             output = root / "results"
             config = {
                 "libvirt": {
@@ -577,7 +577,13 @@ class RunScriptTreatmentIntegrationTest(unittest.TestCase):
                     }
                 },
             }
-            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            config_path.mkdir()
+            for part_name, keys in CONFIG_PART_KEYS:
+                part = {key: config[key] for key in keys if key in config}
+                (config_path / part_name).write_text(
+                    yaml.safe_dump(part, sort_keys=False),
+                    encoding="utf-8",
+                )
 
             with (
                 patch(

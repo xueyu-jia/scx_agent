@@ -19,7 +19,13 @@ try:
 except ImportError as exc:  # pragma: no cover - environment guard
     raise SystemExit("PyYAML is required: install the 'yaml' Python package") from exc
 
-from bench.core.config import ConfigError, load_config, parse_cpu_list
+from bench.core.config import (
+    CONFIG_PART_KEYS,
+    ConfigError,
+    load_config,
+    load_config_data,
+    parse_cpu_list,
+)
 from bench.env.base_image import (
     BaseImageManifestError,
     base_image_manifest_path,
@@ -34,8 +40,8 @@ from bench.env.libvirt import (
 from bench.env.workloads import prepare_workloads
 
 
-DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local.config"
-TEMPLATE_CONFIG = REPO_ROOT / "bench" / "configs" / "example.config"
+DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local_config"
+TEMPLATE_CONFIG = REPO_ROOT / "bench" / "configs" / "example_config"
 DEFAULT_ROOT_IMAGE = Path("/var/lib/libvirt/images/scx-bench-base.qcow2")
 DEFAULT_CLOUD_IMAGE = Path("/var/lib/libvirt/images/scx-bench-cloudimg.qcow2")
 DEFAULT_SEED_IMAGE = Path("/var/lib/libvirt/images/scx-bench-seed.iso")
@@ -342,9 +348,10 @@ def _build_local_config(
     emulator_cpus: str,
     isolated_cpus: str,
 ) -> dict[str, Any]:
-    data = yaml.safe_load(template_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise RuntimeError(f"template config is invalid: {template_path}")
+    try:
+        data = load_config_data(template_path)
+    except ConfigError as exc:
+        raise RuntimeError(f"template config is invalid: {exc}") from exc
 
     data["libvirt"] = {
         **data.get("libvirt", {}),
@@ -398,15 +405,37 @@ def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> Non
 
 
 def _write_config(path: Path, data: dict[str, Any], force: bool, dry_run: bool) -> None:
-    if path.exists() and not force:
-        raise RuntimeError(f"config already exists: {path}; use --force to overwrite")
-    text = yaml.safe_dump(data, sort_keys=False)
+    if path.exists() and not path.is_dir():
+        raise RuntimeError(f"config path exists and is not a directory: {path}")
+
+    owned_keys = {key for _, keys in CONFIG_PART_KEYS for key in keys}
+    unowned_keys = sorted(set(data) - owned_keys)
+    if unowned_keys:
+        raise RuntimeError(f"config contains unowned top-level key(s): {', '.join(unowned_keys)}")
+
+    parts = {
+        name: {key: data[key] for key in keys if key in data}
+        for name, keys in CONFIG_PART_KEYS
+    }
+    existing_parts = [path / name for name, _ in CONFIG_PART_KEYS if (path / name).exists()]
+    if existing_parts and not force:
+        raise RuntimeError(
+            f"config already exists: {existing_parts[0]}; use --force to overwrite"
+        )
+
     if dry_run:
-        print(f"would write config: {path}")
-        print(text)
+        print(f"would write config directory: {path}")
+        for name, _ in CONFIG_PART_KEYS:
+            print(f"--- {path / name}")
+            print(yaml.safe_dump(parts[name], sort_keys=False), end="")
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+
+    path.mkdir(parents=True, exist_ok=True)
+    for name, _ in CONFIG_PART_KEYS:
+        (path / name).write_text(
+            yaml.safe_dump(parts[name], sort_keys=False),
+            encoding="utf-8",
+        )
 
 
 def _fetch_workloads(config_path: Path, workloads: list[str], dry_run: bool) -> None:

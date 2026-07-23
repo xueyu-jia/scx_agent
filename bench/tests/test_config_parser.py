@@ -3,8 +3,6 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-import yaml
-
 from bench.core.config import (
     ConfigError,
     _bench_with_defaults,
@@ -16,6 +14,7 @@ from bench.core.config import (
     _validate_suites,
     _validate_treatments,
     expand_plan,
+    load_config_data,
 )
 from bench.env.manager import _patch_kernel_build_source
 
@@ -200,9 +199,7 @@ class TreatmentConfigTest(unittest.TestCase):
             )
 
     def test_example_cgroup_cpu_matrix_is_internally_consistent(self) -> None:
-        config = yaml.safe_load(
-            Path("bench/configs/cgroup_cpu_tuning.config").read_text(encoding="utf-8")
-        )
+        config = load_config_data(Path("bench/configs/cgroup_cpu_tuning"))
 
         _validate_treatments(config)
         _validate_benches(

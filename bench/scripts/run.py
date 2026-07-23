@@ -37,7 +37,7 @@ _EXECUTION_ORDER_LOCK = threading.Lock()
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a benchmark plan")
-    parser.add_argument("--config", default="bench/configs/local.config")
+    parser.add_argument("--config", default="bench/configs/local_config")
     parser.add_argument("--plan", required=True)
     parser.add_argument("--baseline", help="baseline scheduler name from config.schedulers")
     parser.add_argument("--candidate", help="candidate scheduler name from config.schedulers")

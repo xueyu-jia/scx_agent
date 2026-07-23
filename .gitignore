@@ -7,7 +7,7 @@ bench/workloads/build/
 bench/workloads/src/
 bench/workloads/local/*/*.o
 bench/workloads/local/*/batch_microbench
-bench/configs/local.config
+bench/configs/local_config/
 
 .venv/
 venv/

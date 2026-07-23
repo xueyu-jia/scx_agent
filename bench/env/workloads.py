@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--config",
-        default=str(ROOT / "bench" / "configs" / "local.config"),
+        default=str(ROOT / "bench" / "configs" / "local_config"),
         help="benchmark config path; used to build perf and bpftool from kernel_source",
     )
     parser.add_argument("--force", action="store_true", help="delete existing source before cloning")

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG = Path("bench/configs/local.config")
+DEFAULT_CONFIG = Path("bench/configs/local_config")
 DEFAULT_ROOT = Path("bench/results/cgroup_cpu_matrix")
 
 

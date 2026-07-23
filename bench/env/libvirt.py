@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from bench.core.config import ConfigError, load_config
 
 
-DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local.config"
+DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local_config"
 DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 QEMU_CONF = Path("/etc/libvirt/qemu.conf")
 QEMU_CONF_BACKUP = Path("/etc/libvirt/qemu.conf.scx-bench.bak")
@@ -162,7 +162,7 @@ def verify_qemu_user_config() -> None:
         raise RuntimeError(
             "libvirt qemu user config is not prepared: "
             + "; ".join(mismatched)
-            + "; run: python3 -m bench.env init --config bench/configs/local.config"
+            + "; run: python3 -m bench.env init --config bench/configs/local_config"
         )
 
 

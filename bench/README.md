@@ -41,7 +41,10 @@ python3 bench/scripts/run.py \
 `bench.env init` 会生成本机专属配置：
 
 ```text
-bench/configs/local.config
+bench/configs/local_config/
+  environment.config
+  benches.config
+  plan.config
 ```
 
 它也会通过 `env/libvirt.py` 备份并修改 `/etc/libvirt/qemu.conf`，让 QEMU
@@ -52,7 +55,7 @@ bench/configs/local.config
 python3 -m bench.env restore
 ```
 
-`local.config` 不提交到 git。`run.py` 和 `bench.env` 默认都使用它。
+`local_config/` 不提交到 git。`run.py` 和 `bench.env` 默认都使用这个目录入口。
 
 ## 依赖
 
@@ -76,7 +79,7 @@ cargo build --release --manifest-path schedule/scx_agent_classed/Cargo.toml
 cargo build --release --manifest-path schedule/scx_agent_classed_mcp/Cargo.toml
 ```
 
-对应产物位于各自项目的 `target/release/`，`example.config` 不再从
+对应产物位于各自项目的 `target/release/`，`example_config/` 不再从
 `schedule/scx/target/` 查找这两个自定义产物。
 
 ## 拉取和构建 Workload
@@ -169,25 +172,29 @@ python3 -m bench.env verify
 目录的逐文件 SHA256。写入 manifest 前，base-init VM 会在 guest 内重新计算
 wrapper 哈希并确认与宿主构建快照一致。`verify` 和非 dry-run 的 `run.py` 都会
 比较该 manifest；镜像被替换、manifest 缺失或任一 wrapper 发生变化时，实验会在
-创建 VM 前拒绝运行。`rebuild-image` 只使用现有 `local.config` 重建镜像，不会覆盖
+创建 VM 前拒绝运行。`rebuild-image` 只使用现有 `local_config/` 重建镜像，不会覆盖
 其中的 plan、scheduler 或 machine 配置。
 
 ## 配置文件
 
-运行时默认配置文件是：
+运行时默认配置入口是：
 
 ```text
-bench/configs/local.config
+bench/configs/local_config/
+  environment.config  # libvirt / executor / machines
+  benches.config      # bench_defaults / metric_profiles / suites / benches
+  plan.config         # schedulers / treatments / plans
 ```
 
-模板配置文件是：
+模板配置入口是：
 
 ```text
-bench/configs/example.config
+bench/configs/example_config/
 ```
 
-`example.config` 不包含个人绝对路径，只作为 `bench.env init` 生成
-`local.config` 的模板。
+`example_config/` 不包含个人绝对路径，只作为 `bench.env init` 生成
+`local_config/` 的模板。配置加载器只接受目录；三个 part 缺一不可，且顶层 key
+必须位于上面标明的职责文件中。
 
 顶层结构：
 
@@ -383,12 +390,12 @@ benches:
       timeout_seconds: 30
 ```
 
-完整的 cgroup CPU 场景位于 `bench/configs/cgroup_cpu_tuning.config`，本地配置
+完整的 cgroup CPU 场景位于 `bench/configs/cgroup_cpu_tuning/`，本地配置
 完成初始化后可运行 paired matrix：
 
 ```bash
 python3 -m bench.scenarios.cgroup_cpu.matrix \
-  --config bench/configs/local.config \
+  --config bench/configs/local_config \
   --plan cgroup_cpu_smoke
 ```
 

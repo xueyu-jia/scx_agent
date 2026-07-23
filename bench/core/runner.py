@@ -1379,7 +1379,7 @@ def _preflight_machine(spec: RunSpec) -> None:
             "; ".join(errors)
             + "; prepare host isolation first: "
             + "sudo python3 -m bench.env isolation prepare "
-            + f"--config bench/configs/example.config --plan {spec.plan}"
+            + f"--config bench/configs/example_config --plan {spec.plan}"
         )
 
 

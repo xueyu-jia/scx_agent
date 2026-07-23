@@ -57,9 +57,15 @@ bench/
     run.py
 
   configs/
-    example.config
-    cgroup_cpu_tuning.config
-    local.config  # generated, ignored by git
+    example_config/
+      environment.config
+      benches.config
+      plan.config
+    cgroup_cpu_tuning/
+      environment.config
+      benches.config
+      plan.config
+    local_config/  # generated, ignored by git
 
   workloads/
   schedulers/
@@ -70,7 +76,7 @@ bench/
 
 ### `bench/core/config.py`
 
-Owns config loading, validation, and plan expansion.
+Owns strict three-part directory loading, validation, and plan expansion.
 
 Key responsibilities:
 
@@ -126,7 +132,7 @@ Prepares a machine-specific local environment.
 
 Key responsibilities:
 
-- generate `bench/configs/local.config` from `example.config`;
+- generate `bench/configs/local_config/` from `example_config/`;
 - derive `libvirt.emulator_cpus` and `executor.isolated_cpus` from host topology;
 - generate the SSH key used by the guest;
 - prepare libvirt/QEMU host settings;
@@ -389,9 +395,9 @@ while workload parsing remains the benchmark adapter's responsibility.
 ## Data Flow
 
 ```text
-example.config + env init
-  -> local.config
-local.config
+example_config/ + env init
+  -> local_config/
+local_config/
   -> config parser
   -> base image + benchmark wrapper manifest verification
   -> RunSpec list

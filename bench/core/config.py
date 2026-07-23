@@ -19,6 +19,12 @@ REQUIRED_TOP_LEVEL_KEYS = (
     "metric_profiles",
     "benches",
 )
+CONFIG_PART_KEYS = (
+    ("environment.config", ("libvirt", "executor", "machines")),
+    ("benches.config", ("bench_defaults", "metric_profiles", "suites", "benches")),
+    ("plan.config", ("schedulers", "treatments", "plans")),
+)
+CONFIG_PARTS = tuple(name for name, _ in CONFIG_PART_KEYS)
 
 VALID_DIRECTIONS = {"higher", "lower"}
 VALID_CHARTS = {"delta_bar", "latency_bar", "summary_table"}
@@ -116,16 +122,60 @@ class RunSpec:
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    config_path = Path(path)
-    with config_path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+    data = load_config_data(path)
+    validate_config(data)
+    return data
+
+
+def load_config_data(path: str | Path) -> dict[str, Any]:
+    config_dir = Path(path)
+    if not config_dir.is_dir():
+        raise ConfigError(f"config path must be a directory: {config_dir}")
+
+    unexpected_parts = sorted(
+        candidate.name
+        for candidate in config_dir.glob("*.config")
+        if candidate.name not in CONFIG_PARTS
+    )
+    if unexpected_parts:
+        raise ConfigError(
+            f"unexpected config part(s) in {config_dir}: {', '.join(unexpected_parts)}"
+        )
+
+    merged: dict[str, Any] = {}
+    owners: dict[str, Path] = {}
+    for part_name, allowed_keys in CONFIG_PART_KEYS:
+        part_path = config_dir / part_name
+        if not part_path.is_file():
+            raise ConfigError(f"missing config part: {part_path}")
+        part = _load_config_part(part_path)
+        for key, value in part.items():
+            if key in merged:
+                raise ConfigError(
+                    f"duplicate top-level key {key!r} in {part_path}; "
+                    f"already defined in {owners[key]}"
+                )
+            merged[key] = value
+            owners[key] = part_path
+
+        misplaced = sorted(set(part) - set(allowed_keys))
+        if misplaced:
+            raise ConfigError(
+                f"{part_path} contains misplaced top-level key(s): "
+                f"{', '.join(misplaced)}"
+            )
+
+    return merged
+
+
+def _load_config_part(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file)
 
     if data is None:
-        raise ConfigError(f"{config_path} is empty")
+        raise ConfigError(f"{path} is empty")
     if not isinstance(data, dict):
-        raise ConfigError(f"{config_path} must contain a mapping at the top level")
-
-    validate_config(data)
+        raise ConfigError(f"{path} must contain a mapping at the top level")
     return data
 
 
