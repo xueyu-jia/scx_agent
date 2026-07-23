@@ -33,11 +33,11 @@ from bench.base_image import (
     serialize_base_image_manifest,
     verify_base_image_manifest,
 )
-from bench.config.parser import ConfigError, load_config, parse_cpu_list
+from bench.config.parser import CONFIG_PARTS, ConfigError, load_config, load_config_data, parse_cpu_list
 
 
-DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local.config"
-TEMPLATE_CONFIG = REPO_ROOT / "bench" / "configs" / "example.config"
+DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local_config"
+TEMPLATE_CONFIG = REPO_ROOT / "bench" / "configs" / "example_config"
 DEFAULT_ROOT_IMAGE = Path("/var/lib/libvirt/images/scx-bench-base.qcow2")
 DEFAULT_CLOUD_IMAGE = Path("/var/lib/libvirt/images/scx-bench-cloudimg.qcow2")
 DEFAULT_SEED_IMAGE = Path("/var/lib/libvirt/images/scx-bench-seed.iso")
@@ -57,6 +57,14 @@ DEFAULT_PACKAGES = (
     "libseccomp2",
     "libstdc++6",
     "zlib1g",
+    "make",
+    "gcc",
+    "binutils",
+    "flex",
+    "bison",
+    "bc",
+    "libssl-dev",
+    "libelf-dev",
 )
 REQUIRED_COMMANDS = {
     "cloud-localds": "cloud-image-utils",
@@ -350,9 +358,10 @@ def _build_local_config(
     emulator_cpus: str,
     isolated_cpus: str,
 ) -> dict[str, Any]:
-    data = yaml.safe_load(template_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise RuntimeError(f"template config is invalid: {template_path}")
+    try:
+        data = load_config_data(template_path)
+    except ConfigError as exc:
+        raise RuntimeError(f"template config is invalid: {exc}") from exc
 
     data["libvirt"] = {
         **data.get("libvirt", {}),
@@ -392,28 +401,99 @@ def _build_local_config(
 
 
 def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> None:
-    bench = data.get("benches", {}).get("kernel_build_bzimage")
-    if not isinstance(bench, dict):
-        return
-    args = bench.get("args")
-    if not isinstance(args, list):
-        return
-    for index, value in enumerate(args[:-1]):
-        if value == "--source":
-            args[index + 1] = str(kernel_source)
-            return
+    for bench in data.get("benches", {}).values():
+        if not isinstance(bench, dict):
+            continue
+        measurement = bench.get("measurement")
+        if isinstance(measurement, dict):
+            args = measurement.get("args")
+        else:
+            args = bench.get("args")
+        if not isinstance(args, list):
+            continue
+        for index, value in enumerate(args[:-1]):
+            if value == "--source" and args[index + 1] is None:
+                args[index + 1] = str(kernel_source)
 
 
 def _write_config(path: Path, data: dict[str, Any], force: bool, dry_run: bool) -> None:
-    if path.exists() and not force:
-        raise RuntimeError(f"config already exists: {path}; use --force to overwrite")
-    text = yaml.safe_dump(data, sort_keys=False)
+    _write_split_config(path, data, force=force, dry_run=dry_run)
+
+
+def _write_split_config(path: Path, data: dict[str, Any], force: bool, dry_run: bool) -> None:
+    if path.exists() and not path.is_dir():
+        raise RuntimeError(f"config path exists and is not a directory: {path}")
+
+    parts = {
+        "environment.config": _select_keys(data, ("libvirt", "executor", "machines")),
+        "benches.config": _select_keys(data, ("bench_defaults", "metric_profiles", "benches")),
+        "plan.config": _select_keys(data, ("schedulers", "plans", "suites")),
+    }
+    for name in CONFIG_PARTS:
+        part_path = path / name
+        if part_path.exists() and not force:
+            raise RuntimeError(f"config already exists: {part_path}; use --force to overwrite")
+
     if dry_run:
-        print(f"would write config: {path}")
-        print(text)
+        print(f"would write config directory: {path}")
+        for name in CONFIG_PARTS:
+            print(f"--- {path / name}")
+            print(_dump_config_part(parts[name]), end="")
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+
+    path.mkdir(parents=True, exist_ok=True)
+    for name in CONFIG_PARTS:
+        (path / name).write_text(
+            _dump_config_part(parts[name]),
+            encoding="utf-8",
+        )
+
+
+def _dump_config_part(data: dict[str, Any]) -> str:
+    text = yaml.safe_dump(data, sort_keys=False)
+    return _add_config_spacing(text)
+
+
+def _add_config_spacing(text: str) -> str:
+    spaced_sections = {
+        "schedulers",
+        "plans",
+        "machines",
+        "suites",
+        "metric_profiles",
+        "benches",
+    }
+    lines = text.splitlines()
+    output: list[str] = []
+    current_section: str | None = None
+    seen_section_items: set[str] = set()
+
+    for line in lines:
+        if line and not line.startswith(" "):
+            if output and output[-1] != "":
+                output.append("")
+            current_section = line.split(":", 1)[0]
+            output.append(line)
+            continue
+
+        if (
+            current_section in spaced_sections
+            and line.startswith("  ")
+            and not line.startswith("    ")
+            and line.endswith(":")
+            and line.strip() != "-"
+        ):
+            if current_section in seen_section_items and output and output[-1] != "":
+                output.append("")
+            seen_section_items.add(current_section)
+
+        output.append(line)
+
+    return "\n".join(output) + "\n"
+
+
+def _select_keys(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: data[key] for key in keys if key in data}
 
 
 def _fetch_workloads(config_path: Path, workloads: list[str], dry_run: bool) -> None:
@@ -564,6 +644,7 @@ def _initialize_base_vm(
         libvirt,
         host,
     )
+    _sync_kernel_source_to_guest(libvirt, host)
     _ssh(libvirt, host, "sync && poweroff", check=False)
     time.sleep(5)
     _run_sudo(["virsh", "--connect", libvirt["uri"], "destroy", name], dry_run=False, check=False)
@@ -638,6 +719,26 @@ def _sync_repo_to_guest(
     )
     wrappers_after = benchmark_wrapper_snapshot(REPO_ROOT)
     return wrappers_before, wrappers_after, guest_wrappers_match
+
+
+def _sync_kernel_source_to_guest(libvirt: dict[str, Any], host: str) -> None:
+    source = Path(libvirt.get("kernel_source", ""))
+    if not source.exists():
+        return
+    remote_path = shlex.quote(str(source))
+    remote_parent = shlex.quote(str(source.parent))
+    _ssh(libvirt, host, f"mkdir -p {remote_parent}")
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
+        with tarfile.open(tmp.name, "w:gz") as archive:
+            archive.add(source, arcname=source.name)
+        _scp(libvirt, host, Path(tmp.name), "/tmp/scx-bench-kernel-source.tar.gz")
+    _ssh(
+        libvirt,
+        host,
+        f"rm -rf {remote_path} && "
+        f"tar -xzf /tmp/scx-bench-kernel-source.tar.gz -C {remote_parent} && "
+        "rm -f /tmp/scx-bench-kernel-source.tar.gz",
+    )
 
 
 def _verify_guest_wrapper_snapshot(
@@ -721,6 +822,12 @@ def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
     if ".git" in parts:
         return None
     if name == "bench/results" or name.startswith("bench/results/"):
+        return None
+    if name == ".local-tools" or name.startswith(".local-tools/"):
+        return None
+    if name == ".local-debs" or name.startswith(".local-debs/"):
+        return None
+    if name == "tuning_agent/target" or name.startswith("tuning_agent/target/"):
         return None
     if name == "bench/workloads/src" or name.startswith("bench/workloads/src/"):
         return None

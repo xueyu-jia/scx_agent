@@ -3,11 +3,13 @@ __pycache__/
 
 bench/results/
 bench/workloads/
-bench/configs/local.config
+bench/configs/local_config/
 
 .local-debs
 .local-tools
 *.config
+!bench/configs/example_config/
+!bench/configs/example_config/*.config
 tuning-agent.toml
 
 

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
+
+import yaml
 
 from bench.config.parser import (
     ConfigError,
@@ -9,6 +13,7 @@ from bench.config.parser import (
     _validate_benches,
     _validate_schedulers,
     expand_plan,
+    load_config,
 )
 
 
@@ -19,6 +24,130 @@ def command(argv: list[str] | None = None, timeout_seconds: int = 30) -> dict[st
         "args": values[1:],
         "timeout_seconds": timeout_seconds,
     }
+
+
+class ConfigDirectoryLoadingTest(unittest.TestCase):
+    def test_load_config_directory_merges_parts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "local_config"
+            self._write_split_config(config_dir, self._valid_config(root))
+
+            config = load_config(config_dir)
+
+            self.assertEqual(config["libvirt"]["root_image"], "/tmp/root.qcow2")
+            self.assertIn("bench", config["benches"])
+            self.assertEqual([spec.bench_name for spec in expand_plan(config, "smoke")], ["bench"])
+
+    def test_load_config_directory_requires_all_parts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "local_config"
+            config = self._valid_config(root)
+            self._write_part(
+                config_dir / "environment.config",
+                config,
+                ("libvirt", "executor", "machines"),
+            )
+            self._write_part(
+                config_dir / "benches.config",
+                config,
+                ("metric_profiles", "benches"),
+            )
+
+            with self.assertRaisesRegex(ConfigError, r"missing config part: .*plan\.config"):
+                load_config(config_dir)
+
+    def test_load_config_directory_rejects_duplicate_top_level_keys(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "local_config"
+            config = self._valid_config(root)
+            self._write_part(
+                config_dir / "environment.config",
+                config,
+                ("libvirt", "executor", "machines"),
+            )
+            self._write_part(
+                config_dir / "benches.config",
+                config,
+                ("libvirt", "metric_profiles", "benches"),
+            )
+            self._write_part(
+                config_dir / "plan.config",
+                config,
+                ("schedulers", "plans", "suites"),
+            )
+
+            with self.assertRaisesRegex(ConfigError, r"duplicate top-level key 'libvirt'"):
+                load_config(config_dir)
+
+    def test_load_config_rejects_single_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.config"
+            config_path.write_text("libvirt: {}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ConfigError, r"config path must be a directory"):
+                load_config(config_path)
+
+    def _valid_config(self, root: Path) -> dict[str, object]:
+        kernel_source = root / "linux"
+        (kernel_source / "tools" / "perf").mkdir(parents=True)
+        return {
+            "libvirt": {
+                "kernel": None,
+                "kernel_args": "",
+                "kernel_source": str(kernel_source),
+                "initrd": None,
+                "root_image": "/tmp/root.qcow2",
+                "ssh_user": "root",
+                "ssh_key": "/tmp/key",
+                "workdir": "/tmp/work",
+                "guest_output_dir": "/out",
+                "emulator_cpus": "0",
+            },
+            "executor": {},
+            "machines": {
+                "small": {
+                    "vcpus": 1,
+                    "memory": "1G",
+                    "pin_cpus": "auto",
+                    "exclusive": True,
+                    "frequency": {"fixed": True},
+                }
+            },
+            "metric_profiles": {
+                "metrics": {
+                    "primary": [{"name": "throughput", "direction": "higher"}],
+                }
+            },
+            "benches": {"bench": {"measurement": command()}},
+            "schedulers": {"default": {"kind": "builtin"}},
+            "plans": {
+                "smoke": {
+                    "runs": 1,
+                    "matrix": [{"machine": "small", "suites": ["suite"]}],
+                }
+            },
+            "suites": {"suite": {"benches": ["bench"], "metric_profile": "metrics"}},
+        }
+
+    def _write_split_config(self, path: Path, config: dict[str, object]) -> None:
+        self._write_part(path / "environment.config", config, ("libvirt", "executor", "machines"))
+        self._write_part(path / "benches.config", config, ("metric_profiles", "benches"))
+        self._write_part(path / "plan.config", config, ("schedulers", "plans", "suites"))
+
+    def _write_part(
+        self,
+        path: Path,
+        config: dict[str, object],
+        keys: tuple[str, ...],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            yaml.safe_dump({key: config[key] for key in keys}, sort_keys=False),
+            encoding="utf-8",
+        )
 
 
 class BenchCommandValidationTest(unittest.TestCase):

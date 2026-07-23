@@ -41,7 +41,10 @@ python3 bench/scripts/run.py \
 `prepare_env.py init` 会生成本机专属配置：
 
 ```text
-bench/configs/local.config
+bench/configs/local_config/
+  environment.config
+  benches.config
+  plan.config
 ```
 
 它也会调用 `libvirt_env.py` 备份并修改 `/etc/libvirt/qemu.conf`，让 QEMU
@@ -52,8 +55,8 @@ bench/configs/local.config
 python3 bench/scripts/prepare_env.py restore
 ```
 
-`local.config` 不提交到 git。`run.py`、`isolation.py` 和
-`fetch_workloads.py` 默认都使用它。
+`local_config/` 不提交到 git。`run.py`、`isolation.py`、`libvirt_env.py` 和
+`fetch_workloads.py` 默认都使用这个目录入口。
 
 ## 依赖
 
@@ -160,25 +163,29 @@ python3 bench/scripts/prepare_env.py verify
 目录的逐文件 SHA256。写入 manifest 前，base-init VM 会在 guest 内重新计算
 wrapper 哈希并确认与宿主构建快照一致。`verify` 和非 dry-run 的 `run.py` 都会
 比较该 manifest；镜像被替换、manifest 缺失或任一 wrapper 发生变化时，实验会在
-创建 VM 前拒绝运行。`rebuild-image` 只使用现有 `local.config` 重建镜像，不会覆盖
+创建 VM 前拒绝运行。`rebuild-image` 只使用现有 `local_config/` 重建镜像，不会覆盖
 其中的 plan、scheduler 或 machine 配置。
 
 ## 配置文件
 
-运行时默认配置文件是：
+运行时默认配置入口是目录：
 
 ```text
-bench/configs/local.config
+bench/configs/local_config/
+  environment.config  # libvirt / executor / machines
+  benches.config      # bench_defaults / metric_profiles / benches
+  plan.config         # schedulers / plans / suites
 ```
 
-模板配置文件是：
+模板配置目录是：
 
 ```text
-bench/configs/example.config
+bench/configs/example_config/
 ```
 
-`example.config` 不包含个人绝对路径，只作为 `prepare_env.py init` 生成
-`local.config` 的模板。
+`example_config/` 不包含个人绝对路径，只作为 `prepare_env.py init` 生成
+`local_config/` 的模板。加载器只接受目录入口，并按
+`environment.config -> benches.config -> plan.config` 的顺序合并后再做完整校验。
 
 顶层结构：
 
@@ -189,9 +196,9 @@ executor         pair 并行、自动 CPU pinning 和 host 资源策略
 schedulers       builtin 或 scx 调度器定义
 plans            smoke / full 等测试计划
 machines         VM CPU、内存、pinning、隔离要求
-suites           benchmark 分组
+suites           benchmark 分组和 metric profile 绑定
 metric_profiles  primary / secondary 指标和判定规则
-benches          具体 workload wrapper 命令
+benches          具体 workload wrapper 命令、warmup 和环境变量
 ```
 
 调度器在配置文件中定义：

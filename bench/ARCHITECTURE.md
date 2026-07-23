@@ -43,8 +43,14 @@ bench/
     run.py
 
   configs/
-    example.config
-    local.config  # generated, ignored by git
+    example_config/
+      environment.config
+      benches.config
+      plan.config
+    local_config/  # generated, ignored by git
+      environment.config
+      benches.config
+      plan.config
 
   workloads/
   schedulers/
@@ -60,6 +66,7 @@ Owns config loading, validation, and plan expansion.
 Key responsibilities:
 
 - validate top-level config sections;
+- load the three-part config directory;
 - validate machines, schedulers, suites, benches, and metric profiles;
 - expand a plan into `RunSpec` objects.
 
@@ -110,7 +117,7 @@ Prepares a machine-specific local environment.
 
 Key responsibilities:
 
-- generate `bench/configs/local.config` from `example.config`;
+- generate `bench/configs/local_config/` from `example_config/`;
 - derive `libvirt.emulator_cpus` and `executor.isolated_cpus` from host topology;
 - generate the SSH key used by the guest;
 - call `libvirt_env.py prepare`;
@@ -341,9 +348,9 @@ Standalone analysis CLI for re-analyzing existing result directories.
 ## Data Flow
 
 ```text
-example.config + prepare_env.py init
-  -> local.config
-local.config
+example_config/ + prepare_env.py init
+  -> local_config/
+local_config/
   -> config parser
   -> base image + benchmark wrapper manifest verification
   -> RunSpec list
