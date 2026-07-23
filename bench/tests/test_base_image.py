@@ -13,6 +13,8 @@ from bench.env.base_image import (
     base_image_manifest_path,
     benchmark_wrapper_snapshot,
     build_base_image_manifest,
+    _kernel_source_tar_filter,
+    _tar_filter,
     prepare_base_image,
     serialize_base_image_manifest,
     verify_base_image_manifest,
@@ -148,6 +150,31 @@ class BaseImageManifestTest(unittest.TestCase):
 
             self.assertFalse(image.exists())
             self.assertFalse(base_image_manifest_path(image).exists())
+
+    def test_kernel_source_filter_excludes_generated_repository_state(self) -> None:
+        import tarfile
+
+        self.assertIsNone(_kernel_source_tar_filter(tarfile.TarInfo("./.git/index")))
+        self.assertIsNone(
+            _kernel_source_tar_filter(tarfile.TarInfo("./tools/__pycache__/tool.pyc"))
+        )
+        source = tarfile.TarInfo("./kernel/sched/ext.c")
+        self.assertIs(_kernel_source_tar_filter(source), source)
+
+    def test_repository_filter_keeps_only_scheduler_release_binaries(self) -> None:
+        import tarfile
+
+        debug = tarfile.TarInfo(
+            "./schedule/scx_agent_classed/target/debug/scx_agent_classed"
+        )
+        self.assertIsNone(_tar_filter(debug))
+
+        release = tarfile.TarInfo(
+            "./schedule/scx_agent_classed/target/release/scx_agent_classed"
+        )
+        release.mode = 0o755
+        release.type = tarfile.REGTYPE
+        self.assertIs(_tar_filter(release), release)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,24 @@ def main(argv: list[str] | None = None) -> int:
 
     init = subparsers.add_parser("init", help="generate local config and prepare host/guest assets")
     init.add_argument("--kernel-source", required=True, help="kernel source tree to benchmark")
+    init.add_argument(
+        "--kernel-image",
+        help="bootable kernel image; defaults to <kernel-source>/arch/x86/boot/bzImage",
+    )
+    init.add_argument(
+        "--kernel-config",
+        help="kernel config used by schedulers and kernel-build; defaults to <kernel-source>/.config",
+    )
+    init.add_argument("--initrd", help="optional initramfs used for direct kernel boot")
+    init.add_argument(
+        "--kernel-id",
+        help="profile-specific subdirectory below --libvirt-kernel-dir",
+    )
+    init.add_argument(
+        "--sync-kernel-source",
+        action="store_true",
+        help="copy kernel source and config into the base image for kernel-build workloads",
+    )
     init.add_argument("--config", default=str(DEFAULT_CONFIG))
     init.add_argument("--template", default=str(TEMPLATE_CONFIG))
     init.add_argument("--root-image", default=str(DEFAULT_ROOT_IMAGE))
@@ -153,11 +171,25 @@ def main(argv: list[str] | None = None) -> int:
 
 def init_environment(args: argparse.Namespace) -> int:
     kernel_source = Path(args.kernel_source).expanduser().resolve()
-    kernel = kernel_source / "arch" / "x86" / "boot" / "bzImage"
     if not kernel_source.exists():
         raise RuntimeError(f"kernel source does not exist: {kernel_source}")
+    kernel = (
+        Path(args.kernel_image).expanduser().resolve()
+        if args.kernel_image
+        else kernel_source / "arch" / "x86" / "boot" / "bzImage"
+    )
     if not kernel.exists():
         raise RuntimeError(f"kernel image does not exist: {kernel}")
+    kernel_config = (
+        Path(args.kernel_config).expanduser().resolve()
+        if args.kernel_config
+        else kernel_source / ".config"
+    )
+    if not kernel_config.is_file():
+        raise RuntimeError(f"kernel config does not exist: {kernel_config}")
+    initrd = Path(args.initrd).expanduser().resolve() if args.initrd else None
+    if initrd is not None and not initrd.is_file():
+        raise RuntimeError(f"initrd does not exist: {initrd}")
 
     _check_host_dependencies(
         commands=_required_commands_for_init(args),
@@ -169,7 +201,19 @@ def init_environment(args: argparse.Namespace) -> int:
     libvirt_kernel = _install_kernel_image(
         source=kernel,
         target_dir=Path(args.libvirt_kernel_dir).expanduser().resolve(),
+        kernel_id=args.kernel_id,
         dry_run=args.dry_run,
+    )
+    libvirt_initrd = (
+        _install_boot_artifact(
+            source=initrd,
+            target_dir=Path(args.libvirt_kernel_dir).expanduser().resolve(),
+            filename="initrd.img",
+            kernel_id=args.kernel_id,
+            dry_run=args.dry_run,
+        )
+        if initrd is not None
+        else None
     )
 
     emulator_cpus, isolated_cpus = _select_cpu_sets()
@@ -179,6 +223,9 @@ def init_environment(args: argparse.Namespace) -> int:
         template_path=Path(args.template),
         kernel_source=kernel_source,
         kernel=libvirt_kernel,
+        kernel_config=kernel_config,
+        initrd=libvirt_initrd,
+        sync_kernel_source=args.sync_kernel_source,
         root_image=root_image,
         ssh_key=ssh_key,
         workdir=Path(args.workdir).expanduser().resolve(),
@@ -226,6 +273,10 @@ def verify_environment(args: argparse.Namespace) -> int:
         ("ssh_key", Path(libvirt["ssh_key"]).exists()),
         ("workdir", Path(libvirt["workdir"]).exists()),
     ]
+    if libvirt.get("kernel_config"):
+        checks.append(("kernel_config", Path(libvirt["kernel_config"]).is_file()))
+    if libvirt.get("initrd"):
+        checks.append(("initrd", Path(libvirt["initrd"]).is_file()))
     for name, ok in checks:
         if not ok:
             raise RuntimeError(f"missing {name}: {libvirt.get(name)}")
@@ -329,8 +380,33 @@ def _ensure_ssh_key(path: Path, dry_run: bool) -> None:
     subprocess.run(command, check=True)
 
 
-def _install_kernel_image(source: Path, target_dir: Path, dry_run: bool) -> Path:
-    target = target_dir / "bzImage"
+def _install_kernel_image(
+    source: Path,
+    target_dir: Path,
+    dry_run: bool,
+    kernel_id: str | None = None,
+) -> Path:
+    return _install_boot_artifact(
+        source=source,
+        target_dir=target_dir,
+        filename="bzImage",
+        kernel_id=kernel_id,
+        dry_run=dry_run,
+    )
+
+
+def _install_boot_artifact(
+    source: Path,
+    target_dir: Path,
+    filename: str,
+    kernel_id: str | None,
+    dry_run: bool,
+) -> Path:
+    if kernel_id is not None:
+        if not kernel_id or kernel_id in {".", ".."} or Path(kernel_id).name != kernel_id:
+            raise RuntimeError(f"invalid kernel id: {kernel_id!r}")
+        target_dir = target_dir / kernel_id
+    target = target_dir / filename
     _run_sudo(
         ["install", "-D", "-m", "0644", str(source), str(target)],
         dry_run=dry_run,
@@ -347,6 +423,9 @@ def _build_local_config(
     workdir: Path,
     emulator_cpus: str,
     isolated_cpus: str,
+    kernel_config: Path | None = None,
+    initrd: Path | None = None,
+    sync_kernel_source: bool = False,
 ) -> dict[str, Any]:
     try:
         data = load_config_data(template_path)
@@ -358,8 +437,10 @@ def _build_local_config(
         "uri": "qemu:///system",
         "kernel": str(kernel),
         "kernel_args": "root=/dev/vda1 console=ttyS0 systemd.mask=boot-efi.mount",
+        "kernel_config": str(kernel_config or kernel_source / ".config"),
         "kernel_source": str(kernel_source),
-        "initrd": None,
+        "sync_kernel_source": sync_kernel_source,
+        "initrd": str(initrd) if initrd is not None else None,
         "root_image": str(root_image),
         "runtime_dir": str(DEFAULT_RUNTIME_DIR),
         "network": "default",
@@ -386,11 +467,16 @@ def _build_local_config(
         "pair_policy": "sequential",
         "memory_guard_gb": 16,
     }
-    _patch_kernel_build_source(data, kernel_source)
+    _patch_kernel_build_source(data, kernel_source, kernel_config or kernel_source / ".config")
+    _patch_scheduler_kconfig(data, kernel_config or kernel_source / ".config")
     return data
 
 
-def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> None:
+def _patch_kernel_build_source(
+    data: dict[str, Any],
+    kernel_source: Path,
+    kernel_config: Path | None = None,
+) -> None:
     bench = data.get("benches", {}).get("kernel_build_bzimage")
     if not isinstance(bench, dict):
         return
@@ -398,10 +484,24 @@ def _patch_kernel_build_source(data: dict[str, Any], kernel_source: Path) -> Non
     args = measurement.get("args") if isinstance(measurement, dict) else bench.get("args")
     if not isinstance(args, list):
         return
+    found_config = False
     for index, value in enumerate(args[:-1]):
         if value == "--source":
             args[index + 1] = str(kernel_source)
-            return
+        elif value == "--config" and kernel_config is not None:
+            args[index + 1] = str(kernel_config)
+            found_config = True
+    if kernel_config is not None and not found_config:
+        args.extend(["--config", str(kernel_config)])
+
+
+def _patch_scheduler_kconfig(data: dict[str, Any], kernel_config: Path) -> None:
+    schedulers = data.get("schedulers", {})
+    if not isinstance(schedulers, dict):
+        return
+    for scheduler in schedulers.values():
+        if isinstance(scheduler, dict) and "host_kconfig" in scheduler:
+            scheduler["host_kconfig"] = str(kernel_config)
 
 
 def _write_config(path: Path, data: dict[str, Any], force: bool, dry_run: bool) -> None:

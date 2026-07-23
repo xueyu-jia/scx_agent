@@ -8,6 +8,7 @@ bench/workloads/src/
 bench/workloads/local/*/*.o
 bench/workloads/local/*/batch_microbench
 bench/configs/local_config/
+bench/configs/local_profiles/
 
 .venv/
 venv/

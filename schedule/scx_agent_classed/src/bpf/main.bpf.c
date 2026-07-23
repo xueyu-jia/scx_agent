@@ -1623,7 +1623,8 @@ static bool gated_steal(s32 dst_cpu, u32 class_id)
 
 	cursor = __sync_fetch_and_add(&steal_cursor, 1);
 	dst_load = capacity_scale_load(dst_cpu, cpu_queued_load(dst));
-	bpf_for(i, 0, AGENT_STEAL_SCAN_MAX) {
+	/* Keep this as a plain bounded loop for older verifier state pruning. */
+	for (i = 0; i < AGENT_STEAL_SCAN_MAX; i++) {
 		if (i >= steal_scan || i >= nr_cpu_ids - 1)
 			break;
 		src_cpu = (dst_cpu + 1 +

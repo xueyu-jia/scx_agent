@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import difflib
+import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -378,6 +380,7 @@ class GuestExecutor:
         self.warmup_result = PhaseResult()
         self.measurement_result = PhaseResult()
         self.snapshot_errors: list[str] = []
+        self.system_metadata: dict[str, Any] = {}
         self.status = INTERNAL_ERROR
         self.failure_reason = "guest executor did not complete"
         self.started_at = _utc_now()
@@ -386,6 +389,7 @@ class GuestExecutor:
     def run(self) -> int:
         try:
             self._prepare_output()
+            self._collect_system_metadata()
             self._sleep(self.plan.vm_settle_seconds)
             self._start_scheduler()
             self._run_treatment()
@@ -525,6 +529,50 @@ class GuestExecutor:
         self.treatment_result.status = "PROCEEDED"
         self._sleep(self.plan.post_treatment_settle_seconds)
         self._check_scheduler("post-treatment settle")
+
+    def _collect_system_metadata(self) -> None:
+        uname = os.uname()
+        metadata: dict[str, Any] = {
+            "sysname": uname.sysname,
+            "release": uname.release,
+            "version": uname.version,
+            "machine": uname.machine,
+            "proc_version": _read_optional_text(Path("/proc/version")),
+            "sched_ext_state": _read_optional_text(
+                Path("/sys/kernel/sched_ext/state")
+            ),
+            "vmlinux_btf": Path("/sys/kernel/btf/vmlinux").is_file(),
+        }
+        config_path = Path("/proc/config.gz")
+        if config_path.is_file():
+            try:
+                compressed = config_path.read_bytes()
+                config_text = gzip.decompress(compressed).decode("utf-8", "replace")
+                metadata["config_gz_sha256"] = hashlib.sha256(compressed).hexdigest()
+                wanted = {
+                    "CONFIG_BPF_SYSCALL",
+                    "CONFIG_DEBUG_INFO_BTF",
+                    "CONFIG_EXT4_FS",
+                    "CONFIG_IKCONFIG",
+                    "CONFIG_SCHED_CLASS_EXT",
+                    "CONFIG_VIRTIO_BLK",
+                    "CONFIG_VIRTIO_NET",
+                }
+                metadata["config"] = {
+                    key: value
+                    for key, value in (
+                        line.split("=", 1)
+                        for line in config_text.splitlines()
+                        if "=" in line and line.split("=", 1)[0] in wanted
+                    )
+                }
+            except OSError as exc:
+                metadata["config_error"] = str(exc)
+        self.system_metadata = metadata
+        (self.output_dir / "system_metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     def _start_scheduler(self) -> None:
         scheduler = self.plan.scheduler
@@ -911,6 +959,7 @@ class GuestExecutor:
                 "measurement": self.measurement_result.to_dict(),
             },
             "snapshot_errors": list(self.snapshot_errors),
+            "system": self.system_metadata,
             "timing": {
                 "vm_settle_seconds": self.plan.vm_settle_seconds,
                 "post_treatment_settle_seconds": (
@@ -948,6 +997,13 @@ class GuestExecutor:
     def _sleep(seconds: int) -> None:
         if seconds > 0:
             time.sleep(seconds)
+
+
+def _read_optional_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
 
 
 def _active_group_members(pgid: int) -> list[int]:

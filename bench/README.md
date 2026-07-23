@@ -35,7 +35,7 @@ python3 -m bench.env verify
 python3 bench/scripts/run.py \
   --plan smoke \
   --baseline default \
-  --candidate scx_rlfifo
+  --candidate scx_agent_classed
 ```
 
 `bench.env init` 会生成本机专属配置：
@@ -57,6 +57,124 @@ python3 -m bench.env restore
 
 `local_config/` 不提交到 git。`run.py` 和 `bench.env` 默认都使用这个目录入口。
 
+## openEuler 24.03 SP4 / 6.6 迁移
+
+下面的流程对应已验证的构建：
+
+```text
+kernel 6.6.0-157.0.0.149.20260612.5ba33eb06623.oe2403sp4.x86_64
+runtime 6.6.0-oe2403sp4-157.149-scx
+profile bench/configs/local_profiles/oe2403sp4_6_6_scx
+```
+
+该 profile 通过 libvirt direct boot 替换内核，但保留现有 Ubuntu 22.04 guest
+userspace，以便只改变 kernel 做可比测试。因此结果代表 openEuler kernel 的表现，
+不代表完整 openEuler userspace/发行版栈；后者应使用单独的 openEuler root image。
+
+`kernel-*.rpm` 是二进制安装包，不包含完整编译树。迁移时必须同时取得同一
+NEVRA 的 `kernel-source-*.rpm`。在 Ubuntu host 上先安装 `rpm2cpio`、`cpio`、
+内核构建依赖、`pahole`、libelf 和 LLVM/GCC 工具链，再解包两个 RPM：
+
+```bash
+KNEVRA=6.6.0-157.0.0.149.20260612.5ba33eb06623.oe2403sp4.x86_64
+PROFILE="$HOME/kernels/oe2403sp4-$KNEVRA"
+SOURCE_RPM="$HOME/kernel-source-$KNEVRA.rpm"
+BINARY_RPM="$HOME/kernel-$KNEVRA.rpm"
+
+mkdir -p "$PROFILE/source" "$PROFILE/binary" "$PROFILE/build" "$PROFILE/assets"
+(cd "$PROFILE/source" && rpm2cpio "$SOURCE_RPM" | cpio -idm --quiet)
+(cd "$PROFILE/binary" && rpm2cpio "$BINARY_RPM" | cpio -idm --quiet)
+
+KSRC="$PROFILE/source/usr/src/linux-$KNEVRA"
+KBUILD="$PROFILE/build"
+cp "$PROFILE/binary/boot/config-$KNEVRA" "$PROFILE/assets/vendor.config"
+cp "$PROFILE/assets/vendor.config" "$KBUILD/.config"
+```
+
+直接用 libvirt 启动 `bzImage` 时，根文件系统、virtio block/network 不能只编译为
+模块。启用 sched_ext 和可复现性所需配置：
+
+```bash
+"$KSRC/scripts/config" --file "$KBUILD/.config" \
+  --enable SCHED_CLASS_EXT \
+  --enable IKHEADERS \
+  --enable VIRTIO_BLK \
+  --enable VIRTIO_NET \
+  --enable SCSI_VIRTIO \
+  --enable EXT4_FS \
+  --set-str LOCALVERSION -oe2403sp4-157.149-scx \
+  --set-str SYSTEM_TRUSTED_KEYS '' \
+  --set-str SYSTEM_REVOCATION_KEYS ''
+
+make -C "$KSRC" O="$KBUILD" olddefconfig
+make -C "$KSRC" O="$KBUILD" -j"$(nproc)" bzImage
+cp "$KBUILD/arch/x86/boot/bzImage" "$PROFILE/assets/bzImage"
+cp "$KBUILD/.config" "$PROFILE/assets/kernel.config"
+```
+
+`scx_agent_classed` 有一项源码兼容：remote steal 使用普通固定上限循环，避免
+6.6 verifier 对 `bpf_for` 展开超过 1,000,000 条处理指令；扫描上限和调度语义不变。
+
+为每个内核使用独立 config、kernel image 和 root image，不能覆盖 Linux 6.18
+profile。框架支持外置 build 目录、独立 kernel config 和源码同步：
+
+```bash
+python3 -m bench.env init \
+  --config bench/configs/local_profiles/oe2403sp4_6_6_scx \
+  --kernel-source "$KSRC" \
+  --kernel-image "$PROFILE/assets/bzImage" \
+  --kernel-config "$KBUILD/.config" \
+  --kernel-id oe2403sp4_6_6_scx \
+  --root-image /var/lib/libvirt/scx-bench-runs/scx-bench-oe2403sp4-base.qcow2 \
+  --sync-kernel-source
+
+python3 -m bench.env verify \
+  --config bench/configs/local_profiles/oe2403sp4_6_6_scx
+```
+
+先运行单次迁移门禁，再运行正式多次性能测试：
+
+```bash
+python3 bench/scripts/run.py \
+  --config bench/configs/local_profiles/oe2403sp4_6_6_scx \
+  --plan kernel_migration_smoke \
+  --baseline default \
+  --candidate scx_agent_classed \
+  --parallel 1
+
+python3 bench/scripts/run.py \
+  --config bench/configs/local_profiles/oe2403sp4_6_6_scx \
+  --plan full \
+  --baseline default \
+  --candidate scx_agent_classed \
+  --parallel 1
+```
+
+上面的 paired run 比较同一 openEuler 内核下的 scheduler。比较 Linux 6.18 与
+openEuler 时，必须在两个 profile 中用相同 scheduler、plan、CPU pinning、VM
+规格和运行次数分别执行，再离线比较结果：
+
+```bash
+python3 bench/scripts/run.py \
+  --config bench/configs/local_config \
+  --plan full --scheduler default \
+  --output bench/results/kernel_compare/linux_6_18_default
+
+python3 bench/scripts/run.py \
+  --config bench/configs/local_profiles/oe2403sp4_6_6_scx \
+  --plan full --scheduler default \
+  --output bench/results/kernel_compare/oe2403sp4_6_6_default
+
+python3 -m bench.analysis.run \
+  --baseline bench/results/kernel_compare/linux_6_18_default \
+  --candidate bench/results/kernel_compare/oe2403sp4_6_6_default \
+  --output bench/results/kernel_compare/default_analysis
+```
+
+每个 `result.json` 和 `system_metadata.json` 都记录实际 `uname`、`/proc/version`、
+sched_ext 状态、BTF 是否存在、关键 config 和 `/proc/config.gz` SHA256。分析前应先
+确认两个结果目录的 `system.release` 分别是预期的 6.18 和 openEuler 6.6。
+
 ## 依赖
 
 需要：
@@ -67,7 +185,7 @@ python3 -m bench.env restore
 - 可由 libvirt 直接启动的内核镜像
 - 可通过 SSH 登录的 base qcow2 guest image
 - 放在 `bench/workloads/` 下的 benchmark 程序
-- 如果使用 `kind: scx`，需要放在 `bench/schedulers/` 下的调度器程序
+- 如果使用 `kind: scx`，需要先构建对应的 Cargo scheduler
 
 `bench.env init` 会检查这些依赖；缺依赖时默认尝试通过 apt 安装。
 如果不希望脚本安装系统包，可以加 `--no-install-deps`。
@@ -80,7 +198,17 @@ cargo build --release --manifest-path schedule/scx_agent_classed_mcp/Cargo.toml
 ```
 
 对应产物位于各自项目的 `target/release/`，`example_config/` 不再从
-`schedule/scx/target/` 查找这两个自定义产物。
+其他源码目录查找这两个自定义产物。`scx_agent_classed` 使用的
+`scx_stats`、`scx_stats_derive`、`scx_utils` 和构建依赖 `scx_cargo` 均在其
+`Cargo.toml` 中直接依赖官方 `https://github.com/sched-ext/scx.git`。依赖来源是
+`main` 主线，当前固定到 commit
+`96e4f928a2d3c84170548f0b552705544f27f2b2`，由 Cargo 下载到用户缓存；仓库不包含
+上游 scx 源码副本。固定 SHA 与 `--locked` 确保构建不会随远端 main 自动漂移：
+
+```bash
+cargo build --locked --release \
+  --manifest-path schedule/scx_agent_classed/Cargo.toml
+```
 
 ## 拉取和构建 Workload
 
@@ -452,8 +580,8 @@ baseline 和 candidate 都可以是 `scx` 调度器。
 ```bash
 python3 bench/scripts/run.py \
   --plan smoke \
-  --baseline scx_rlfifo \
-  --candidate scx_rlfifo \
+  --baseline scx_agent_classed \
+  --candidate scx_agent_classed \
   --baseline-treatment control \
   --candidate-treatment agent_tuned
 ```

@@ -90,6 +90,8 @@ class ConfigDirectoryWritingTest(unittest.TestCase):
             kernel = kernel_source / "arch" / "x86" / "boot" / "bzImage"
             kernel.parent.mkdir(parents=True)
             kernel.write_text("kernel", encoding="utf-8")
+            kernel_config = kernel_source / ".config"
+            kernel_config.write_text("CONFIG_SCHED_CLASS_EXT=y\n", encoding="utf-8")
             ssh_key = root / "id_ed25519"
             ssh_key.write_text("key", encoding="utf-8")
             workdir = root / "workdir"
@@ -111,6 +113,8 @@ class ConfigDirectoryWritingTest(unittest.TestCase):
             loaded = load_config(target)
             kernel_args = loaded["benches"]["kernel_build_bzimage"]["measurement"]["args"]
             self.assertIn(str(kernel_source), kernel_args)
+            self.assertIn(str(kernel_config), kernel_args)
+            self.assertEqual(loaded["libvirt"]["kernel_config"], str(kernel_config))
             self.assertIn("treatments", loaded)
 
     def test_writer_preserves_all_owned_sections(self) -> None:

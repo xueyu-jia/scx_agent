@@ -132,11 +132,19 @@ class BenchCommandValidationTest(unittest.TestCase):
             }
         }
 
-        _patch_kernel_build_source(config, Path("/kernel/source"))
+        _patch_kernel_build_source(
+            config,
+            Path("/kernel/source"),
+            Path("/kernel/build/.config"),
+        )
 
         self.assertEqual(
             config["benches"]["kernel_build_bzimage"]["measurement"]["args"][2],
             "/kernel/source",
+        )
+        self.assertEqual(
+            config["benches"]["kernel_build_bzimage"]["measurement"]["args"][-2:],
+            ["--config", "/kernel/build/.config"],
         )
 
 

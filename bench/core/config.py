@@ -79,7 +79,9 @@ VALID_LIBVIRT_KEYS = {
     "uri",
     "kernel",
     "kernel_args",
+    "kernel_config",
     "kernel_source",
+    "sync_kernel_source",
     "initrd",
     "root_image",
     "runtime_dir",
@@ -281,6 +283,17 @@ def _validate_libvirt(config: dict[str, Any]) -> None:
         raise ConfigError(f"libvirt.kernel_source does not exist: {kernel_source}")
     if not (Path(kernel_source) / "tools" / "perf").exists():
         raise ConfigError(f"libvirt.kernel_source does not contain tools/perf: {kernel_source}")
+
+    kernel_config = libvirt.get("kernel_config")
+    if kernel_config is not None:
+        if not isinstance(kernel_config, str):
+            raise ConfigError("libvirt.kernel_config must be a string or null")
+        if not Path(kernel_config).is_file():
+            raise ConfigError(f"libvirt.kernel_config does not exist: {kernel_config}")
+
+    sync_kernel_source = libvirt.get("sync_kernel_source", False)
+    if not isinstance(sync_kernel_source, bool):
+        raise ConfigError("libvirt.sync_kernel_source must be a boolean")
 
     network = libvirt.get("network", "default")
     if network is not None and not isinstance(network, str):

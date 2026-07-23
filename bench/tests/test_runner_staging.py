@@ -52,8 +52,8 @@ class RunnerSchedulerStagingTest(unittest.TestCase):
 
     def test_relative_host_path_is_resolved_from_repository_root(self) -> None:
         self.assertEqual(
-            _resolve_host_path("schedule/scx"),
-            (REPO_ROOT / Path("schedule/scx")).resolve(),
+            _resolve_host_path("schedule/scx_agent_classed"),
+            (REPO_ROOT / Path("schedule/scx_agent_classed")).resolve(),
         )
 
     def test_scheduler_support_files_are_staged_and_hashed(self) -> None:

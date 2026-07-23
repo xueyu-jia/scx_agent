@@ -1037,7 +1037,7 @@ dependencies = [
 [[package]]
 name = "scx_cargo"
 version = "1.1.2"
-source = "git+https://github.com/xueyu-jia/scx.git?rev=0c3841b2b2f033f1701a9ee06dd42d32ceee6744#0c3841b2b2f033f1701a9ee06dd42d32ceee6744"
+source = "git+https://github.com/sched-ext/scx.git?rev=96e4f928a2d3c84170548f0b552705544f27f2b2#96e4f928a2d3c84170548f0b552705544f27f2b2"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -1058,7 +1058,7 @@ dependencies = [
 [[package]]
 name = "scx_stats"
 version = "1.1.2"
-source = "git+https://github.com/xueyu-jia/scx.git?rev=0c3841b2b2f033f1701a9ee06dd42d32ceee6744#0c3841b2b2f033f1701a9ee06dd42d32ceee6744"
+source = "git+https://github.com/sched-ext/scx.git?rev=96e4f928a2d3c84170548f0b552705544f27f2b2#96e4f928a2d3c84170548f0b552705544f27f2b2"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -1074,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "scx_stats_derive"
 version = "1.1.2"
-source = "git+https://github.com/xueyu-jia/scx.git?rev=0c3841b2b2f033f1701a9ee06dd42d32ceee6744#0c3841b2b2f033f1701a9ee06dd42d32ceee6744"
+source = "git+https://github.com/sched-ext/scx.git?rev=96e4f928a2d3c84170548f0b552705544f27f2b2#96e4f928a2d3c84170548f0b552705544f27f2b2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1086,7 +1086,7 @@ dependencies = [
 [[package]]
 name = "scx_utils"
 version = "1.1.2"
-source = "git+https://github.com/xueyu-jia/scx.git?rev=0c3841b2b2f033f1701a9ee06dd42d32ceee6744#0c3841b2b2f033f1701a9ee06dd42d32ceee6744"
+source = "git+https://github.com/sched-ext/scx.git?rev=96e4f928a2d3c84170548f0b552705544f27f2b2#96e4f928a2d3c84170548f0b552705544f27f2b2"
 dependencies = [
  "anyhow",
  "bindgen",

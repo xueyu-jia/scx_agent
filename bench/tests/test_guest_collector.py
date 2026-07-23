@@ -260,6 +260,11 @@ assert Path(os.environ["SCX_BENCH_WORKDIR"]) == Path.cwd()
                     warmup=python_command(warmup_source),
                 )
             )
+            metadata = json.loads(
+                (root / "output" / "system_metadata.json").read_text()
+            )
+            self.assertEqual(metadata["release"], result["system"]["release"])
+            self.assertIn("vmlinux_btf", metadata)
 
             self.assertEqual(returncode, 0)
             self.assertEqual(result["status"], "PASS")

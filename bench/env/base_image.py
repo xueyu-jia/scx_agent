@@ -287,6 +287,8 @@ def _initialize_base_vm(
         libvirt,
         host,
     )
+    if libvirt.get("sync_kernel_source", False):
+        _sync_kernel_source_to_guest(libvirt, host)
     _ssh(libvirt, host, "sync && poweroff", check=False)
     time.sleep(5)
     _run_sudo(
@@ -371,6 +373,54 @@ def _sync_repo_to_guest(
     return wrappers_before, wrappers_after, guest_wrappers_match
 
 
+def _sync_kernel_source_to_guest(libvirt: dict[str, Any], host: str) -> None:
+    source = Path(libvirt["kernel_source"]).expanduser().resolve()
+    if not source.is_dir() or source == Path("/"):
+        raise RuntimeError(f"invalid kernel source for guest sync: {source}")
+    if not (source / "Makefile").is_file() or not (source / "tools" / "perf").is_dir():
+        raise RuntimeError(f"kernel source is incomplete: {source}")
+
+    destination = str(source)
+    _ssh(libvirt, host, f"mkdir -p {shlex.quote(destination)}")
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
+        with tarfile.open(tmp.name, "w:gz", compresslevel=1) as archive:
+            archive.add(source, arcname=".", filter=_kernel_source_tar_filter)
+        _scp(libvirt, host, Path(tmp.name), "/tmp/scx-kernel-source.tar.gz")
+    _ssh(
+        libvirt,
+        host,
+        f"tar -xzf /tmp/scx-kernel-source.tar.gz -C {shlex.quote(destination)} && "
+        "rm -f /tmp/scx-kernel-source.tar.gz",
+    )
+
+    kernel_config_value = libvirt.get("kernel_config")
+    if kernel_config_value:
+        kernel_config = Path(kernel_config_value).expanduser().resolve()
+        try:
+            kernel_config.relative_to(source)
+        except ValueError:
+            remote_config = str(kernel_config)
+            _ssh(libvirt, host, f"mkdir -p {shlex.quote(str(kernel_config.parent))}")
+            _scp(libvirt, host, kernel_config, remote_config)
+
+    _ssh(
+        libvirt,
+        host,
+        f"test -f {shlex.quote(destination + '/Makefile')} && "
+        f"test -d {shlex.quote(destination + '/tools/perf')}",
+    )
+
+
+def _kernel_source_tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    name = info.name
+    while name.startswith("./"):
+        name = name[2:]
+    parts = Path(name).parts
+    if ".git" in parts or "__pycache__" in parts:
+        return None
+    return info
+
+
 def _verify_guest_wrapper_snapshot(
     libvirt: dict[str, Any],
     host: str,
@@ -449,7 +499,9 @@ def _write_base_image_manifest(
 
 
 def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-    name = info.name.lstrip("./")
+    name = info.name
+    while name.startswith("./"):
+        name = name[2:]
     parts = Path(name).parts
     if ".git" in parts:
         return None
@@ -459,20 +511,22 @@ def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
         return None
     if name == "bench/workloads/build" or name.startswith("bench/workloads/build/"):
         return None
-    if name == "schedule/scx/target":
-        return info
-    if name == "schedule/scx/target/release":
-        return info
-    if name.startswith("schedule/scx/target/release/"):
-        relative = Path(name).relative_to("schedule/scx/target/release")
-        if len(relative.parts) == 1 and info.isfile() and info.mode & 0o111:
-            filename = relative.parts[0]
-            if filename.startswith("scx"):
-                return info
-        return None
+    scheduler_targets = (
+        "schedule/scx_agent_classed/target",
+        "schedule/scx_agent_classed_mcp/target",
+    )
+    for target in scheduler_targets:
+        if name in {target, f"{target}/release"}:
+            return info
+        if name.startswith(f"{target}/release/"):
+            relative = Path(name).relative_to(f"{target}/release")
+            if len(relative.parts) == 1 and info.isfile() and info.mode & 0o111:
+                if relative.name.startswith("scx"):
+                    return info
+            return None
+        if name.startswith(f"{target}/"):
+            return None
     if name == "tuning_agent/target" or name.startswith("tuning_agent/target/"):
-        return None
-    if name.startswith("schedule/scx/target/"):
         return None
     if "__pycache__" in parts:
         return None
