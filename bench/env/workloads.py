@@ -8,9 +8,10 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(ROOT := Path(__file__).resolve().parents[2]))
-from bench.config.parser import load_config
+from bench.core.config import load_config
 
 
 SRC = ROOT / "bench" / "workloads" / "src"
@@ -67,6 +68,11 @@ WORKLOADS = {
     ),
     "perf": Workload(
         name="perf",
+        repo="",
+        ref="",
+    ),
+    "bpftool": Workload(
+        name="bpftool",
         repo="",
         ref="",
     ),
@@ -136,7 +142,10 @@ WORKLOADS = {
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Fetch and build benchmark workloads")
+    parser = argparse.ArgumentParser(
+        prog="python3 -m bench.env workloads",
+        description="Fetch and build benchmark workloads",
+    )
     parser.add_argument(
         "workloads",
         nargs="*",
@@ -146,29 +155,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config",
         default=str(ROOT / "bench" / "configs" / "local.config"),
-        help="benchmark config path; used to find libvirt.kernel_source for perf",
+        help="benchmark config path; used to build perf and bpftool from kernel_source",
     )
     parser.add_argument("--force", action="store_true", help="delete existing source before cloning")
     args = parser.parse_args(argv)
     config = load_config(args.config)
+    prepare_workloads(config, args.workloads, force=args.force)
 
+    print(f"workload binaries: {BIN}")
+    return 0
+
+
+def prepare_workloads(
+    config: dict[str, Any],
+    workload_names: list[str],
+    *,
+    force: bool = False,
+) -> None:
     SRC.mkdir(parents=True, exist_ok=True)
     BIN.mkdir(parents=True, exist_ok=True)
     BUILD.mkdir(parents=True, exist_ok=True)
 
-    for name in args.workloads:
+    for name in workload_names:
         if name not in WORKLOADS:
             raise SystemExit(f"unknown workload: {name}")
         workload = WORKLOADS[name]
         if name == "perf":
             build_perf(Path(config["libvirt"]["kernel_source"]))
             continue
+        if name == "bpftool":
+            build_bpftool(Path(config["libvirt"]["kernel_source"]))
+            continue
         source = (
             ROOT / workload.local_path
             if workload.source_type == "local"
             else SRC / workload.name
         )
-        if args.force and source.exists() and workload.source_type != "local":
+        if force and source.exists() and workload.source_type != "local":
             shutil.rmtree(source)
         if workload.source_type == "local":
             if not source.exists():
@@ -178,10 +201,6 @@ def main(argv: list[str] | None = None) -> int:
         else:
             clone_or_update(workload, source)
         build(workload.name, source)
-
-    print(f"workload binaries: {BIN}")
-    return 0
-
 
 def fetch_archive(workload: Workload, source: Path) -> None:
     url = workload.archive_url
@@ -307,6 +326,41 @@ def build_perf(kernel_source: Path) -> None:
     install(build_dir / "perf", BIN / "perf")
 
 
+def build_bpftool(kernel_source: Path) -> None:
+    source = kernel_source / "tools" / "bpf" / "bpftool"
+    if not source.exists():
+        raise RuntimeError(f"kernel source does not contain tools/bpf/bpftool: {kernel_source}")
+
+    build_dir = BUILD / "bpftool"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True)
+    llvm_strip = shutil.which("llvm-strip")
+    if llvm_strip is None:
+        llvm_config = shutil.which("llvm-config")
+        if llvm_config is not None:
+            bindir = subprocess.check_output(
+                [llvm_config, "--bindir"], text=True
+            ).strip()
+            candidate = Path(bindir) / "llvm-strip"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                llvm_strip = str(candidate)
+    if llvm_strip is None:
+        raise RuntimeError("building bpftool requires llvm-strip or llvm-config")
+    run(
+        [
+            "make",
+            "-C",
+            str(source),
+            f"OUTPUT={build_dir}/",
+            f"LLVM_STRIP={llvm_strip}",
+            "feature-llvm=0",
+            f"-j{os.cpu_count() or 1}",
+        ]
+    )
+    install(build_dir / "bpftool", BIN / "bpftool")
+
+
 def find_executable(root: Path, name: str) -> Path:
     for path in root.rglob(name):
         if path.is_file() and os.access(path, os.X_OK):
@@ -363,7 +417,10 @@ def build_pmbench(source: Path) -> None:
 def build_mutex_benchmark(source: Path) -> None:
     benchmark_dir = SRC / "google-benchmark"
     if not benchmark_dir.exists():
-        raise RuntimeError("google-benchmark must be fetched first: fetch_workloads.py google-benchmark")
+        raise RuntimeError(
+            "google-benchmark must be fetched first: "
+            "python3 -m bench.env workloads google-benchmark"
+        )
     build_dir = benchmark_dir / "build"
     if not (build_dir / "src" / "libbenchmark.a").exists():
         build_dir.mkdir(parents=True, exist_ok=True)

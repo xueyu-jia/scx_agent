@@ -9,7 +9,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+repo_root = Path(os.environ.get("SCX_BENCH_WORKDIR", Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(repo_root))
 from bench.benchmarks.schbench import (
     parse_metrics as parse_schbench_metrics,
     parse_section_metrics,

@@ -105,12 +105,16 @@ def compare_paired_runs(
 
     pairs = []
     for run_index in sorted(baseline):
-        baseline_value = _number(baseline[run_index].metrics.get(metric))
-        candidate_value = _number(candidate[run_index].metrics.get(metric))
+        baseline_run = baseline[run_index]
+        candidate_run = candidate[run_index]
+        if baseline_run.status != "PASS" or candidate_run.status != "PASS":
+            continue
+        baseline_value = _number(baseline_run.metrics.get(metric))
+        candidate_value = _number(candidate_run.metrics.get(metric))
         if baseline_value is None or candidate_value is None:
             continue
         delta = candidate_value - baseline_value
-        identity = baseline[run_index]
+        identity = baseline_run
         pairs.append(
             {
                 "baseline": baseline_label,

@@ -53,6 +53,7 @@ RESERVED_GUEST_ENV = {
     "SCX_BENCH_VARIANT",
     "SCX_BENCH_TREATMENT",
     "SCX_BENCH_TREATMENT_OUTCOME",
+    "SCX_BENCH_WORKDIR",
 }
 PASS = "PASS"
 SCHEDULER_FAILED = "SCHEDULER_FAILED"
@@ -733,6 +734,7 @@ class GuestExecutor:
         for name in RESERVED_GUEST_ENV:
             env.pop(name, None)
         env["SCX_BENCH_OUT"] = str(output_dir)
+        env["SCX_BENCH_WORKDIR"] = str(self.plan.workdir)
         if include_run_context:
             env.update(
                 {

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bench.metrics import load_perf_stat_metrics
+from bench.core.metrics import load_perf_stat_metrics
 
 
 class PerfStatMetricsTest(unittest.TestCase):
@@ -43,6 +43,18 @@ class PerfStatMetricsTest(unittest.TestCase):
         self.assertEqual(metrics["cycles"], 0.0)
         self.assertEqual(metrics["perf_hardware_invalid_events"], 2.0)
         self.assertEqual(metrics["perf_hardware_events_valid"], 0.0)
+
+    def test_normalizes_raw_nanosecond_task_clock_to_milliseconds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "perf.csv"
+            path.write_text(
+                "116910674270,,task-clock,116910674270,100.00,3.939,CPUs utilized\n",
+                encoding="utf-8",
+            )
+
+            metrics = load_perf_stat_metrics(path)
+
+        self.assertAlmostEqual(metrics["task_clock_msec"], 116_910.67427)
 
 
 if __name__ == "__main__":

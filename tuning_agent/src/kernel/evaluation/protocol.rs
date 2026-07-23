@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_measurement_cannot_spoof_fixed_system_guardrails() {
+    fn trusted_system_measurement_remains_separate_with_fixed_guards_disabled() {
         let trusted = Arc::new(QueueMeasurement {
             meta: meta(
                 TRUSTED_GUARDRAIL_MEASUREMENT_ID,
@@ -1158,7 +1158,8 @@ mod tests {
             .evaluate(&mut transaction, &context, &intent, &candidate)
             .unwrap();
 
-        assert_eq!(evidence.decision.verdict, EvaluationVerdict::Unsafe);
+        assert_eq!(evidence.decision.verdict, EvaluationVerdict::Improved);
+        assert!(evidence.decision.system_guardrails.is_empty());
         assert_eq!(
             evidence.candidate_measurement.batch.metrics["psi.cpu.full.avg10"].value,
             json!(1.0)

@@ -50,3 +50,22 @@ enabled = true
 #
 # [mcp.servers.env]
 # RUST_LOG = "warn"
+
+# scx_agent_classed dynamic rule provider. The scheduler remains the only
+# writer of both the learned rule file and the BPF map.
+# [[mcp.servers]]
+# id = "scx-agent-classed"
+# enabled = true
+# command = "/usr/local/libexec/scx_agent_classed_mcp"
+# args = []
+# request_timeout_ms = 30000
+# allowed_capabilities = [
+#   "rules.snapshot.v1",
+#   "rule.upsert.v1",
+#   "classification.integrity.v1",
+# ]
+# allow_mutations = true
+#
+# [mcp.servers.env]
+# SCX_AGENT_CLASSED_CONTROL_SOCKET = "/run/scx_agent_classed/control.sock"
+# SCX_AGENT_CLASSED_MCP_JOURNAL = "/var/lib/scx_agent_classed/mcp-operations.json"

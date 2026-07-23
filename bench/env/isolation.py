@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from bench.config.parser import ConfigError, expand_plan, load_config, parse_cpu_list
+from bench.core.config import ConfigError, expand_plan, load_config, parse_cpu_list
 
 
 STATE_PATH = Path("/var/lib/scx-bench/isolation-state.json")
@@ -34,7 +34,10 @@ BOOT_ARG_KEYS = {
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Prepare or restore host isolation for scx bench")
+    parser = argparse.ArgumentParser(
+        prog="python3 -m bench.env isolation",
+        description="Prepare or restore host isolation for scx bench",
+    )
     parser.add_argument("action", choices=("prepare", "restore", "status", "apply-runtime"))
     parser.add_argument("--config", default="bench/configs/local.config")
     parser.add_argument("--plan", help="only use machines referenced by this plan")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import hashlib
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,9 +11,12 @@ from unittest.mock import Mock, patch
 
 import yaml
 
-from bench.collectors.guest import build_guest_run_plan
-from bench.config.parser import RunSpec
-from bench.runner import (
+from bench.core.guest_plan import build_guest_run_plan
+from bench.core.config import RunSpec
+from bench.core.runner import (
+    GUEST_SCHEDULER_KCONFIG_PATH,
+    GUEST_SCHEDULER_PATH,
+    GUEST_SCHEDULER_SUPPORT_DIR,
     REPO_ROOT,
     _guest_scheduler,
     _guest_treatment,
@@ -20,6 +25,7 @@ from bench.runner import (
     _resolve_host_path,
     _run_libvirt,
     _run_one,
+    _stage_scheduler,
 )
 from bench.scripts.run import _build_pairs, _variant, main as run_main
 
@@ -30,13 +36,18 @@ class RunnerSchedulerStagingTest(unittest.TestCase):
             "kind": "scx",
             "command": "guest/scx_test",
             "host_command": "build/scx_test",
+            "host_kconfig": "build/kernel.config",
+            "host_support_files": ["build/scx_agent_classed_mcp"],
             "args": ["--test"],
         }
 
         guest = _guest_scheduler(scheduler)
 
-        self.assertEqual(guest["command"], "/tmp/scx-bench-scheduler")
+        self.assertEqual(guest["command"], GUEST_SCHEDULER_PATH)
         self.assertEqual(guest["args"], ["--test"])
+        self.assertNotIn("host_command", guest)
+        self.assertNotIn("host_kconfig", guest)
+        self.assertNotIn("host_support_files", guest)
         self.assertEqual(scheduler["command"], "guest/scx_test")
 
     def test_relative_host_path_is_resolved_from_repository_root(self) -> None:
@@ -44,6 +55,111 @@ class RunnerSchedulerStagingTest(unittest.TestCase):
             _resolve_host_path("schedule/scx"),
             (REPO_ROOT / Path("schedule/scx")).resolve(),
         )
+
+    def test_scheduler_support_files_are_staged_and_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            scheduler = root / "scheduler"
+            scheduler.write_bytes(b"scheduler-binary")
+            os.chmod(scheduler, 0o755)
+            kconfig = root / "kernel.config"
+            kconfig.write_bytes(b"CONFIG_SCHED_CLASS_EXT=y\n")
+            support = root / "scx_agent_classed_mcp"
+            support.write_bytes(b"mcp-provider")
+
+            with patch("bench.core.runner._scp_to_guest") as scp, patch(
+                "bench.core.runner._run_command"
+            ):
+                artifact = _stage_scheduler(
+                    {"ssh_user": "root", "ssh_key": "/tmp/test-key"},
+                    "192.0.2.1",
+                    22,
+                    str(scheduler),
+                    str(kconfig),
+                    [str(support)],
+                    [],
+                    [],
+                )
+
+        self.assertEqual(artifact["guest_path"], GUEST_SCHEDULER_PATH)
+        self.assertEqual(
+            artifact["sha256"], hashlib.sha256(b"scheduler-binary").hexdigest()
+        )
+        self.assertEqual(
+            artifact["kconfig"],
+            {
+                "source": str(kconfig),
+                "guest_path": GUEST_SCHEDULER_KCONFIG_PATH,
+                "sha256": hashlib.sha256(b"CONFIG_SCHED_CLASS_EXT=y\n").hexdigest(),
+            },
+        )
+        self.assertEqual(
+            artifact["support_files"][support.name],
+            {
+                "source": str(support),
+                "guest_path": f"{GUEST_SCHEDULER_SUPPORT_DIR}/{support.name}",
+                "sha256": hashlib.sha256(b"mcp-provider").hexdigest(),
+            },
+        )
+        self.assertEqual(
+            [call.args[4] for call in scp.call_args_list],
+            [
+                GUEST_SCHEDULER_PATH,
+                GUEST_SCHEDULER_KCONFIG_PATH,
+                f"{GUEST_SCHEDULER_SUPPORT_DIR}/{support.name}",
+            ],
+        )
+
+    def test_run_metadata_records_scheduler_artifacts(self) -> None:
+        scheduler = {
+            "kind": "scx",
+            "command": "guest/scx_test",
+            "host_command": "build/scx_test",
+            "host_support_files": ["build/scx_agent_classed_mcp"],
+        }
+        scheduler_artifact = {
+            "guest_path": GUEST_SCHEDULER_PATH,
+            "sha256": "scheduler-sha256",
+            "support_files": {
+                "scx_agent_classed_mcp": {
+                    "guest_path": f"{GUEST_SCHEDULER_SUPPORT_DIR}/scx_agent_classed_mcp",
+                    "sha256": "support-sha256",
+                }
+            },
+        }
+        completed = {
+            "status": None,
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "scheduler_artifact": scheduler_artifact,
+        }
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("bench.core.runner._preflight_machine"),
+            patch("bench.core.runner._run_libvirt", return_value=completed) as run_libvirt,
+            patch("bench.core.runner._read_guest_result", return_value={"status": "PASS"}),
+            patch("bench.core.runner.load_bench_metrics", return_value={"metrics": {}}),
+            patch("bench.core.runner.load_perf_stat_metrics", return_value={}),
+        ):
+            result = _run_one(
+                RunnerExecutionPlanTest()._spec(),
+                Path(temp_dir),
+                False,
+                "candidate",
+                scheduler,
+                None,
+                30,
+                None,
+            )
+
+        self.assertEqual(result["scheduler_artifact"], scheduler_artifact)
+        self.assertEqual(
+            run_libvirt.call_args.kwargs["scheduler_host_support_files"],
+            ["build/scx_agent_classed_mcp"],
+        )
+        self.assertNotIn("host_command", result["execution_plan"]["scheduler"])
+        self.assertNotIn("host_support_files", result["execution_plan"]["scheduler"])
 
     def test_guest_treatment_uses_staged_command_without_mutating_input(self) -> None:
         treatment = {
@@ -134,8 +250,8 @@ class RunnerExecutionPlanTest(unittest.TestCase):
         spec = self._spec()
         scheduler = {"kind": "builtin"}
         with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "bench.runner.write_guest_plan"
-        ) as write_guest, patch("bench.runner._run_libvirt") as run_libvirt:
+            "bench.core.runner.write_guest_plan"
+        ) as write_guest, patch("bench.core.runner._run_libvirt") as run_libvirt:
             result = _run_one(
                 spec,
                 Path(temp_dir),
@@ -268,9 +384,9 @@ class RunnerExecutionPlanTest(unittest.TestCase):
         }
         with (
             tempfile.TemporaryDirectory() as temp_dir,
-            patch("bench.runner._preflight_machine"),
-            patch("bench.runner._run_libvirt", return_value=libvirt_result),
-            patch("bench.runner._read_guest_result", return_value=guest_result),
+            patch("bench.core.runner._preflight_machine"),
+            patch("bench.core.runner._run_libvirt", return_value=libvirt_result),
+            patch("bench.core.runner._read_guest_result", return_value=guest_result),
         ):
             result = _run_one(
                 self._spec(),
@@ -317,7 +433,7 @@ class RunnerGuestTransferTest(unittest.TestCase):
             executor={},
         )
         with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "bench.runner._run_libvirt"
+            "bench.core.runner._run_libvirt"
         ) as run_libvirt:
             result = _run_one(
                 spec,
@@ -357,15 +473,15 @@ class RunnerGuestTransferTest(unittest.TestCase):
         run_guest = Mock()
         with (
             tempfile.TemporaryDirectory() as temp_dir,
-            patch("bench.runner._prepare_runtime_dir"),
-            patch("bench.runner._create_overlay"),
-            patch("bench.runner._run_command"),
-            patch("bench.runner._apply_host_thread_pinning", return_value={}),
-            patch("bench.runner._wait_for_ssh", return_value=("192.0.2.1", 22)),
-            patch("bench.runner._scp_to_guest", scp),
-            patch("bench.runner._run_guest_command", run_guest),
-            patch("bench.runner._cleanup_domain"),
-            patch("bench.runner._cleanup_runtime_dir"),
+            patch("bench.core.runner._prepare_runtime_dir"),
+            patch("bench.core.runner._create_overlay"),
+            patch("bench.core.runner._run_command"),
+            patch("bench.core.runner._apply_host_thread_pinning", return_value={}),
+            patch("bench.core.runner._wait_for_ssh", return_value=("192.0.2.1", 22)),
+            patch("bench.core.runner._scp_to_guest", scp),
+            patch("bench.core.runner._run_guest_command", run_guest),
+            patch("bench.core.runner._cleanup_domain"),
+            patch("bench.core.runner._cleanup_runtime_dir"),
         ):
             root = Path(temp_dir)
             result = _run_libvirt(
@@ -498,6 +614,35 @@ class RunScriptTreatmentIntegrationTest(unittest.TestCase):
             self.assertEqual(metadata["candidate"], "default__agent")
             self.assertTrue((output / "runs" / "default__control").is_dir())
             self.assertTrue((output / "runs" / "default__agent").is_dir())
+
+    def test_standalone_mode_reuses_run_entrypoint(self) -> None:
+        spec = RunnerExecutionPlanTest()._spec()
+        config = {"schedulers": {"default": {"kind": "builtin"}}}
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("bench.scripts.run.load_config", return_value=config),
+            patch("bench.scripts.run.expand_plan", return_value=[spec]),
+            patch("bench.scripts.run.run_specs") as run_specs,
+            patch("bench.scripts.run._result_statuses", return_value=["DRY_RUN"]),
+            redirect_stdout(io.StringIO()),
+        ):
+            returncode = run_main(
+                [
+                    "--config",
+                    str(Path(temp_dir) / "config.yaml"),
+                    "--plan",
+                    "warmup-test",
+                    "--scheduler",
+                    "default",
+                    "--output",
+                    str(Path(temp_dir) / "results"),
+                    "--dry-run",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(run_specs.call_count, 1)
+        self.assertEqual(run_specs.call_args.kwargs["label"], "default")
 
 
 if __name__ == "__main__":

@@ -28,9 +28,9 @@
 git clone <repo>
 cd scx_agent
 
-python3 bench/scripts/prepare_env.py init --kernel-source ~/linux-6.18
+python3 -m bench.env init --kernel-source ~/linux-6.18
 sudo reboot
-python3 bench/scripts/prepare_env.py verify
+python3 -m bench.env verify
 
 python3 bench/scripts/run.py \
   --plan smoke \
@@ -38,22 +38,21 @@ python3 bench/scripts/run.py \
   --candidate scx_rlfifo
 ```
 
-`prepare_env.py init` 会生成本机专属配置：
+`bench.env init` 会生成本机专属配置：
 
 ```text
 bench/configs/local.config
 ```
 
-它也会调用 `libvirt_env.py` 备份并修改 `/etc/libvirt/qemu.conf`，让 QEMU
+它也会通过 `env/libvirt.py` 备份并修改 `/etc/libvirt/qemu.conf`，让 QEMU
 以当前测试用户运行，避免 `run.py` 读取 VM runtime 文件时需要 sudo。
 恢复所有由初始化流程管理的 host 设置：
 
 ```bash
-python3 bench/scripts/prepare_env.py restore
+python3 -m bench.env restore
 ```
 
-`local.config` 不提交到 git。`run.py`、`isolation.py` 和
-`fetch_workloads.py` 默认都使用它。
+`local.config` 不提交到 git。`run.py` 和 `bench.env` 默认都使用它。
 
 ## 依赖
 
@@ -67,8 +66,18 @@ python3 bench/scripts/prepare_env.py restore
 - 放在 `bench/workloads/` 下的 benchmark 程序
 - 如果使用 `kind: scx`，需要放在 `bench/schedulers/` 下的调度器程序
 
-第一版 `prepare_env.py init` 会检查这些依赖；缺依赖时默认尝试通过 apt 安装。
+`bench.env init` 会检查这些依赖；缺依赖时默认尝试通过 apt 安装。
 如果不希望脚本安装系统包，可以加 `--no-install-deps`。
+
+自定义调度器和 MCP adapter 是两个独立的 Cargo 项目，分别构建：
+
+```bash
+cargo build --release --manifest-path schedule/scx_agent_classed/Cargo.toml
+cargo build --release --manifest-path schedule/scx_agent_classed_mcp/Cargo.toml
+```
+
+对应产物位于各自项目的 `target/release/`，`example.config` 不再从
+`schedule/scx/target/` 查找这两个自定义产物。
 
 ## 拉取和构建 Workload
 
@@ -101,12 +110,12 @@ tail latency:
 拉取并构建：
 
 ```bash
-python3 bench/scripts/fetch_workloads.py \
-  hackbench schbench stress-ng fio redis rt-tests will-it-scale perf
+python3 -m bench.env workloads \
+  hackbench schbench stress-ng fio redis rt-tests will-it-scale perf bpftool
 ```
 
-`perf` 会根据配置文件中的 `libvirt.kernel_source` 从当前内核源码的
-`tools/perf` 构建：
+`perf` 和 `bpftool` 会根据配置文件中的 `libvirt.kernel_source` 从当前内核源码的
+`tools/perf`、`tools/bpf/bpftool` 构建：
 
 ```yaml
 libvirt:
@@ -145,14 +154,14 @@ It reports separate schbench wakeup/request percentiles alongside batch
 throughput from the same mixed run, making it useful for validating
 workload-class isolation and starvation behavior.
 
-通常不需要手动调用该脚本，`prepare_env.py init` 会自动调用。
+通常不需要手动执行，`bench.env init` 会自动准备 workload。
 
 benchmark wrapper 会随仓库一起固化到 base image，不会在每次 run 时覆盖。
 修改、增加或删除 `bench/benchmarks/` 下的文件后，必须重建镜像：
 
 ```bash
-python3 bench/scripts/prepare_env.py rebuild-image
-python3 bench/scripts/prepare_env.py verify
+python3 -m bench.env rebuild-image
+python3 -m bench.env verify
 ```
 
 构建完成后会在 qcow2 旁写入
@@ -177,7 +186,7 @@ bench/configs/local.config
 bench/configs/example.config
 ```
 
-`example.config` 不包含个人绝对路径，只作为 `prepare_env.py init` 生成
+`example.config` 不包含个人绝对路径，只作为 `bench.env init` 生成
 `local.config` 的模板。
 
 顶层结构：
@@ -284,6 +293,7 @@ SCX_BENCH_ROLE       baseline | candidate | standalone
 SCX_BENCH_VARIANT    <scheduler> 或 <scheduler>__<treatment>
 SCX_BENCH_TREATMENT  treatment 名；未配置时为空
 SCX_BENCH_OUT        当前阶段的产物目录
+SCX_BENCH_WORKDIR    guest 内的仓库工作目录
 ```
 
 Treatment 还会收到 `SCX_BENCH_TREATMENT_OUTCOME`。命令退出前必须在该路径
@@ -496,29 +506,29 @@ runner 在真实启动 VM 前会严格检查：
 查看当前隔离状态：
 
 ```bash
-python3 bench/scripts/isolation.py status
+python3 -m bench.env isolation status
 ```
 
 预览将要修改的 host 设置：
 
 ```bash
-python3 bench/scripts/isolation.py prepare \
+python3 -m bench.env isolation prepare \
   --dry-run
 ```
 
 准备隔离环境：
 
 ```bash
-sudo python3 bench/scripts/isolation.py prepare --no-reboot
+sudo python3 -m bench.env isolation prepare --no-reboot
 ```
 
-通常不需要手动执行，`prepare_env.py init` 会调用它，然后用户手动
+通常不需要手动执行，`bench.env init` 会调用它，然后用户手动
 `sudo reboot`。
 
 恢复原始 host 设置并自动重启：
 
 ```bash
-sudo python3 bench/scripts/isolation.py restore
+sudo python3 -m bench.env isolation restore
 ```
 
 隔离脚本会保存状态到：
@@ -747,6 +757,6 @@ paired/summary.csv
 - libvirt XML 会显式设置 `vcpupin`、`emulatorpin` 和可选的
   `iothreadpin`；启用 `pin_vhost_threads` 时，runner 会记录并尽量 pin
   host vhost 线程。
-- host CPU 隔离和固定频率需要先通过 `bench/scripts/isolation.py` 准备。
+- host CPU 隔离和固定频率需要先通过 `python3 -m bench.env isolation` 准备。
 - runner 会在真实运行前做严格 preflight 检查。
 - run.py 以 comparison pair 为单位调度，资源允许时可以并发运行多个 VM。

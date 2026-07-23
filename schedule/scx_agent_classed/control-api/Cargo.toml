@@ -1,0 +1,9 @@
+[package]
+name = "scx_agent_classed_control"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned control protocol for scx_agent_classed"
+license = "GPL-2.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

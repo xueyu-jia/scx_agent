@@ -1,0 +1,35 @@
+[package]
+name = "scx_agent_classed"
+version = "0.1.0"
+authors = ["sched_ext contributors"]
+edition = "2021"
+description = "Per-class, per-CPU DSQ scheduler for latency and batch workloads"
+license = "GPL-2.0-only"
+default-run = "scx_agent_classed"
+
+[dependencies]
+anyhow = "1"
+ctrlc = { version = "3", features = ["termination"] }
+clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
+crossbeam = "0.8"
+libbpf-rs = "=0.26.2"
+log = "0.4"
+scx_stats = { git = "https://github.com/xueyu-jia/scx.git", rev = "0c3841b2b2f033f1701a9ee06dd42d32ceee6744", version = "1.1.2" }
+scx_stats_derive = { git = "https://github.com/xueyu-jia/scx.git", rev = "0c3841b2b2f033f1701a9ee06dd42d32ceee6744", version = "1.1.2" }
+scx_utils = { git = "https://github.com/xueyu-jia/scx.git", rev = "0c3841b2b2f033f1701a9ee06dd42d32ceee6744", version = "1.1.2" }
+scx_agent_classed_control = { path = "control-api", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+simplelog = "0.12"
+socket2 = "0.6"
+
+[build-dependencies]
+scx_cargo = { git = "https://github.com/xueyu-jia/scx.git", rev = "0c3841b2b2f033f1701a9ee06dd42d32ceee6744", version = "1.1.2" }
+
+[features]
+enable_backtrace = []
+
+[workspace]
+members = ["control-api"]
+resolver = "2"

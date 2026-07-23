@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 import math
 import tempfile
 import unittest
@@ -102,6 +103,24 @@ class PairConstructionTest(unittest.TestCase):
 
         self.assertEqual(paired["pairs"], [])
         self.assertIsNone(paired["absolute"])
+
+    def test_failed_run_with_metrics_is_excluded_from_pairs(self) -> None:
+        failed = replace(
+            run("candidate", 2, throughput=1),
+            status="SCHEDULER_FAILED",
+            failure_reason="scheduler exited during measurement",
+        )
+        paired = compare_paired_runs(
+            [run("default", 1, throughput=100), run("default", 2, throughput=100)],
+            [run("candidate", 1, throughput=90), failed],
+            "throughput",
+            "higher",
+            "default",
+            "candidate",
+        )
+
+        self.assertEqual([row["run_index"] for row in paired["pairs"]], [1])
+        self.assertEqual(paired["percent"]["mean"], -10.0)
 
 
 class PairedStatisticsTest(unittest.TestCase):

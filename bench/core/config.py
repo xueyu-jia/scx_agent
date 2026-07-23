@@ -29,6 +29,7 @@ VALID_SCX_SCHEDULER_KEYS = {
     "command",
     "host_command",
     "host_kconfig",
+    "host_support_files",
     "args",
     "env",
     "settle_seconds",
@@ -57,6 +58,7 @@ RESERVED_GUEST_ENV = {
     "SCX_BENCH_VARIANT",
     "SCX_BENCH_TREATMENT",
     "SCX_BENCH_TREATMENT_OUTCOME",
+    "SCX_BENCH_WORKDIR",
 }
 VALID_EXECUTOR_KEYS = {
     "parallel",
@@ -325,6 +327,17 @@ def _validate_schedulers(config: dict[str, Any]) -> None:
             if host_kconfig is not None and host_command is None:
                 raise ConfigError(
                     f"schedulers.{scheduler_name}.host_kconfig requires host_command"
+                )
+            host_support_files = scheduler.get("host_support_files", [])
+            if not isinstance(host_support_files, list) or any(
+                not isinstance(item, str) or not item for item in host_support_files
+            ):
+                raise ConfigError(
+                    f"schedulers.{scheduler_name}.host_support_files must be a string list"
+                )
+            if host_support_files and host_command is None:
+                raise ConfigError(
+                    f"schedulers.{scheduler_name}.host_support_files requires host_command"
                 )
             args = scheduler.get("args", [])
             if not isinstance(args, list):

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree as ET
 
-from bench.collectors.guest import (
+from bench.core.guest_plan import (
     GUEST_EXECUTOR_PATH,
     GUEST_EXECUTOR_SOURCE,
     GUEST_OUTPUT_DIR,
@@ -22,15 +22,18 @@ from bench.collectors.guest import (
     build_guest_run_plan,
     write_guest_plan,
 )
-from bench.metrics import load_bench_metrics, load_perf_stat_metrics
+from bench.core.metrics import load_bench_metrics, load_perf_stat_metrics
 
-from bench.config.parser import RunSpec, parse_cpu_list
+from bench.core.config import RunSpec, parse_cpu_list
 
 
 _MANIFEST_LOCK = threading.Lock()
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_DIR = Path("/var/lib/libvirt/scx-bench-runs")
 RUNTIME_ISOLATION_REPORT = Path("/var/lib/scx-bench/runtime-isolation.json")
+GUEST_SCHEDULER_PATH = "/tmp/scx-bench-scheduler"
+GUEST_SCHEDULER_KCONFIG_PATH = "/tmp/scx-bench-kconfig"
+GUEST_SCHEDULER_SUPPORT_DIR = "/tmp/scx-bench-scheduler.d"
 GUEST_TREATMENT_PATH = "/tmp/scx-bench-treatment"
 GUEST_TREATMENT_SUPPORT_DIR = "/tmp/scx-bench-treatment.d"
 GUEST_BENCH_SUPPORT_DIR = "/tmp/scx-bench-workload.d"
@@ -217,6 +220,7 @@ def _run_one(
         guest_output_dir,
         scheduler_host_command=scheduler.get("host_command"),
         scheduler_host_kconfig=scheduler.get("host_kconfig"),
+        scheduler_host_support_files=scheduler.get("host_support_files", []),
         timeout=guest_plan.host_timeout_seconds(
             int(spec.libvirt.get("timeout_extra_seconds", 120))
         ),
@@ -242,6 +246,7 @@ def _run_one(
     host_thread_pinning = completed.get("host_thread_pinning", {})
     host_irq_delta = completed.get("host_irq_delta", {})
     guest_executor = completed.get("guest_executor", {})
+    scheduler_artifact = completed.get("scheduler_artifact", {})
     treatment_artifact = completed.get("treatment_artifact", {})
     benchmark_artifact = completed.get("benchmark_artifact", {})
 
@@ -272,6 +277,7 @@ def _run_one(
             "host_thread_pinning": host_thread_pinning,
             "host_irq_delta": host_irq_delta,
             "guest_executor": guest_executor,
+            "scheduler_artifact": scheduler_artifact,
             "treatment_artifact": treatment_artifact,
             "benchmark_artifact": benchmark_artifact,
             "finished_at": finished_at.isoformat(),
@@ -298,6 +304,7 @@ def _run_libvirt(
     boot_timeout: int,
     progress_interval: int,
     heartbeat: Callable[[float], None],
+    scheduler_host_support_files: list[str] | None = None,
     treatment_host_command: str | None = None,
     treatment_host_support_files: list[str] | None = None,
     bench_host_support_files: list[str] | None = None,
@@ -310,6 +317,7 @@ def _run_libvirt(
     host_thread_pinning: dict[str, Any] = {}
     host_irq_delta: dict[str, Any] = {}
     guest_executor: dict[str, str] = {}
+    scheduler_artifact: dict[str, Any] = {}
     treatment_artifact: dict[str, Any] = {}
     benchmark_artifact: dict[str, Any] = {}
     try:
@@ -321,12 +329,13 @@ def _run_libvirt(
 
         host, port = _wait_for_ssh(libvirt, domain_name, boot_timeout, progress_interval, heartbeat)
         if scheduler_host_command:
-            _stage_scheduler(
+            scheduler_artifact = _stage_scheduler(
                 libvirt,
                 host,
                 port,
                 scheduler_host_command,
                 scheduler_host_kconfig,
+                scheduler_host_support_files or [],
                 stdout_parts,
                 stderr_parts,
             )
@@ -438,17 +447,22 @@ def _run_libvirt(
         host_thread_pinning,
         host_irq_delta,
         guest_executor,
+        scheduler_artifact,
         treatment_artifact,
         benchmark_artifact,
     )
 
 
 def _guest_scheduler(scheduler: dict[str, Any]) -> dict[str, Any]:
-    if scheduler.get("kind") != "scx" or not scheduler.get("host_command"):
+    if scheduler.get("kind") != "scx":
         return scheduler
 
     guest_scheduler = dict(scheduler)
-    guest_scheduler["command"] = "/tmp/scx-bench-scheduler"
+    if scheduler.get("host_command"):
+        guest_scheduler["command"] = GUEST_SCHEDULER_PATH
+    guest_scheduler.pop("host_command", None)
+    guest_scheduler.pop("host_kconfig", None)
+    guest_scheduler.pop("host_support_files", None)
     return guest_scheduler
 
 
@@ -471,22 +485,36 @@ def _stage_scheduler(
     port: int,
     host_command: str,
     host_kconfig: str | None,
+    host_support_files: list[str],
     stdout_parts: list[str],
     stderr_parts: list[str],
-) -> None:
+) -> dict[str, Any]:
     source = _resolve_host_path(host_command)
     if not source.is_file():
         raise RuntimeError(f"scheduler host_command does not exist: {source}")
     if not os.access(source, os.X_OK):
         raise RuntimeError(f"scheduler host_command is not executable: {source}")
 
-    destination = "/tmp/scx-bench-scheduler"
-    _scp_to_guest(libvirt, host, port, source, destination, stdout_parts, stderr_parts)
-    _run_command(
-        _ssh_command(libvirt, host, port, f"chmod 0755 {shlex.quote(destination)}"),
+    _scp_to_guest(
+        libvirt,
+        host,
+        port,
+        source,
+        GUEST_SCHEDULER_PATH,
         stdout_parts,
         stderr_parts,
     )
+    _run_command(
+        _ssh_command(
+            libvirt,
+            host,
+            port,
+            f"chmod 0755 {shlex.quote(GUEST_SCHEDULER_PATH)}",
+        ),
+        stdout_parts,
+        stderr_parts,
+    )
+    kconfig_artifact = None
     if host_kconfig:
         kconfig = _resolve_host_path(host_kconfig)
         if not kconfig.is_file():
@@ -496,10 +524,34 @@ def _stage_scheduler(
             host,
             port,
             kconfig,
-            "/tmp/scx-bench-kconfig",
+            GUEST_SCHEDULER_KCONFIG_PATH,
             stdout_parts,
             stderr_parts,
         )
+        kconfig_artifact = {
+            "source": str(kconfig),
+            "guest_path": GUEST_SCHEDULER_KCONFIG_PATH,
+            "sha256": _sha256_file(kconfig),
+        }
+
+    artifact = {
+        "source": str(source),
+        "guest_path": GUEST_SCHEDULER_PATH,
+        "sha256": _sha256_file(source),
+        "support_files": _stage_support_files(
+            libvirt,
+            host,
+            port,
+            host_support_files,
+            GUEST_SCHEDULER_SUPPORT_DIR,
+            "scheduler",
+            stdout_parts,
+            stderr_parts,
+        ),
+    }
+    if kconfig_artifact is not None:
+        artifact["kconfig"] = kconfig_artifact
+    return artifact
 
 
 def _stage_treatment(
@@ -1075,7 +1127,7 @@ def _remove_path(
     except OSError as exc:
         raise RuntimeError(
             f"runtime path is not removable: {path}: {exc}; "
-            "run prepare_env.py init to configure libvirt/qemu as the benchmark user"
+            "run `python3 -m bench.env init` to configure libvirt/qemu as the benchmark user"
         ) from exc
 
 
@@ -1200,6 +1252,7 @@ def _libvirt_result(
     host_thread_pinning: dict[str, Any],
     host_irq_delta: dict[str, Any],
     guest_executor: dict[str, str],
+    scheduler_artifact: dict[str, Any],
     treatment_artifact: dict[str, Any],
     benchmark_artifact: dict[str, Any],
 ) -> dict[str, Any]:
@@ -1211,6 +1264,7 @@ def _libvirt_result(
         "host_thread_pinning": host_thread_pinning,
         "host_irq_delta": host_irq_delta,
         "guest_executor": guest_executor,
+        "scheduler_artifact": scheduler_artifact,
         "treatment_artifact": treatment_artifact,
         "benchmark_artifact": benchmark_artifact,
     }
@@ -1324,7 +1378,7 @@ def _preflight_machine(spec: RunSpec) -> None:
         raise PreflightError(
             "; ".join(errors)
             + "; prepare host isolation first: "
-            + "sudo python3 bench/scripts/isolation.py prepare "
+            + "sudo python3 -m bench.env isolation prepare "
             + f"--config bench/configs/example.config --plan {spec.plan}"
         )
 

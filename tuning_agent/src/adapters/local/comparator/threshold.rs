@@ -17,6 +17,46 @@ pub struct ThresholdComparisonSpec {
     pub conditions: Vec<MetricCondition>,
 }
 
+const METRIC_OPERATORS: [&str; 12] = [
+    "decrease_percent_ge",
+    "decrease_abs_ge",
+    "increase_percent_ge",
+    "increase_abs_ge",
+    "increase_percent_le",
+    "increase_abs_le",
+    "decrease_percent_le",
+    "decrease_abs_le",
+    "change_percent_le",
+    "change_abs_le",
+    "current_le",
+    "current_ge",
+];
+
+fn metric_condition_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "description": "Compare one exact metric across baseline and candidate. decrease_* uses baseline minus candidate, increase_* uses candidate minus baseline, change_* uses absolute change, and current_* tests the candidate value. Percent operators divide by the absolute baseline; abs operators use the metric's unit.",
+        "additionalProperties": false,
+        "required": ["metric", "op", "value"],
+        "properties": {
+            "metric": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact metric name exported by the selected measurement capability."
+            },
+            "op": {
+                "type": "string",
+                "enum": METRIC_OPERATORS,
+                "description": "Typed comparison operator applied to baseline and candidate values."
+            },
+            "value": {
+                "type": "number",
+                "description": "Finite threshold; delta operators require a non-negative value."
+            }
+        }
+    })
+}
+
 pub struct ThresholdComparisonPolicy {
     meta: CapabilityMeta,
 }
@@ -46,7 +86,8 @@ impl ThresholdComparisonPolicy {
                     "conditions": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 256
+                        "maxItems": 256,
+                        "items": metric_condition_schema()
                     }
                 }
             }),
@@ -249,6 +290,23 @@ mod tests {
         assert_eq!(
             serde_json::to_value(spec).unwrap()["conditions"][0]["op"],
             "decrease_percent_ge"
+        );
+    }
+
+    #[test]
+    fn input_schema_exposes_typed_condition_fields_and_operators() {
+        let policy = ThresholdComparisonPolicy::new();
+        let condition = &policy.meta().input_schema["properties"]["conditions"]["items"];
+
+        assert_eq!(condition["required"], json!(["metric", "op", "value"]));
+        assert_eq!(condition["additionalProperties"], false);
+        assert_eq!(
+            condition["properties"]["op"]["enum"],
+            json!(METRIC_OPERATORS)
+        );
+        assert_eq!(
+            condition["properties"]["metric"]["description"],
+            "Exact metric name exported by the selected measurement capability."
         );
     }
 }

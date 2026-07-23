@@ -212,6 +212,7 @@ fn evaluation_contract_schema(snapshot: &CapabilitySnapshot) -> Value {
 fn binding_schema(meta: &crate::domain::CapabilityMeta) -> Value {
     json!({
         "type": "object",
+        "description": binding_description(meta),
         "additionalProperties": false,
         "required": ["capability_id", "specification"],
         "properties": {
@@ -219,6 +220,37 @@ fn binding_schema(meta: &crate::domain::CapabilityMeta) -> Value {
             "specification": meta.input_schema,
         }
     })
+}
+
+fn binding_description(meta: &crate::domain::CapabilityMeta) -> String {
+    if meta.kind != CapabilityKind::Measurement {
+        return meta.description.clone();
+    }
+
+    let metrics = meta
+        .output_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, schema)| {
+            let meaning = schema
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| schema.get("type").and_then(Value::as_str))
+                .unwrap_or("provider-defined value");
+            format!("{name}: {meaning}")
+        })
+        .collect::<Vec<_>>();
+    if metrics.is_empty() {
+        meta.description.clone()
+    } else {
+        format!(
+            "{}. Output metrics: {}.",
+            meta.description.trim_end_matches('.'),
+            metrics.join("; ")
+        )
+    }
 }
 
 fn alternatives(variants: Vec<Value>) -> Value {
@@ -253,6 +285,10 @@ fn capability_tool_name(prefix: &str, capability_id: &CapabilityId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{
+        CapabilityKind, CapabilityMeta, Digest, EffectClass, ProviderClass, ProviderId,
+        ProviderPin, ProviderVersion,
+    };
 
     #[test]
     fn generated_names_are_openai_safe_and_stable() {
@@ -283,6 +319,46 @@ mod tests {
         assert_eq!(
             schema["properties"]["workload_invariants"]["maxItems"],
             json!(MAX_WORKLOAD_INVARIANTS)
+        );
+    }
+
+    #[test]
+    fn measurement_binding_describes_provider_output_metrics() {
+        let meta = CapabilityMeta::new(
+            CapabilityId::new("measurement/classification-integrity").unwrap(),
+            CapabilityKind::Measurement,
+            EffectClass::ReadOnly,
+            ProviderPin {
+                provider_id: ProviderId::new("test-provider").unwrap(),
+                provider_version: ProviderVersion::new("1").unwrap(),
+                provider_class: ProviderClass::Mcp,
+                manifest_digest: Digest::new("test-manifest").unwrap(),
+            },
+            "Measure classification integrity",
+            json!({"type": "object"}),
+            json!({
+                "type": "object",
+                "properties": {
+                    "active_rule_coverage": {
+                        "type": "number",
+                        "description": "Fraction of expected rules active in BPF"
+                    },
+                    "task_state_errors_delta": {
+                        "type": "number",
+                        "description": "Task-state errors since measurement open"
+                    }
+                }
+            }),
+        );
+
+        let binding = binding_schema(&meta);
+        let description = binding["description"].as_str().unwrap();
+        assert!(description.contains("active_rule_coverage"));
+        assert!(description.contains("Fraction of expected rules active in BPF"));
+        assert!(description.contains("task_state_errors_delta"));
+        assert_eq!(
+            binding["properties"]["capability_id"]["const"],
+            "measurement/classification-integrity"
         );
     }
 }

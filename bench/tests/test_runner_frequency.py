@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bench.runner import _check_fixed_frequency
+from bench.core.runner import _check_fixed_frequency
 
 
 class FixedFrequencyPreflightTest(unittest.TestCase):

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
 
-from bench.base_image import (
+from bench.env.base_image import (
     BaseImageManifestError,
     base_image_manifest_path,
     benchmark_wrapper_snapshot,
     build_base_image_manifest,
+    prepare_base_image,
     serialize_base_image_manifest,
     verify_base_image_manifest,
 )
@@ -120,6 +123,31 @@ class BaseImageManifestTest(unittest.TestCase):
             manifest_path.write_text(json.dumps({"version": True}), encoding="utf-8")
             with self.assertRaisesRegex(BaseImageManifestError, "unsupported"):
                 verify_base_image_manifest(image, repository)
+
+    def test_dry_run_build_does_not_create_image_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "base.qcow2"
+            with redirect_stdout(io.StringIO()):
+                prepare_base_image(
+                    config={
+                        "libvirt": {
+                            "uri": "qemu:///system",
+                            "root_image": str(image),
+                            "ssh_key": str(root / "key"),
+                            "network": "default",
+                        }
+                    },
+                    cloud_image=root / "cloud.qcow2",
+                    seed_image=root / "seed.iso",
+                    image_url="https://example.invalid/cloud.qcow2",
+                    image_size="40G",
+                    force=False,
+                    dry_run=True,
+                )
+
+            self.assertFalse(image.exists())
+            self.assertFalse(base_image_manifest_path(image).exists())
 
 
 if __name__ == "__main__":

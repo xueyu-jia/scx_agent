@@ -18,9 +18,15 @@ if str(REPO_ROOT) not in sys.path:
 from bench.analysis.compare import build_analysis
 from bench.analysis.loader import load_result_dir
 from bench.analysis.report import write_html_report
-from bench.base_image import BaseImageManifestError, verify_base_image_manifest
-from bench.config.parser import ConfigError, RunSpec, expand_plan, load_config, parse_cpu_list
-from bench.runner import run_specs
+from bench.core.config import (
+    ConfigError,
+    RunSpec,
+    expand_plan,
+    load_config,
+    parse_cpu_list,
+)
+from bench.core.runner import run_specs
+from bench.env.base_image import BaseImageManifestError, verify_base_image_manifest
 
 
 DEFAULT_EXPERIMENT_ROOT = Path("bench/results/experiments")
@@ -30,11 +36,15 @@ _EXECUTION_ORDER_LOCK = threading.Lock()
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run a full baseline/candidate benchmark experiment")
+    parser = argparse.ArgumentParser(description="Run a benchmark plan")
     parser.add_argument("--config", default="bench/configs/local.config")
     parser.add_argument("--plan", required=True)
-    parser.add_argument("--baseline", required=True, help="baseline scheduler name from config.schedulers")
-    parser.add_argument("--candidate", required=True, help="candidate scheduler name from config.schedulers")
+    parser.add_argument("--baseline", help="baseline scheduler name from config.schedulers")
+    parser.add_argument("--candidate", help="candidate scheduler name from config.schedulers")
+    parser.add_argument(
+        "--scheduler",
+        help="run the plan once with one scheduler instead of a paired comparison",
+    )
     parser.add_argument(
         "--baseline-treatment",
         help="optional baseline treatment name from config.treatments",
@@ -63,6 +73,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    standalone = args.scheduler is not None
+    if standalone and any(
+        value is not None
+        for value in (
+            args.baseline,
+            args.candidate,
+            args.baseline_treatment,
+            args.candidate_treatment,
+            args.parallel,
+        )
+    ):
+        parser.error(
+            "--scheduler cannot be combined with paired comparison options"
+        )
+    if not standalone and (args.baseline is None or args.candidate is None):
+        parser.error("--baseline and --candidate are required without --scheduler")
+
     _log(f"loading config: {args.config}")
     base_image_manifest: dict[str, Any] | None = None
     try:
@@ -72,28 +99,38 @@ def main(argv: list[str] | None = None) -> int:
                 config["libvirt"]["root_image"],
                 REPO_ROOT,
             )
-        baseline = _variant(
-            "baseline",
-            args.baseline,
-            _scheduler(config, args.baseline),
-            args.baseline_treatment,
-            _treatment(config, args.baseline_treatment),
-        )
-        candidate = _variant(
-            "candidate",
-            args.candidate,
-            _scheduler(config, args.candidate),
-            args.candidate_treatment,
-            _treatment(config, args.candidate_treatment),
-        )
         specs = expand_plan(config, args.plan)
-        parallel = _resolve_parallel(config, args.parallel)
+        if standalone:
+            scheduler = _scheduler(config, args.scheduler)
+        else:
+            baseline = _variant(
+                "baseline",
+                args.baseline,
+                _scheduler(config, args.baseline),
+                args.baseline_treatment,
+                _treatment(config, args.baseline_treatment),
+            )
+            candidate = _variant(
+                "candidate",
+                args.candidate,
+                _scheduler(config, args.candidate),
+                args.candidate_treatment,
+                _treatment(config, args.candidate_treatment),
+            )
+            parallel = _resolve_parallel(config, args.parallel)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
     except BaseImageManifestError as exc:
         print(f"base image error: {exc}", file=sys.stderr)
         return 2
+
+    if standalone:
+        try:
+            return _run_standalone(args, config, specs, scheduler)
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return 2
 
     if baseline.label == candidate.label:
         print(
@@ -189,6 +226,63 @@ def main(argv: list[str] | None = None) -> int:
     _log(f"report: {analysis_dir / 'report.html'}")
     _log(f"latest report: {latest_report}")
     return 0
+
+
+def _run_standalone(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    specs: list[RunSpec],
+    scheduler: dict[str, Any],
+) -> int:
+    output = (
+        Path(args.output)
+        if args.output
+        else _default_standalone_dir(args.plan, args.scheduler)
+    )
+    pool = (
+        _HostResourcePool.from_config(config, args.dry_run)
+        if any(spec.machine.get("pin_cpus") == "auto" for spec in specs)
+        else None
+    )
+    progress = _Progress(len(specs))
+    for spec in specs:
+        allocation = pool.allocate(spec) if pool is not None else None
+        if pool is not None and allocation is None:
+            raise ConfigError(
+                f"insufficient isolated resources for {spec.machine_name}"
+            )
+        placed = _place_spec(spec, allocation)
+        placement = (
+            allocation.placement
+            if allocation is not None
+            else _configured_placement(placed)
+        )
+        try:
+            run_specs(
+                [placed],
+                output_dir=output,
+                dry_run=args.dry_run,
+                label=args.scheduler,
+                scheduler=scheduler,
+                config_path=args.config,
+                progress_callback=progress.callback,
+                progress_interval=args.progress_interval,
+                placement=placement,
+                role="standalone",
+            )
+        finally:
+            if pool is not None and allocation is not None:
+                pool.release(allocation)
+
+    statuses = _result_statuses(output)
+    print(f"output: {output}")
+    print(f"statuses: {', '.join(statuses)}")
+    return (
+        0
+        if statuses
+        and all(status in {"PASS", "DRY_RUN"} for status in statuses)
+        else 1
+    )
 
 
 @dataclass(frozen=True)
@@ -572,6 +666,21 @@ def _variant(
 def _default_experiment_dir(baseline: str, candidate: str) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return DEFAULT_EXPERIMENT_ROOT / f"{timestamp}__{_safe(baseline)}_vs_{_safe(candidate)}"
+
+
+def _default_standalone_dir(plan: str, scheduler: str) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return Path("bench/results/standalone") / (
+        f"{timestamp}__{_safe(plan)}__{_safe(scheduler)}"
+    )
+
+
+def _result_statuses(output: Path) -> list[str]:
+    statuses = []
+    for path in sorted(output.glob("run_*/result.json")):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        statuses.append(str(value.get("status", "UNKNOWN")))
+    return statuses
 
 
 def _safe(value: str) -> str:

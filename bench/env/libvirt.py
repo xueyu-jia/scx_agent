@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from bench.config.parser import ConfigError, load_config
+from bench.core.config import ConfigError, load_config
 
 
 DEFAULT_CONFIG = REPO_ROOT / "bench" / "configs" / "local.config"
@@ -29,7 +29,10 @@ QEMU_CONF_END = "# END scx-bench qemu user"
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Prepare or restore scx bench libvirt/QEMU host settings")
+    parser = argparse.ArgumentParser(
+        prog="python3 -m bench.env.libvirt",
+        description="Prepare or restore scx bench libvirt/QEMU host settings",
+    )
     subparsers = parser.add_subparsers(dest="action", required=True)
 
     prepare = subparsers.add_parser("prepare", help="prepare libvirt/QEMU host settings")
@@ -159,7 +162,7 @@ def verify_qemu_user_config() -> None:
         raise RuntimeError(
             "libvirt qemu user config is not prepared: "
             + "; ".join(mismatched)
-            + "; run: python3 bench/scripts/libvirt_env.py prepare --config bench/configs/local.config"
+            + "; run: python3 -m bench.env init --config bench/configs/local.config"
         )
 
 

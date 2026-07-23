@@ -95,6 +95,14 @@ def load_perf_stat_metrics(path: Path) -> dict[str, float]:
                     hardware_seen = True
                     invalid_hardware += 1
                 continue
+            if name == "task_clock_msec":
+                unit = fields[1].strip().lower()
+                if unit in {"", "ns", "nsec"}:
+                    value /= 1_000_000.0
+                elif unit in {"us", "usec"}:
+                    value /= 1_000.0
+                elif unit in {"s", "sec"}:
+                    value *= 1_000.0
             metrics[name] = metrics.get(name, 0.0) + value
             if hardware:
                 hardware_seen = True

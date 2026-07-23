@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-from bench.config.parser import (
+from bench.core.config import (
     ConfigError,
     _bench_with_defaults,
     _validate_bench_defaults,
@@ -17,7 +17,7 @@ from bench.config.parser import (
     _validate_treatments,
     expand_plan,
 )
-from bench.scripts.prepare_env import _patch_kernel_build_source
+from bench.env.manager import _patch_kernel_build_source
 
 
 def command(argv: list[str] | None = None, timeout_seconds: int = 30) -> dict[str, object]:
@@ -111,13 +111,16 @@ class BenchCommandValidationTest(unittest.TestCase):
             )
 
     def test_reserved_output_environment_cannot_be_overridden(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "reserved variables.*SCX_BENCH_OUT"):
-            self._validate(
-                {
-                    "measurement": command(),
-                    "env": {"SCX_BENCH_OUT": "/tmp/other"},
-                }
-            )
+        for name in ("SCX_BENCH_OUT", "SCX_BENCH_WORKDIR"):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ConfigError, f"reserved variables.*{name}"
+            ):
+                self._validate(
+                    {
+                        "measurement": command(),
+                        "env": {name: "/tmp/other"},
+                    }
+                )
 
     def test_local_config_patches_kernel_source_inside_measurement(self) -> None:
         config = {
@@ -220,6 +223,7 @@ class TreatmentConfigTest(unittest.TestCase):
             ["--no-commit-disposition", "proceed"],
         )
 
+
 class BenchTimingTest(unittest.TestCase):
     def test_defaults_are_merged_and_bench_values_override_them(self) -> None:
         config = {
@@ -287,11 +291,47 @@ class SchedulerConfigTest(unittest.TestCase):
                     "test": {
                         "kind": "scx",
                         "command": "scheduler",
+                        "host_command": "build/scheduler",
+                        "host_support_files": ["build/provider"],
                         "settle_seconds": 2,
                     }
                 }
             }
         )
+
+    def test_scheduler_support_files_require_a_host_command(self) -> None:
+        with self.assertRaisesRegex(
+            ConfigError, r"schedulers\.test\.host_support_files requires host_command"
+        ):
+            _validate_schedulers(
+                {
+                    "schedulers": {
+                        "test": {
+                            "kind": "scx",
+                            "command": "scheduler",
+                            "host_support_files": ["build/provider"],
+                        }
+                    }
+                }
+            )
+
+    def test_scheduler_support_files_must_be_a_string_list(self) -> None:
+        for value in ("build/provider", ["build/provider", ""]):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ConfigError, r"host_support_files must be a string list"
+            ):
+                _validate_schedulers(
+                    {
+                        "schedulers": {
+                            "test": {
+                                "kind": "scx",
+                                "command": "scheduler",
+                                "host_command": "build/scheduler",
+                                "host_support_files": value,
+                            }
+                        }
+                    }
+                )
 
     def test_legacy_scheduler_warmup_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unsupported keys"):

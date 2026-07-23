@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -55,7 +55,8 @@ def main(argv: list[str] | None = None) -> int:
                     ns.clients,
                     "-t",
                     ns.tests,
-                    "--csv",
+                    "--precision",
+                    "3",
                 ]
             )
         finally:
@@ -66,27 +67,69 @@ def main(argv: list[str] | None = None) -> int:
                 proc.kill()
 
     metrics = {"elapsed_time_sec": result.elapsed_time_sec}
-    metrics.update(parse_csv(result.stdout))
+    metrics.update(parse_output(result.stdout))
     emit(result, metrics, tool="redis")
     return result.returncode
 
 
-def parse_csv(text: str) -> dict[str, float]:
+def parse_output(text: str) -> dict[str, float]:
     metrics: dict[str, float] = {}
-    values = []
-    for row in csv.reader(text.splitlines()):
-        if len(row) < 2:
-            continue
-        name = row[0].strip().lower().replace(" ", "_")
-        try:
-            value = float(row[1])
-        except ValueError:
-            continue
-        metrics[f"{name}_qps"] = value
-        values.append(value)
-    if values:
-        metrics["throughput"] = sum(values)
+    throughputs: list[float] = []
+    p99_values: list[float] = []
+    p999_values: list[float] = []
+    parts = re.split(
+        r"^[ \t\r]*======\s+(.+?)\s+======[ \t\r]*$",
+        text,
+        flags=re.MULTILINE,
+    )
+    for index in range(1, len(parts), 2):
+        name = parts[index].strip().lower().replace(" ", "_")
+        section = parts[index + 1]
+        throughput = _number(section, r"throughput summary:\s*([0-9.]+)")
+        if throughput is not None:
+            metrics[f"{name}_qps"] = throughput
+            throughputs.append(throughput)
+
+        summary = re.search(
+            r"latency summary \(msec\):.*?\n\s*avg\s+min\s+p50\s+p95\s+p99\s+max\s*\n"
+            r"\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)",
+            section,
+            flags=re.DOTALL,
+        )
+        if summary:
+            for metric, value in zip(
+                ("avg", "min", "p50", "p95", "p99", "max"),
+                summary.groups(),
+                strict=True,
+            ):
+                metrics[f"{name}_{metric}_latency_us"] = float(value) * 1000.0
+            p99_values.append(float(summary.group(5)) * 1000.0)
+
+        percentiles = [
+            (float(percentile), float(milliseconds) * 1000.0)
+            for percentile, milliseconds in re.findall(
+                r"^[ \t]*([0-9.]+)% <= ([0-9.]+) milliseconds",
+                section,
+                flags=re.MULTILINE,
+            )
+        ]
+        p999 = next((latency for percentile, latency in percentiles if percentile >= 99.9), None)
+        if p999 is not None:
+            metrics[f"{name}_p999_latency_us"] = p999
+            p999_values.append(p999)
+
+    if throughputs:
+        metrics["throughput"] = sum(throughputs)
+    if p99_values:
+        metrics["p99_latency_us"] = max(p99_values)
+    if p999_values:
+        metrics["p999_latency_us"] = max(p999_values)
     return metrics
+
+
+def _number(text: str, pattern: str) -> float | None:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return float(match.group(1)) if match else None
 
 
 def free_port() -> int:

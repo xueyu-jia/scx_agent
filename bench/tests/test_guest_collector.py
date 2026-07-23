@@ -9,8 +9,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bench.collectors.guest import build_guest_run_plan, write_guest_plan
-from bench.collectors.guest_executor import (
+from bench.core.guest_plan import build_guest_run_plan, write_guest_plan
+from bench.core.guest_executor import (
     Command,
     GuestExecutor,
     Plan,
@@ -67,6 +67,7 @@ assert os.environ["SCX_BENCH_ROLE"] == "candidate"
 assert os.environ["SCX_BENCH_VARIANT"] == "test-variant"
 assert os.environ["SCX_BENCH_TREATMENT"] == "test-treatment"
 assert os.environ["TREATMENT_ENV"] == "present"
+assert Path(os.environ["SCX_BENCH_WORKDIR"]) == Path.cwd()
 outcome = Path(os.environ["SCX_BENCH_TREATMENT_OUTCOME"])
 outcome.write_text(json.dumps({{
     "version": 2,
@@ -237,6 +238,7 @@ assert "SCX_BENCH_ROLE" not in os.environ
 assert "SCX_BENCH_VARIANT" not in os.environ
 assert "SCX_BENCH_TREATMENT" not in os.environ
 assert "SCX_BENCH_TREATMENT_OUTCOME" not in os.environ
+assert Path(os.environ["SCX_BENCH_WORKDIR"]) == Path.cwd()
 (out / "primed").write_text("yes")
 """
         measurement_source = """
@@ -246,6 +248,7 @@ out = Path(os.environ["SCX_BENCH_OUT"])
 assert (out / "treatment" / "state").read_text() == "ready"
 assert (out / "warmup" / "primed").read_text() == "yes"
 assert "SCX_BENCH_ROLE" not in os.environ
+assert Path(os.environ["SCX_BENCH_WORKDIR"]) == Path.cwd()
 """
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

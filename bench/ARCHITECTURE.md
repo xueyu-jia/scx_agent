@@ -4,11 +4,10 @@ This document describes the current benchmark framework architecture.
 
 ## Design Principles
 
-- Configuration defines stable entities.
+- Core owns configuration, execution plans, and raw evidence collection.
 - CLI selects experiment variables.
 - Runner executes already-expanded specs.
 - Scripts orchestrate workflows.
-- Collectors gather raw evidence.
 - Analysis compares results.
 - Reporting only visualizes analysis output.
 
@@ -16,22 +15,22 @@ This document describes the current benchmark framework architecture.
 
 ```text
 bench/
-  config/
-    parser.py
-
-  base_image.py
-  runner.py
+  core/
+    config.py
+    runner.py
+    guest_plan.py
+    guest_executor.py
+    metrics.py
 
   scripts/
-    prepare_env.py
     run.py
-    libvirt_env.py
-    isolation.py
-    fetch_workloads.py
 
-  collectors/
-    guest.py
-    guest_executor.py
+  env/
+    manager.py
+    base_image.py
+    libvirt.py
+    isolation.py
+    workloads.py
 
   integrations/
     tuning_agent/
@@ -47,12 +46,12 @@ bench/
       mcp_server.py
       mock_llm.py
       matrix.py
-
   benchmarks/
     generic.py
 
   analysis/
     loader.py
+    paired.py
     compare.py
     report.py
     run.py
@@ -69,7 +68,7 @@ bench/
 
 ## Module Responsibilities
 
-### `bench/config/parser.py`
+### `bench/core/config.py`
 
 Owns config loading, validation, and plan expansion.
 
@@ -81,7 +80,7 @@ Key responsibilities:
 
 It does not run benchmarks and does not decide baseline/candidate order.
 
-### `bench/runner.py`
+### `bench/core/runner.py`
 
 Executes a provided list of `RunSpec` objects for one scheduler/treatment variant.
 
@@ -110,6 +109,7 @@ Key responsibilities:
 - read config;
 - reject stale base images before a real experiment starts;
 - select baseline/candidate scheduler and optional treatment combinations;
+- run a standalone plan with one scheduler when `--scheduler` is selected;
 - expand the selected plan;
 - build comparison pairs from expanded `RunSpec` objects;
 - allocate host CPU placement for `pin_cpus: auto`;
@@ -120,7 +120,7 @@ Key responsibilities:
 
 This script is the normal user-facing entry point.
 
-### `bench/scripts/prepare_env.py`
+### `bench/env/manager.py`
 
 Prepares a machine-specific local environment.
 
@@ -129,31 +129,34 @@ Key responsibilities:
 - generate `bench/configs/local.config` from `example.config`;
 - derive `libvirt.emulator_cpus` and `executor.isolated_cpus` from host topology;
 - generate the SSH key used by the guest;
-- call `libvirt_env.py prepare`;
-- call `fetch_workloads.py`;
+- prepare libvirt/QEMU host settings;
+- fetch and build selected workloads;
 - create the libvirt base image;
 - write and verify base-image provenance;
 - rebuild only the image through `rebuild-image` without replacing local config;
-- call `isolation.py prepare --no-reboot`;
-- call `libvirt_env.py restore` and `isolation.py restore` from `restore`;
+- prepare host isolation;
+- restore libvirt and isolation state from `restore`;
 - verify that the generated environment is usable.
 
-`prepare_env.py` owns machine-local orchestration. It does not run experiments
+`env/manager.py` owns machine-local orchestration. It does not run experiments
 and does not own subsystem-specific host mutations.
 
-### `bench/base_image.py`
+### `bench/env/base_image.py`
 
-Owns base-image provenance. It hashes every source file under
-`bench/benchmarks/`, excluding generated Python caches, and binds that snapshot
-to the qcow2 device, inode, size, and modification time. The base initialization
-VM recomputes the wrapper hashes after extraction; the manifest is written only
-after that check passes and the VM has shut down.
+Owns the complete base-image lifecycle. It downloads and resizes the cloud
+image, creates the seed image, initializes the base VM, synchronizes the
+benchmark wrapper source, and writes the base-image provenance manifest. It
+also hashes every source file under `bench/benchmarks/`, excluding generated
+Python caches, and binds that snapshot to the qcow2 device, inode, size, and
+modification time. The base initialization VM recomputes the wrapper hashes
+after extraction; the manifest is written only after that check passes and the
+VM has shut down.
 
-`prepare_env.py verify` and non-dry-run `scripts/run.py` use the same verifier.
+`env verify` and non-dry-run `scripts/run.py` use the same verifier.
 The per-run runner does not know which benchmark wrappers exist and does not
 copy wrapper source into guests.
 
-### `bench/scripts/libvirt_env.py`
+### `bench/env/libvirt.py`
 
 Prepares or restores libvirt/QEMU host settings.
 
@@ -165,7 +168,7 @@ Key responsibilities:
 - ensure libvirtd and the selected libvirt network are available;
 - verify the libvirt/QEMU host environment.
 
-### `bench/scripts/isolation.py`
+### `bench/env/isolation.py`
 
 Prepares or restores host isolation.
 
@@ -182,7 +185,7 @@ Key responsibilities:
 The runner does not modify host isolation. It only checks that isolation is
 already active.
 
-### `bench/scripts/fetch_workloads.py`
+### `bench/env/workloads.py`
 
 Fetches and builds community workload programs.
 
@@ -200,7 +203,7 @@ perf bench  configured kernel source tree tools/perf
 kernel build configured kernel source tree
 ```
 
-The script stores source trees under:
+The module stores source trees under:
 
 ```text
 bench/workloads/src/
@@ -216,7 +219,7 @@ bench/workloads/bin/
 `bench/workloads/bin/perf`. The `perf bench sched` wrapper uses this binary
 before falling back to host `perf`.
 
-### `bench/collectors/guest.py`
+### `bench/core/guest_plan.py`
 
 Defines the host-side execution-plan model. It converts validated benchmark,
 scheduler, and libvirt configuration into a versioned JSON document and
@@ -224,7 +227,7 @@ calculates the corresponding host timeout budget.
 
 It does not execute commands or generate shell source.
 
-### `bench/collectors/guest_executor.py`
+### `bench/core/guest_executor.py`
 
 A standalone, standard-library Python program staged into each guest. It
 validates the uploaded JSON plan independently before executing it. Keeping
@@ -296,12 +299,12 @@ normalized JSON.
 Specialized wrappers are used for tools such as `fio`, `schbench`, `perf bench
 sched`, `will-it-scale`, `cyclictest`, `kernel build`, and `redis-benchmark`.
 
-### `bench/metrics.py`
+### `bench/core/metrics.py`
 
 Loads and validates benchmark wrapper output.
 
 Benchmark wrappers convert workload-native output into the framework metric
-JSON contract. `bench/metrics.py` reads that JSON from `stdout.log`, preserves
+JSON contract. `bench/core/metrics.py` reads that JSON from `stdout.log`, preserves
 the metrics, and records parse status such as `ok`, `empty_stdout`, or
 `non_json_stdout`.
 
@@ -386,15 +389,15 @@ while workload parsing remains the benchmark adapter's responsibility.
 ## Data Flow
 
 ```text
-example.config + prepare_env.py init
+example.config + env init
   -> local.config
 local.config
   -> config parser
   -> base image + benchmark wrapper manifest verification
   -> RunSpec list
   -> scripts/run.py chooses scheduler order
-  -> runner.py executes scheduler + RunSpec batch
-  -> runner.py uploads guest_executor.py + guest_plan.json
+  -> core/runner.py executes scheduler + RunSpec batch
+  -> core/runner.py uploads core/guest_executor.py + guest_plan.json
   -> libvirt guest validates and executes the plan
   -> per-run raw artifacts
   -> analysis loader
@@ -582,14 +585,14 @@ machines:
       fixed: true
 ```
 
-`scripts/isolation.py prepare` configures host boot/runtime state.
+`env isolation prepare` configures host boot/runtime state.
 
 When `pin_cpus: auto` is used, `executor.isolated_cpus` defines the host CPU
 range to isolate. `scripts/run.py` then allocates complete SMT sibling groups
 to comparison pairs. A physical core's logical CPU siblings are never split
 across different pairs.
 
-`runner.py` checks:
+`core/runner.py` checks:
 
 - pinned CPUs exist;
 - pinned CPUs are isolated;
@@ -602,7 +605,7 @@ If checks fail, the run is marked `PREFLIGHT_FAILED` and no VM is started.
 Add new workload:
 
 1. put the binary in `bench/workloads/`;
-2. or teach `bench/scripts/fetch_workloads.py` how to fetch/build it;
+2. or teach `bench/env/workloads.py` how to fetch/build it;
 3. add or reuse a wrapper under `bench/benchmarks/`;
 4. add a `benches:` entry;
 5. include it in a suite.
