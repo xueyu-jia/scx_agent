@@ -62,7 +62,7 @@ impl ToolCatalog {
         catalog.add_builtin(
             "begin_experiment",
             CatalogKind::BeginExperiment,
-            "Freeze the episode's only objective and complete evaluation contract before any mutation.",
+            "Freeze the episode's only objective and complete evaluation contract before any mutation. Use only exact metric names listed in the selected measurement capability's Output metrics.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -166,7 +166,7 @@ impl ToolCatalog {
 fn evaluation_contract_schema(snapshot: &CapabilitySnapshot) -> Value {
     let measurement = snapshot
         .iter_meta()
-        .filter(|meta| meta.kind == CapabilityKind::Measurement)
+        .filter(|meta| meta.kind == CapabilityKind::Measurement && meta.is_agent_selectable())
         .map(binding_schema)
         .collect::<Vec<_>>();
     let comparison = snapshot
@@ -320,6 +320,25 @@ mod tests {
             schema["properties"]["workload_invariants"]["maxItems"],
             json!(MAX_WORKLOAD_INVARIANTS)
         );
+    }
+
+    #[test]
+    fn runtime_guardrail_measurement_is_absent_from_agent_contract_schema() {
+        let mut registry =
+            crate::capability::CapabilityRegistry::new(crate::capability::AdminPolicy::default());
+        registry
+            .register_measurement(std::sync::Arc::new(
+                crate::adapters::local::measurement::CoreSystemMeasurementProvider::new(),
+            ))
+            .unwrap();
+
+        let schema = evaluation_contract_schema(&registry.snapshot());
+        let measurement = &schema["properties"]["measurement"];
+
+        assert_eq!(measurement, &json!({"not": {}}));
+        assert!(!schema
+            .to_string()
+            .contains("builtin/measurement.core-system.v1"));
     }
 
     #[test]

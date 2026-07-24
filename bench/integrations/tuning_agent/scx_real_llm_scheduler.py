@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     base_url = _normalize_base_url(
         os.environ.get("SCX_REAL_LLM_BASE_URL", "http://192.168.122.1:17001")
     )
-    model = os.environ.get("SCX_REAL_LLM_MODEL", "gpt-5.5")
+    model = os.environ.get("SCX_REAL_LLM_MODEL", "deepseek-v4-flash")
     api_key = os.environ.get("SCX_REAL_LLM_API_KEY", "local-test")
     diagnostic_counters = _bool_env("SCX_REAL_LLM_DIAGNOSTIC_COUNTERS", True)
     if not model or not api_key:
@@ -276,7 +276,7 @@ def _render_config(
         f"api_key = {quote(api_key)}\n"
         f"model = {quote(model)}\n"
         "timeout_ms = 120000\n"
-        "retry_count = 1\n\n"
+        "retry_count = 3\n\n"
         "[reasoning]\n"
         "max_rounds = 12\n\n"
         "[safety]\n"

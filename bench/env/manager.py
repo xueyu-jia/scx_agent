@@ -65,16 +65,9 @@ REQUIRED_PACKAGES = (
     "libvirt-daemon-driver-qemu",
 )
 DEFAULT_WORKLOADS = (
-    "hackbench",
     "schbench",
     "stress-ng",
-    "fio",
-    "redis",
-    "rt-tests",
-    "will-it-scale",
     "perf",
-    "bpftool",
-    "batch-microbench",
 )
 
 
@@ -436,7 +429,7 @@ def _build_local_config(
         **data.get("libvirt", {}),
         "uri": "qemu:///system",
         "kernel": str(kernel),
-        "kernel_args": "root=/dev/vda1 console=ttyS0 systemd.mask=boot-efi.mount",
+        "kernel_args": "root=/dev/vda1 console=ttyS0 systemd.mask=boot-efi.mount psi=1",
         "kernel_config": str(kernel_config or kernel_source / ".config"),
         "kernel_source": str(kernel_source),
         "sync_kernel_source": sync_kernel_source,
@@ -600,13 +593,9 @@ def _verify_isolation(config: dict[str, Any]) -> None:
 
 def _verify_workloads() -> None:
     required = [
-        "hackbench",
         "schbench",
         "stress-ng",
-        "fio",
         "perf",
-        "bpftool",
-        "batch_microbench",
     ]
     missing = [
         name for name in required if not (REPO_ROOT / "bench" / "workloads" / "bin" / name).exists()

@@ -85,6 +85,33 @@ class ControlTreatmentTest(unittest.TestCase):
 
 
 class ClassificationAdmissionTest(unittest.TestCase):
+    def test_scheduler_model_must_match_the_treatment_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            options = treatment.Options(
+                mode="classify",
+                duration_seconds=1.0,
+                targets=(treatment.Target("schbench", "latency"),),
+                classify_timeout_seconds=1.0,
+                io_timeout_seconds=0.1,
+                control_socket=root / "control.sock",
+                evidence_dir=root / "evidence",
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {"SCX_PERF_EXPECTED_MODEL": "planned-model"},
+                    clear=True,
+                ),
+                patch.object(
+                    treatment,
+                    "_wait_for_json",
+                    return_value={"model": "unexpected-model"},
+                ),
+                self.assertRaisesRegex(treatment.TreatmentError, "planned-model"),
+            ):
+                treatment._run_classification(options)
+
     def test_committed_episode_and_rule_transition_are_accepted(self) -> None:
         target = treatment.Target("schbench", "latency")
         treatment._verify_rule(self._snapshot(target, learned=False), target, learned=False)

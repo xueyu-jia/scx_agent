@@ -6,7 +6,9 @@ use crate::capability::{
     AdminPolicy, CapabilitySnapshot, ComparisonPolicy, MeasurementProvider, MutationDriver,
     ProbeProvider,
 };
-use crate::domain::{CapabilityId, CapabilityKind, CapabilityMeta, EffectClass};
+use crate::domain::{
+    CapabilityId, CapabilityKind, CapabilityMeta, CapabilityRole, EffectClass, ProviderClass,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryErrorKind {
@@ -156,6 +158,19 @@ impl CapabilityRegistry {
                 format!(
                     "capability '{}' has invalid {:?} effect for {:?}",
                     meta.id, meta.effect, expected_kind
+                ),
+            ));
+        }
+        if meta.role == CapabilityRole::RuntimeSystemGuardrail
+            && (expected_kind != CapabilityKind::Measurement
+                || meta.effect != EffectClass::ReadOnly
+                || meta.provider.provider_class != ProviderClass::Builtin)
+        {
+            return Err(RegistryError::new(
+                RegistryErrorKind::InvalidMetadata,
+                format!(
+                    "capability '{}' has an invalid runtime system guardrail role",
+                    meta.id
                 ),
             ));
         }
@@ -450,6 +465,32 @@ mod tests {
         let mut registry = CapabilityRegistry::new(policy);
         registry.register_probe(provider).unwrap();
         assert!(registry.snapshot().probe(&id).is_some());
+    }
+
+    #[test]
+    fn external_measurement_cannot_claim_runtime_guardrail_role() {
+        let mut measurement_meta = meta(
+            CapabilityId::new("mcp/measurement.guardrail-claim").unwrap(),
+            CapabilityKind::Measurement,
+            EffectClass::ReadOnly,
+            ProviderClass::Mcp,
+        );
+        measurement_meta.role = CapabilityRole::RuntimeSystemGuardrail;
+        let policy = AdminPolicy::default().allow_provider_classes([
+            ProviderClass::Builtin,
+            ProviderClass::Local,
+            ProviderClass::Mcp,
+        ]);
+        let mut registry = CapabilityRegistry::new(policy);
+
+        let error = registry
+            .register_measurement(Arc::new(DummyMeasurement {
+                meta: measurement_meta,
+            }))
+            .unwrap_err();
+
+        assert_eq!(error.kind, RegistryErrorKind::InvalidMetadata);
+        assert!(error.message.contains("runtime system guardrail role"));
     }
 
     #[test]

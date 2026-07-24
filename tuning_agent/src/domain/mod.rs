@@ -14,7 +14,8 @@ mod probe;
 
 pub use candidate::Candidate;
 pub use capability::{
-    CapabilityKind, CapabilityLimits, CapabilityMeta, EffectClass, ProviderClass, ProviderPin,
+    CapabilityKind, CapabilityLimits, CapabilityMeta, CapabilityRole, EffectClass, ProviderClass,
+    ProviderPin,
 };
 pub use commit::CommitAuthorization;
 pub use comparison::{

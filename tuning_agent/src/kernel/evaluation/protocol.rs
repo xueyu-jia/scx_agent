@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -360,6 +361,15 @@ impl AbEvaluationProtocol {
                     ),
                 )
             })?;
+        if !measurement.meta().is_agent_selectable() {
+            return Err(EvaluationError::new(
+                EvaluationErrorKind::InvalidContract,
+                format!(
+                    "measurement '{}' is reserved for runtime system guardrails",
+                    contract.measurement().capability_id
+                ),
+            ));
+        }
         if let Some(deadline) = deadline {
             deadline.ensure_provider_call(
                 measurement.meta(),
@@ -380,6 +390,7 @@ impl AbEvaluationProtocol {
                 ),
             )
         })?;
+        validate_declared_metric_references(contract, measurement.meta())?;
         self.validate_comparison_capabilities(contract, deadline)
     }
 
@@ -660,6 +671,51 @@ impl AbEvaluationProtocol {
     }
 }
 
+fn validate_declared_metric_references(
+    contract: &FrozenEvaluationContract,
+    measurement: &crate::domain::CapabilityMeta,
+) -> Result<(), EvaluationError> {
+    let declared = measurement
+        .output_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    if declared.is_empty() {
+        return Ok(());
+    }
+
+    for binding in contract
+        .primary()
+        .iter()
+        .chain(contract.regression_guards().iter())
+        .chain(contract.workload_invariants().iter())
+    {
+        let Some(conditions) = binding
+            .specification
+            .get("conditions")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for condition in conditions {
+            let Some(metric) = condition.get("metric").and_then(Value::as_str) else {
+                continue;
+            };
+            if !declared.contains(metric) {
+                return Err(EvaluationError::new(
+                    EvaluationErrorKind::InvalidContract,
+                    format!(
+                        "comparison '{}' references metric '{metric}', which measurement '{}' does not declare",
+                        binding.capability_id, measurement.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn side_context(
     context: &InvocationContext,
     side: &str,
@@ -700,8 +756,8 @@ mod tests {
         AdminPolicy, CapabilityRegistry, ComparisonPolicy, MeasurementProvider,
     };
     use crate::domain::{
-        CapabilityId, CapabilityKind, CapabilityMeta, CleanupReceipt, ComparisonConclusion,
-        ConditionEvidence, EffectClass, EpisodeId, MeasurementOpenRequest,
+        CapabilityId, CapabilityKind, CapabilityMeta, CapabilityRole, CleanupReceipt,
+        ComparisonConclusion, ConditionEvidence, EffectClass, EpisodeId, MeasurementOpenRequest,
         MeasurementSampleRequest, MeasurementSession, MeasurementSessionId, MetricBatch,
         MetricKind, MetricQuality, MetricValue, ProviderClass, ProviderError, ProviderId,
         ProviderPin, ProviderVersion,
@@ -941,6 +997,147 @@ mod tests {
         assert_eq!(error.kind, EvaluationErrorKind::BudgetExceeded);
         assert!(error.message.contains("schedules 20 ms"));
         assert_eq!(measurement.opens.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn contract_rejects_metric_not_declared_by_measurement() {
+        let mut measurement_meta = meta(
+            TRUSTED_GUARDRAIL_MEASUREMENT_ID,
+            CapabilityKind::Measurement,
+            EffectClass::ReadOnly,
+        );
+        measurement_meta.output_schema = json!({
+            "type": "object",
+            "properties": {"throughput": {"type": "number"}}
+        });
+        let measurement = Arc::new(QueueMeasurement {
+            meta: measurement_meta,
+            samples: Mutex::new(VecDeque::new()),
+            opens: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
+        let comparison = Arc::new(PassingComparison {
+            meta: meta(
+                "test/comparison-metric-name",
+                CapabilityKind::Comparison,
+                EffectClass::PureComputation,
+            ),
+        });
+        let mut registry = CapabilityRegistry::new(AdminPolicy::default());
+        registry.register_measurement(measurement.clone()).unwrap();
+        registry.register_comparison(comparison.clone()).unwrap();
+        let snapshot = registry.snapshot();
+        let contract = ContractFreezer::new(snapshot.clone())
+            .freeze(
+                crate::domain::ContractId::new("contract-metric-name").unwrap(),
+                EvaluationContractSpec {
+                    measurement: MeasurementBinding {
+                        capability_id: measurement.meta.id.clone(),
+                        specification: json!({}),
+                    },
+                    primary: vec![ComparisonBinding {
+                        capability_id: comparison.meta.id.clone(),
+                        specification: json!({
+                            "conditions": [{
+                                "metric": "loadavg.one_minute",
+                                "op": "current_le",
+                                "value": 1.0
+                            }]
+                        }),
+                    }],
+                    regression_guards: Vec::new(),
+                    workload_invariants: Vec::new(),
+                    sampling: SamplingPlan {
+                        settle_ms: 0,
+                        sample_count: 1,
+                        sample_interval_ms: 0,
+                    },
+                },
+            )
+            .unwrap();
+        let protocol = AbEvaluationProtocol::new(snapshot, Duration::from_secs(1)).unwrap();
+
+        let error = protocol.validate_contract(&contract).unwrap_err();
+
+        assert_eq!(error.kind, EvaluationErrorKind::InvalidContract);
+        assert!(error.message.contains("loadavg.one_minute"));
+        assert!(error.message.contains("does not declare"));
+        assert_eq!(measurement.opens.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn runtime_guardrail_measurement_cannot_become_primary_from_a_stale_contract() {
+        let measurement_id = CapabilityId::new(TRUSTED_GUARDRAIL_MEASUREMENT_ID).unwrap();
+        let comparison_id = CapabilityId::new("test/comparison-stale-guardrail").unwrap();
+
+        let mut old_registry = CapabilityRegistry::new(AdminPolicy::default());
+        old_registry
+            .register_measurement(Arc::new(QueueMeasurement {
+                meta: meta(
+                    measurement_id.as_str(),
+                    CapabilityKind::Measurement,
+                    EffectClass::ReadOnly,
+                ),
+                samples: Mutex::new(VecDeque::new()),
+                opens: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+            }))
+            .unwrap();
+        old_registry
+            .register_comparison(Arc::new(PassingComparison {
+                meta: meta(
+                    comparison_id.as_str(),
+                    CapabilityKind::Comparison,
+                    EffectClass::PureComputation,
+                ),
+            }))
+            .unwrap();
+        let old_snapshot = old_registry.snapshot();
+        let contract = freeze_test_contract(
+            &old_snapshot,
+            measurement_id.clone(),
+            comparison_id.clone(),
+            SamplingPlan {
+                settle_ms: 0,
+                sample_count: 1,
+                sample_interval_ms: 0,
+            },
+            "stale-guardrail",
+        );
+
+        let mut guardrail_meta = meta(
+            measurement_id.as_str(),
+            CapabilityKind::Measurement,
+            EffectClass::ReadOnly,
+        );
+        guardrail_meta.role = CapabilityRole::RuntimeSystemGuardrail;
+        let mut current_registry = CapabilityRegistry::new(AdminPolicy::default());
+        current_registry
+            .register_measurement(Arc::new(QueueMeasurement {
+                meta: guardrail_meta,
+                samples: Mutex::new(VecDeque::new()),
+                opens: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+            }))
+            .unwrap();
+        current_registry
+            .register_comparison(Arc::new(PassingComparison {
+                meta: meta(
+                    comparison_id.as_str(),
+                    CapabilityKind::Comparison,
+                    EffectClass::PureComputation,
+                ),
+            }))
+            .unwrap();
+        let protocol =
+            AbEvaluationProtocol::new(current_registry.snapshot(), Duration::from_secs(1)).unwrap();
+
+        let error = protocol.validate_contract(&contract).unwrap_err();
+
+        assert_eq!(error.kind, EvaluationErrorKind::InvalidContract);
+        assert!(error
+            .message
+            .contains("reserved for runtime system guardrails"));
     }
 
     #[test]

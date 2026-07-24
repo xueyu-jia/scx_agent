@@ -12,6 +12,16 @@ pub enum CapabilityKind {
     Comparison,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityRole {
+    #[default]
+    AgentSelectable,
+    RuntimeSystemGuardrail,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
@@ -62,6 +72,8 @@ pub struct CapabilityMeta {
     pub description: String,
     pub input_schema: Value,
     pub output_schema: Value,
+    #[serde(default)]
+    pub role: CapabilityRole,
     pub allowed_phases: Vec<EpisodePhase>,
     pub limits: CapabilityLimits,
     pub deterministic: bool,
@@ -86,6 +98,7 @@ impl CapabilityMeta {
             description: description.into(),
             input_schema,
             output_schema,
+            role: CapabilityRole::AgentSelectable,
             allowed_phases: Vec::new(),
             limits: CapabilityLimits::default(),
             deterministic: false,
@@ -102,5 +115,9 @@ impl CapabilityMeta {
 
     pub fn is_allowed_in(&self, phase: EpisodePhase) -> bool {
         self.allowed_phases.contains(&phase)
+    }
+
+    pub fn is_agent_selectable(&self) -> bool {
+        self.role == CapabilityRole::AgentSelectable
     }
 }

@@ -25,6 +25,7 @@ impl ContractFreezer {
             .capabilities
             .measurement(&spec.measurement.capability_id)
             .ok_or_else(|| missing("measurement", &spec.measurement.capability_id))?;
+        ensure_agent_selectable_measurement(measurement.meta())?;
         ensure_commit_pending(measurement.meta())?;
         measurement
             .validate_specification(&spec.measurement.specification)
@@ -87,6 +88,22 @@ impl ContractFreezer {
             self.capabilities.generation(),
             pins,
         )
+    }
+}
+
+fn ensure_agent_selectable_measurement(
+    meta: &crate::domain::CapabilityMeta,
+) -> Result<(), EvaluationError> {
+    if meta.is_agent_selectable() {
+        Ok(())
+    } else {
+        Err(EvaluationError::new(
+            EvaluationErrorKind::InvalidContract,
+            format!(
+                "measurement '{}' is reserved for runtime system guardrails",
+                meta.id
+            ),
+        ))
     }
 }
 

@@ -7,10 +7,10 @@ use serde_json::{json, Value};
 
 use crate::capability::MeasurementProvider;
 use crate::domain::{
-    CapabilityId, CapabilityKind, CapabilityMeta, CleanupReceipt, Digest, EffectClass,
-    EpisodePhase, MeasurementOpenRequest, MeasurementSampleRequest, MeasurementSession,
-    MeasurementSessionId, MetricBatch, MetricKind, MetricQuality, MetricValue, ProviderClass,
-    ProviderError, ProviderErrorKind, ProviderId, ProviderPin, ProviderVersion,
+    CapabilityId, CapabilityKind, CapabilityMeta, CapabilityRole, CleanupReceipt, Digest,
+    EffectClass, EpisodePhase, MeasurementOpenRequest, MeasurementSampleRequest,
+    MeasurementSession, MeasurementSessionId, MetricBatch, MetricKind, MetricQuality, MetricValue,
+    ProviderClass, ProviderError, ProviderErrorKind, ProviderId, ProviderPin, ProviderVersion,
 };
 
 const SESSION_PROVIDER: &str = "builtin.core-system-measurement";
@@ -46,10 +46,47 @@ impl CoreSystemMeasurementProvider {
             }),
             json!({
                 "type": "object",
-                "required": ["metrics", "quality"]
+                "additionalProperties": false,
+                "required": [
+                    "loadavg.1m",
+                    "psi.cpu.some.avg10",
+                    "psi.io.some.avg10",
+                    "psi.memory.some.avg10"
+                ],
+                "properties": {
+                    "loadavg.1m": {
+                        "type": "number",
+                        "description": "One-minute runnable and uninterruptible task load average."
+                    },
+                    "psi.cpu.some.avg10": {
+                        "type": "number",
+                        "description": "Ten-second average CPU some-stall pressure percentage."
+                    },
+                    "psi.cpu.full.avg10": {
+                        "type": "number",
+                        "description": "Ten-second average CPU full-stall pressure percentage when exported by the kernel."
+                    },
+                    "psi.io.some.avg10": {
+                        "type": "number",
+                        "description": "Ten-second average I/O some-stall pressure percentage."
+                    },
+                    "psi.io.full.avg10": {
+                        "type": "number",
+                        "description": "Ten-second average I/O full-stall pressure percentage when exported by the kernel."
+                    },
+                    "psi.memory.some.avg10": {
+                        "type": "number",
+                        "description": "Ten-second average memory some-stall pressure percentage."
+                    },
+                    "psi.memory.full.avg10": {
+                        "type": "number",
+                        "description": "Ten-second average memory full-stall pressure percentage when exported by the kernel."
+                    }
+                }
             }),
         )
         .with_allowed_phases([EpisodePhase::CommitPending]);
+        meta.role = CapabilityRole::RuntimeSystemGuardrail;
         meta.idempotent = true;
 
         Self {
@@ -273,6 +310,30 @@ mod tests {
         assert_eq!(batch.metrics["psi.io.full.avg10"].value, json!(0.25));
         assert_eq!(batch.metrics["psi.io.full.avg10"].kind, MetricKind::Gauge);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_declares_exact_output_metric_names() {
+        let provider = CoreSystemMeasurementProvider::new();
+        assert_eq!(provider.meta().role, CapabilityRole::RuntimeSystemGuardrail);
+        assert!(!provider.meta().is_agent_selectable());
+        let properties = provider.meta().output_schema["properties"]
+            .as_object()
+            .unwrap();
+
+        for metric in [
+            "loadavg.1m",
+            "psi.cpu.some.avg10",
+            "psi.cpu.full.avg10",
+            "psi.io.some.avg10",
+            "psi.io.full.avg10",
+            "psi.memory.some.avg10",
+            "psi.memory.full.avg10",
+        ] {
+            assert!(properties.contains_key(metric), "missing metric {metric}");
+        }
+        assert!(!properties.contains_key("cpu.some.avg10"));
+        assert!(!properties.contains_key("loadavg.one_minute"));
     }
 
     #[test]

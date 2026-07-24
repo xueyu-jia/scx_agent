@@ -33,7 +33,7 @@ sudo reboot
 python3 -m bench.env verify
 
 python3 bench/scripts/run.py \
-  --plan smoke \
+  --plan kernel_migration_smoke \
   --baseline default \
   --candidate scx_agent_classed
 ```
@@ -132,6 +132,47 @@ python3 -m bench.env verify \
   --config bench/configs/local_profiles/oe2403sp4_6_6_scx
 ```
 
+openEuler 内核配置包含 `CONFIG_PSI_DEFAULT_DISABLED=y`，因此 direct boot 的
+`libvirt.kernel_args` 必须包含 `psi=1`。否则 guest 不会创建 `/proc/pressure/`，
+tuning-agent 的 A/B evaluation 会在 commit 前安全回滚。
+
+只运行 EEVDF A/A 噪声对比和真实 LLM 正式实验时，使用固定入口脚本。先执行
+不启动 VM 的完整预检，再开始实验。DeepSeek key 只通过当前 shell 环境传入；使用
+无回显读取可避免把 key 留在 shell history：
+
+```bash
+read -rsp 'DeepSeek API key: ' DEEPSEEK_API_KEY
+printf '\n'
+export DEEPSEEK_API_KEY
+
+bash bench/scripts/run_oe2403sp4_real_llm.sh --preflight-only
+bash bench/scripts/run_oe2403sp4_real_llm.sh --latency-gate
+bash bench/scripts/run_oe2403sp4_real_llm.sh
+
+unset DEEPSEEK_API_KEY
+```
+
+脚本使用 OpenAI 兼容协议，在 `127.0.0.1:17002` 启动宿主机 HTTPS gateway，并建立
+`192.168.122.1:17001` 到该 gateway 的 VM relay。真实 key 只存在于 gateway 的
+运行时环境中；guest 只持有本地 token，key 不进入 URL、配置、进程参数、命令日志
+或实验 manifest。gateway 仅将 tuning-agent 的 `/v1` 路由规范化为上述 DeepSeek
+接口使用的无版本前缀路由，不转换消息或 tool-call JSON。
+
+当前上游为 `https://api.deepseek.com`，模型为 `deepseek-v4-flash`。预检通过完整
+relay 链路执行一次真实的 `tool_choice: auto` tool call，确认模型、鉴权和 tuning-agent 所需协议
+均可用。随后脚本依次运行三组 A/A 和三组真实 LLM 对比，并逐组校验 run 状态、
+LLM episode 和 quiet state。默认结果写入带时间戳的
+`bench/results/oe2403sp4_6_6_scx/real_llm/` 子目录。
+当前快速闭环矩阵为三组 A/A 各 2 pair，以及 LATENCY 8 pair、BATCH 4 pair、
+MIX 4 pair，总计 22 pair、44 个 run。
+所有 control/classify treatment 固定为 120 秒，随后再进行 5 秒 post-treatment settle。
+
+`--latency-gate` 只运行一个正式 LATENCY pair：一侧是 `default + control`，另一侧是
+`scx_agent_classed + DeepSeek classify`。LLM 只分类真实 workload `schbench`，不分类
+作为测量包装器的 `perf`。门禁要求唯一的 classification episode 达到
+`committed/improved`，并要求两侧 measurement 都为 `PASS`；适合在完整矩阵前验证
+分类、调度和性能数据采集链路。
+
 先运行单次迁移门禁，再运行正式多次性能测试：
 
 ```bash
@@ -142,12 +183,19 @@ python3 bench/scripts/run.py \
   --candidate scx_agent_classed \
   --parallel 1
 
-python3 bench/scripts/run.py \
-  --config bench/configs/local_profiles/oe2403sp4_6_6_scx \
-  --plan full \
-  --baseline default \
-  --candidate scx_agent_classed \
-  --parallel 1
+for plan in \
+  single_latency_core_measured \
+  single_batch_core_measured \
+  mixed_fixed_rps_core_measured
+do
+  python3 bench/scripts/run.py \
+    --config bench/configs/local_profiles/oe2403sp4_6_6_scx \
+    --plan "$plan" \
+    --baseline default \
+    --candidate scx_agent_classed \
+    --order alternating \
+    --parallel 1
+done
 ```
 
 上面的 paired run 比较同一 openEuler 内核下的 scheduler。比较 Linux 6.18 与
@@ -157,12 +205,12 @@ openEuler 时，必须在两个 profile 中用相同 scheduler、plan、CPU pinn
 ```bash
 python3 bench/scripts/run.py \
   --config bench/configs/local_config \
-  --plan full --scheduler default \
+  --plan single_latency_core_measured --scheduler default \
   --output bench/results/kernel_compare/linux_6_18_default
 
 python3 bench/scripts/run.py \
   --config bench/configs/local_profiles/oe2403sp4_6_6_scx \
-  --plan full --scheduler default \
+  --plan single_latency_core_measured --scheduler default \
   --output bench/results/kernel_compare/oe2403sp4_6_6_default
 
 python3 -m bench.analysis.run \
@@ -212,41 +260,26 @@ cargo build --locked --release \
 
 ## 拉取和构建 Workload
 
-第一批集成的 workload：
+默认配置只准备当前实验使用的 workload：
 
 ```text
-CPU throughput:
-  hackbench
+batch:
   stress-ng
-  will-it-scale
-
-IO unblock:
-  fio
-
-调度 / IPC:
-  perf bench sched pipe
-  perf bench sched messaging
-
-tail latency:
+latency:
   schbench
-  cyclictest
-
-综合构建:
-  kernel build
-
-真实服务场景:
-  redis-server + redis-benchmark
+measurement:
+  perf stat
 ```
 
 拉取并构建：
 
 ```bash
 python3 -m bench.env workloads \
-  hackbench schbench stress-ng fio redis rt-tests will-it-scale perf bpftool
+  schbench stress-ng perf
 ```
 
-`perf` 和 `bpftool` 会根据配置文件中的 `libvirt.kernel_source` 从当前内核源码的
-`tools/perf`、`tools/bpf/bpftool` 构建：
+`perf` 会根据配置文件中的 `libvirt.kernel_source` 从当前内核源码的
+`tools/perf` 构建：
 
 ```yaml
 libvirt:
@@ -265,18 +298,11 @@ bench/workloads/bin/
 bench/workloads/src/
 ```
 
-当前 wrapper：
+当前默认配置使用的 wrapper：
 
 ```text
-bench/benchmarks/hackbench.py
 bench/benchmarks/schbench.py
 bench/benchmarks/stress_ng.py
-bench/benchmarks/fio.py
-bench/benchmarks/redis.py
-bench/benchmarks/perf_sched.py
-bench/benchmarks/will_it_scale.py
-bench/benchmarks/cyclictest.py
-bench/benchmarks/kernel_build.py
 bench/benchmarks/mixed_class.py
 ```
 
@@ -332,7 +358,7 @@ bench_defaults  benchmark 默认 post-warmup settle / cooldown 设置
 executor         pair 并行、自动 CPU pinning 和 host 资源策略
 schedulers       builtin 或 scx 调度器定义
 treatments       measurement 前建立实验状态的可选处理命令
-plans            smoke / full 等测试计划
+plans            迁移门禁、预热和正式测试计划
 machines         VM CPU、内存、pinning、隔离要求
 suites           benchmark 分组
 metric_profiles  primary / secondary 指标和判定规则
@@ -346,11 +372,11 @@ schedulers:
   default:
     kind: builtin
 
-  scx_simple:
+  scx_agent_classed:
     kind: scx
-    command: bench/schedulers/scx_simple
-    host_command: bench/schedulers/scx_simple
-    args: []
+    command: schedule/scx_agent_classed/target/release/scx_agent_classed
+    host_command: schedule/scx_agent_classed/target/release/scx_agent_classed
+    args: [--default-class, batch]
     settle_seconds: 2
 ```
 
@@ -568,9 +594,9 @@ executor。treatment、warmup 与 measurement 的 timeout 都在 guest 内执行
 
 ```bash
 python3 bench/scripts/run.py \
-  --plan smoke \
+  --plan kernel_migration_smoke \
   --baseline default \
-  --candidate scx_simple
+  --candidate scx_agent_classed
 ```
 
 baseline 和 candidate 都可以是 `scx` 调度器。
@@ -579,11 +605,11 @@ baseline 和 candidate 都可以是 `scx` 调度器。
 
 ```bash
 python3 bench/scripts/run.py \
-  --plan smoke \
-  --baseline scx_agent_classed \
-  --candidate scx_agent_classed \
-  --baseline-treatment control \
-  --candidate-treatment agent_tuned
+  --plan single_latency_core_priming \
+  --baseline default \
+  --baseline-treatment llm_latency_control \
+  --candidate scx_agent_classed_llm_latency \
+  --candidate-treatment llm_latency_classify
 ```
 
 没有 treatment 时，原有 scheduler 对比命令和结果目录保持不变。指定
@@ -683,9 +709,9 @@ sudo python3 -m bench.env isolation restore
 
 ```bash
 python3 bench/scripts/run.py \
-  --plan smoke \
+  --plan kernel_migration_smoke \
   --baseline default \
-  --candidate scx_simple \
+  --candidate scx_agent_classed \
   --dry-run
 ```
 
@@ -693,9 +719,9 @@ python3 bench/scripts/run.py \
 
 ```bash
 python3 bench/scripts/run.py \
-  --plan smoke \
+  --plan kernel_migration_smoke \
   --baseline default \
-  --candidate scx_simple
+  --candidate scx_agent_classed
 ```
 
 默认以 comparison pair 为基本单位运行：
@@ -716,9 +742,9 @@ run_index 3: baseline -> candidate
 
 ```bash
 python3 bench/scripts/run.py \
-  --plan smoke \
+  --plan kernel_migration_smoke \
   --baseline default \
-  --candidate scx_simple \
+  --candidate scx_agent_classed \
   --order sequential
 ```
 
@@ -726,9 +752,9 @@ python3 bench/scripts/run.py \
 
 ```bash
 python3 bench/scripts/run.py \
-  --plan smoke \
+  --plan kernel_migration_smoke \
   --baseline default \
-  --candidate scx_simple \
+  --candidate scx_agent_classed \
   --parallel auto
 ```
 
@@ -839,12 +865,12 @@ bench/benchmarks/generic.py
 }
 ```
 
-对于正式测试，建议为不同工具编写专用 wrapper，例如：
+当前正式配置使用三个专用 wrapper：
 
 ```text
-bench/benchmarks/fio.py
 bench/benchmarks/schbench.py
-bench/benchmarks/cyclictest.py
+bench/benchmarks/stress_ng.py
+bench/benchmarks/mixed_class.py
 ```
 
 专用 wrapper 应解析工具原生输出，并输出稳定的指标名，例如：
@@ -864,7 +890,7 @@ elapsed_time_sec
 ```bash
 python3 -m bench.analysis.run \
   --baseline bench/results/experiments/<id>/runs/default \
-  --candidate bench/results/experiments/<id>/runs/scx_simple \
+  --candidate bench/results/experiments/<id>/runs/scx_agent_classed \
   --output /tmp/scx-analysis
 ```
 

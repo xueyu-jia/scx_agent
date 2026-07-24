@@ -21,6 +21,7 @@ DEFAULT_CLASS = "latency"
 DEFAULT_DURATION_SECONDS = 60.0
 DEFAULT_CLASSIFY_TIMEOUT_SECONDS = 300.0
 DEFAULT_IO_TIMEOUT_SECONDS = 5.0
+DEFAULT_EXPECTED_MODEL = "deepseek-v4-flash"
 DEFAULT_STATE_DIR = Path("/tmp/scx-real-llm")
 CONTROL_VERSION = 1
 MAX_FRAME_BYTES = 1024 * 1024
@@ -301,8 +302,13 @@ def _run_classification(options: Options) -> dict[str, Any]:
         "supervisor": evidence_dir / "supervisor.json",
     }
     supervisor = _wait_for_json(paths["supervisor"], options.io_timeout_seconds)
-    if supervisor.get("model") != "gpt-5.5":
-        raise TreatmentError("scheduler supervisor is not configured for model gpt-5.5")
+    expected_model = os.environ.get("SCX_PERF_EXPECTED_MODEL", DEFAULT_EXPECTED_MODEL)
+    if not expected_model:
+        raise TreatmentError("SCX_PERF_EXPECTED_MODEL must not be empty")
+    if supervisor.get("model") != expected_model:
+        raise TreatmentError(
+            f"scheduler supervisor is not configured for model {expected_model}"
+        )
 
     control = ControlClient(options.control_socket, options.io_timeout_seconds)
     expected_rules: dict[str, str] = {}
