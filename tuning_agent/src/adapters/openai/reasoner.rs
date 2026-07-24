@@ -46,6 +46,13 @@ impl AgentReasoner for OpenAiReasoner {
         self.messages.push(ChatMessage::System(
             include_str!("../../system_prompt.md").trim().to_string(),
         ));
+        if context.get("available_skills").is_some() {
+            self.messages.push(ChatMessage::System(
+                include_str!("../../skill/system_prompt.md")
+                    .trim()
+                    .to_string(),
+            ));
+        }
         self.messages.push(ChatMessage::User(context.to_string()));
         self.complete()
     }

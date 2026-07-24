@@ -146,7 +146,7 @@ printf '\n'
 export DEEPSEEK_API_KEY
 
 bash bench/scripts/run_oe2403sp4_real_llm.sh --preflight-only
-bash bench/scripts/run_oe2403sp4_real_llm.sh --latency-gate
+bash bench/scripts/run_oe2403sp4_real_llm.sh --group-gate
 bash bench/scripts/run_oe2403sp4_real_llm.sh
 
 unset DEEPSEEK_API_KEY
@@ -161,17 +161,24 @@ unset DEEPSEEK_API_KEY
 当前上游为 `https://api.deepseek.com`，模型为 `deepseek-v4-flash`。预检通过完整
 relay 链路执行一次真实的 `tool_choice: auto` tool call，确认模型、鉴权和 tuning-agent 所需协议
 均可用。随后脚本依次运行三组 A/A 和三组真实 LLM 对比，并逐组校验 run 状态、
-LLM episode 和 quiet state。默认结果写入带时间戳的
+LLM episode 和 quiet state。校验失败会被记录，但不会阻止后续实验组执行；全部组
+完成后脚本以非零状态退出。默认结果写入带时间戳的
 `bench/results/oe2403sp4_6_6_scx/real_llm/` 子目录。
 当前快速闭环矩阵为三组 A/A 各 2 pair，以及 LATENCY 8 pair、BATCH 4 pair、
 MIX 4 pair，总计 22 pair、44 个 run。
-所有 control/classify treatment 固定为 120 秒，随后再进行 5 秒 post-treatment settle。
+所有 control/classify treatment 固定为 240 秒；classify episode 最多等待 180 秒，
+随后再进行 5 秒 post-treatment settle。
 
-`--latency-gate` 只运行一个正式 LATENCY pair：一侧是 `default + control`，另一侧是
-`scx_agent_classed + DeepSeek classify`。LLM 只分类真实 workload `schbench`，不分类
-作为测量包装器的 `perf`。门禁要求唯一的 classification episode 达到
-`committed/improved`，并要求两侧 measurement 都为 `PASS`；适合在完整矩阵前验证
-分类、调度和性能数据采集链路。
+classify treatment 会先通过共享屏障同时发布该 workload 的全部目标 `comm`，再要求
+`scx_agent_classed` 将它们放进一条 activation 和一个 LLM episode。episode 必须为每个
+目标创建一条 mutation，并通过一次 `request_commit` 原子提交全部规则。LATENCY 包含
+`schbench`，BATCH 包含 `stress-ng` 和 `stress-ng-cpu`，MIX 包含上述三个目标。
+
+`--group-gate` 分别运行一个 LATENCY、BATCH 和 MIX 正式 pair。一侧是
+`default + control`，另一侧是 `scx_agent_classed + DeepSeek classify`。每个 candidate
+run 必须只有一个 `committed/improved` classification episode，mutation 数必须等于
+activation 中的 comm 数，并要求两侧 measurement 都为 `PASS`。BATCH 和 MIX 门禁用于
+确认多 comm 聚合没有被拆成多个 episode。
 
 先运行单次迁移门禁，再运行正式多次性能测试：
 
@@ -503,6 +510,8 @@ tuning-agent 领域流程和私有状态到通用 outcome 的转换。它会：
 - 创建临时 cgroup，并把可选训练负载放入该 cgroup；
 - 启动 mock/真实 LLM 代理等 support process；
 - 启动 tuning-agent daemon；
+- 配置 training ready path 时，等待严格 V1 readiness 文件并验证
+  PID、start time 和 executable；未配置时使用原有 settle sleep；
 - 执行 `tuning-agent activate --wait --json ... <cgroup_path>`；
 - 停止并等待全部辅助进程，验证保留的 cgroup 与 CPU 状态；
 - 原子写入 Outcome V2。
@@ -521,6 +530,12 @@ recovery_required                           -> unsafe
 `recovery_required -> unsafe` 不可配置。激活响应、验证证据和私有状态保存在
 `details` 中供审计，Bench Core 不解释这些内容。
 
+训练负载可配置 `SCX_TUNING_AGENT_TRAINING_READY_PATH` 和
+`SCX_TUNING_AGENT_TRAINING_READY_TIMEOUT_SECONDS`。相对 ready path 以
+`SCX_BENCH_OUT` 为基准。真实模型场景还可分别配置 LLM、MCP 和 evaluation
+timeout；adapter 只在私有临时文件中保存真实 API key，实验 artifact 中的配置会
+将其替换为 `<redacted>`。
+
 确定性测试可以使用 `bench/integrations/tuning_agent/mock_llm.py` 和
 `bench/integrations/tuning_agent/deterministic_mcp.py`。场景由
 `SCX_DETERMINISTIC_SCENARIO` 控制：
@@ -534,24 +549,29 @@ benchmark 自有的 `host_support_files` 会独立复制到
 
 ```yaml
 benches:
-  cgroup_cpu_share:
+  redis_cpu:
     host_support_files:
-      - bench/scenarios/cgroup_cpu/workload.py
-      - bench/scenarios/cgroup_cpu/common.py
+      - bench/scenarios/redis_cpu/workload.py
+      - bench/scenarios/redis_cpu/common.py
     measurement:
       command: python3
       args: [/tmp/scx-bench-workload.d/workload.py]
-      timeout_seconds: 30
+      timeout_seconds: 180
 ```
 
-完整的 cgroup CPU 场景位于 `bench/configs/cgroup_cpu_tuning/`，本地配置
-完成初始化后可运行 paired matrix：
+真实 LLM Redis CPU 场景位于 `bench/configs/redis_cpu_tuning/`。它使用两个
+Redis shard、一个独立 driver CPU 和竞争性 batch workload，训练阶段通过严格
+readiness 文件固定 workload identity，正式测量则使用独立 staged workload：
 
 ```bash
-python3 -m bench.scenarios.cgroup_cpu.matrix \
+python3 -m bench.scenarios.redis_cpu.matrix \
   --config bench/configs/local_config \
-  --plan cgroup_cpu_smoke
+  --plan redis_cpu_smoke
 ```
+
+该场景不提供 Mock LLM。`positive` 和 `no_signal` 统计真实模型决策；
+`regression` 和 `recovery` 使用 `PASS`、`FAIL`、`NOT_EXERCISED`、
+`MODEL_INVALID` 区分 Runtime 安全性与模型路径覆盖率。
 
 VM 与调度器准备阶段使用独立的 settle 时间；workload warmup 必须显式配置
 命令。warmup 成功后等待 `post_warmup_settle_seconds`，再采集 before

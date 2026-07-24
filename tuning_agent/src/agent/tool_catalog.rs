@@ -18,6 +18,8 @@ pub(crate) enum CatalogKind {
     BeginExperiment,
     RequestCommit,
     Abort,
+    LoadSkill,
+    LoadSkillReference,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +109,55 @@ impl ToolCatalog {
                 "properties": { "reason": { "type": "string", "minLength": 1 } }
             }),
         );
+        catalog
+    }
+
+    pub fn from_snapshots(snapshot: &CapabilitySnapshot, skills_available: bool) -> Self {
+        let mut catalog = Self::from_snapshot(snapshot);
+        if skills_available {
+            catalog.add_builtin(
+                "load_skill",
+                CatalogKind::LoadSkill,
+                "Load one available Skill's complete SKILL.md instructions. Use it in a context-only tool-call batch before tuning actions.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+                        }
+                    }
+                }),
+            );
+            catalog.add_builtin(
+                "load_skill_reference",
+                CatalogKind::LoadSkillReference,
+                "Load one UTF-8 reference from an already loaded Skill. Use the exact references/... path returned by load_skill and do not mix this call with tuning actions.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["skill", "path"],
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+                        },
+                        "path": {
+                            "type": "string",
+                            "minLength": 12,
+                            "maxLength": 4096,
+                            "pattern": "^references/"
+                        }
+                    }
+                }),
+            );
+        }
         catalog
     }
 
@@ -300,6 +351,28 @@ mod tests {
         assert!(first
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_'));
+    }
+
+    #[test]
+    fn skill_context_tools_are_only_exposed_when_skills_are_available() {
+        let registry =
+            crate::capability::CapabilityRegistry::new(crate::capability::AdminPolicy::default());
+        let snapshot = registry.snapshot();
+        let without_skills = ToolCatalog::from_snapshots(&snapshot, false);
+        let with_skills = ToolCatalog::from_snapshots(&snapshot, true);
+
+        assert!(!without_skills
+            .specs()
+            .iter()
+            .any(|tool| tool.name == "load_skill"));
+        assert!(with_skills
+            .specs()
+            .iter()
+            .any(|tool| tool.name == "load_skill"));
+        assert!(with_skills
+            .specs()
+            .iter()
+            .any(|tool| tool.name == "load_skill_reference"));
     }
 
     #[test]

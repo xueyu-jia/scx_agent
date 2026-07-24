@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -34,16 +35,9 @@ class TreatmentParsingTest(unittest.TestCase):
         )
         self.assertEqual(options.evidence_dir, Path("/tmp/run/real_llm"))
 
-    def test_single_target_uses_supervisor_target_environment(self) -> None:
-        with patch.dict(
-            os.environ,
-            {"SCX_REAL_LLM_TARGET_COMM": "redis-alt"},
-            clear=True,
-        ):
-            args = treatment._parser().parse_args(["--mode", "classify"])
-            options = treatment._options(args, Path("/tmp/run/treatment"))
-
-        self.assertEqual(options.targets, (treatment.Target("redis-alt", "latency"),))
+    def test_target_is_required(self) -> None:
+        with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+            treatment._parser().parse_args(["--mode", "classify"])
 
     def test_duplicate_target_is_rejected(self) -> None:
         args = treatment._parser().parse_args(
@@ -72,8 +66,8 @@ class ControlTreatmentTest(unittest.TestCase):
                         "control",
                         "--duration-seconds",
                         "0.05",
-                        "--comm",
-                        "scx-treat-b",
+                        "--target",
+                        "scx-treat-b=batch",
                     ]
                 )
 
@@ -82,6 +76,28 @@ class ControlTreatmentTest(unittest.TestCase):
             self.assertEqual(value["version"], 2)
             self.assertEqual(value["disposition"], "proceed")
             self.assertEqual(value["details"]["discovery"]["process_count"], 1)
+
+
+class GroupProcessTest(unittest.TestCase):
+    def test_group_barrier_publishes_all_comms(self) -> None:
+        for iteration in range(50):
+            prefix = f"g{os.getpid():x}{iteration:02x}"
+            targets = (
+                treatment.Target(f"{prefix}a", "latency"),
+                treatment.Target(f"{prefix}b", "batch"),
+            )
+            processes = treatment._start_target_group(targets, 2.0)
+            try:
+                for target, process in processes:
+                    observed = (
+                        Path(f"/proc/{process.pid}/comm")
+                        .read_text(encoding="utf-8")
+                        .strip()
+                    )
+                    self.assertEqual(observed, target.comm)
+            finally:
+                for _target, process in processes:
+                    treatment._terminate(process)
 
 
 class ClassificationAdmissionTest(unittest.TestCase):
@@ -112,47 +128,68 @@ class ClassificationAdmissionTest(unittest.TestCase):
             ):
                 treatment._run_classification(options)
 
-    def test_committed_episode_and_rule_transition_are_accepted(self) -> None:
-        target = treatment.Target("schbench", "latency")
-        treatment._verify_rule(self._snapshot(target, learned=False), target, learned=False)
-        treatment._verify_rule(self._snapshot(target, learned=True), target, learned=True)
-        treatment._verify_episode(
-            [
-                {
-                    "event": "episode_started",
-                    "episode_id": 7,
-                    "data": {
-                        "activation": {"evidence": {"unknown_comms": [target.comm]}}
-                    },
-                }
-            ],
+    def test_committed_group_episode_is_accepted(self) -> None:
+        targets = (
+            treatment.Target("schbench", "latency"),
+            treatment.Target("stress-ng", "batch"),
+        )
+        audit = self._group_audit(targets)
+
+        mutation_count = treatment._verify_group_episode(
+            audit,
             7,
             {
                 "phase": "committed",
                 "data": {"decision": {"verdict": "improved"}},
             },
-            target,
+            targets,
         )
 
-    def test_non_committed_episode_is_rejected(self) -> None:
-        target = treatment.Target("schbench", "latency")
-        with self.assertRaisesRegex(treatment.TreatmentError, "did not commit"):
-            treatment._verify_episode(
-                [
-                    {
-                        "event": "episode_started",
-                        "episode_id": 7,
-                        "data": {
-                            "activation": {"evidence": {"unknown_comms": [target.comm]}}
-                        },
-                    }
-                ],
+        self.assertEqual(mutation_count, 2)
+
+    def test_split_group_activation_is_rejected(self) -> None:
+        targets = (
+            treatment.Target("schbench", "latency"),
+            treatment.Target("stress-ng", "batch"),
+        )
+        audit = self._group_audit(targets)
+        audit[0]["data"]["activation"]["evidence"]["unknown_comms"] = ["schbench"]
+
+        with self.assertRaisesRegex(treatment.TreatmentError, "group activation contained"):
+            treatment._verify_group_episode(
+                audit,
                 7,
-                {"phase": "clean", "data": {}},
-                target,
+                {
+                    "phase": "committed",
+                    "data": {"decision": {"verdict": "improved"}},
+                },
+                targets,
             )
 
-    def test_extra_unknown_comm_episode_is_rejected(self) -> None:
+    def test_partial_group_mutation_is_rejected(self) -> None:
+        targets = (
+            treatment.Target("schbench", "latency"),
+            treatment.Target("stress-ng", "batch"),
+        )
+        audit = self._group_audit(targets)
+        audit = [
+            record
+            for record in audit
+            if record.get("data", {}).get("call_id") not in {"mutate-2"}
+        ]
+
+        with self.assertRaisesRegex(treatment.TreatmentError, "mutations differ"):
+            treatment._verify_group_episode(
+                audit,
+                7,
+                {
+                    "phase": "committed",
+                    "data": {"decision": {"verdict": "improved"}},
+                },
+                targets,
+            )
+
+    def test_extra_episode_is_rejected(self) -> None:
         records = [
             {"event": "episode_started", "episode_id": 1},
             {"event": "episode_finished", "episode_id": 1},
@@ -189,7 +226,14 @@ class ClassificationAdmissionTest(unittest.TestCase):
                     patch.object(treatment, "_run_classification", side_effect=classify),
                 ):
                     returncode = treatment.main(
-                        ["--mode", "classify", "--duration-seconds", "0.01"]
+                        [
+                            "--mode",
+                            "classify",
+                            "--duration-seconds",
+                            "0.01",
+                            "--target",
+                            "schbench=latency",
+                        ]
                     )
 
                 self.assertEqual(returncode, 0)
@@ -198,21 +242,104 @@ class ClassificationAdmissionTest(unittest.TestCase):
                 self.assertIn(expected, value["reason"]["message"])
 
     @staticmethod
-    def _snapshot(target: treatment.Target, *, learned: bool) -> dict[str, object]:
-        rule: dict[str, object] = {
-            "comm": target.comm,
-            "class": target.rule_class if learned else "batch",
-            "source": "learned" if learned else "default",
-            "consistent": True,
-        }
-        if learned:
-            rule.update(
-                {
-                    "active_class": target.rule_class,
-                    "persisted_class": target.rule_class,
-                }
+    def _group_audit(targets: tuple[treatment.Target, ...]) -> list[dict[str, object]]:
+        episode_id = 7
+        change_ids = [f"change-{index}" for index in range(1, len(targets) + 1)]
+        records: list[dict[str, object]] = [
+            {
+                "event": "episode_started",
+                "episode_id": episode_id,
+                "data": {
+                    "activation": {
+                        "evidence": {
+                            "unknown_comms": sorted(target.comm for target in targets)
+                        }
+                    }
+                },
+            },
+            {
+                "event": "agent_command",
+                "episode_id": episode_id,
+                "data": {
+                    "call_id": "begin",
+                    "tool": "begin_experiment",
+                    "arguments": {
+                        "evaluation_contract": {
+                            "measurement": {
+                                "specification": {
+                                    "targets": [
+                                        {"comm": target.comm, "class": target.rule_class}
+                                        for target in targets
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+        ]
+        for index, (target, change_id) in enumerate(zip(targets, change_ids), start=1):
+            call_id = f"mutate-{index}"
+            records.extend(
+                [
+                    {
+                        "event": "agent_command",
+                        "episode_id": episode_id,
+                        "data": {
+                            "call_id": call_id,
+                            "tool": "experiment-dynamic",
+                            "arguments": {
+                                "arguments": {
+                                    "comm": target.comm,
+                                    "class": target.rule_class,
+                                }
+                            },
+                        },
+                    },
+                    {
+                        "event": "agent_command_result",
+                        "episode_id": episode_id,
+                        "data": {
+                            "call_id": call_id,
+                            "ok": True,
+                            "content": {
+                                "change": {
+                                    "capability_id": "mcp/scx-agent-classed/rule.upsert.v1",
+                                    "change_id": change_id,
+                                }
+                            },
+                        },
+                    },
+                ]
             )
-        return {"revision": 3 if learned else 0, "rules_seq": 8 if learned else 2, "rules": [rule]}
+        records.extend(
+            [
+                {
+                    "event": "agent_command",
+                    "episode_id": episode_id,
+                    "data": {
+                        "call_id": "commit",
+                        "tool": "request_commit",
+                        "arguments": {"change_ids": change_ids},
+                    },
+                },
+                {
+                    "event": "agent_command_result",
+                    "episode_id": episode_id,
+                    "data": {
+                        "call_id": "commit",
+                        "ok": True,
+                        "content": {
+                            "committed": True,
+                            "finalized_changes": [
+                                {"change_id": change_id} for change_id in change_ids
+                            ],
+                        },
+                    },
+                },
+            ]
+        )
+        return records
 
 
 if __name__ == "__main__":

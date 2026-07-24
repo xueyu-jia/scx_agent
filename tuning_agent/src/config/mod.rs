@@ -4,5 +4,5 @@ mod model;
 pub use model::{
     ActivationConfig, AuditConfig, CapabilityConfig, Config, LlmConfig, LocalMutationConfig,
     LocalMutationTargetConfig, McpConfig, McpServerConfig, ReasoningConfig, SafetyConfig,
-    TransactionConfig,
+    SkillConfig, TransactionConfig,
 };

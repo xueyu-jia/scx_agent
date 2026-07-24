@@ -7,9 +7,10 @@ mod measurement;
 mod protocol;
 mod verdict;
 
+#[cfg(test)]
+pub use condition::MetricOperator;
 pub use condition::{
     evaluate_metric_condition, ConditionOutcome, MetricCondition, MetricConditionEvidence,
-    MetricOperator,
 };
 pub use contract::{
     CapabilityBindingPin, ComparisonBinding, EvaluationContractSpec, FrozenEvaluationContract,

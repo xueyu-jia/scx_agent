@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tuning_agent::activation::source::{send_unix_activation, send_unix_activation_request};
+use tuning_agent::activation::source::{
+    send_unix_activation_request, send_unix_activation_request_nowait,
+};
 use tuning_agent::activation::{ActivationEvent, ActivationRequest, EventSource, Scope, Severity};
 use tuning_agent::config::Config;
 use tuning_agent::runtime::Runtime;
@@ -35,9 +37,11 @@ fn main() {
             wait,
             json,
             timeout,
+            requested_skills,
         } => {
+            let request = ActivationRequest::new(new_request_id(), wait, event)
+                .with_requested_skills(requested_skills);
             if wait {
-                let request = ActivationRequest::new(new_request_id(), true, event);
                 let response = match send_unix_activation_request(
                     &config.activation.socket_path,
                     &request,
@@ -64,7 +68,9 @@ fn main() {
                     );
                 }
             } else {
-                if let Err(err) = send_unix_activation(&config.activation.socket_path, &event) {
+                if let Err(err) =
+                    send_unix_activation_request_nowait(&config.activation.socket_path, &request)
+                {
                     eprintln!("activation send failed: {err}");
                     std::process::exit(1);
                 }
@@ -79,7 +85,7 @@ fn main() {
                         })
                     );
                 } else {
-                    println!("activation sent: {}", event.event_type);
+                    println!("activation sent: {}", request.event.event_type);
                 }
             }
         }
@@ -99,6 +105,7 @@ enum Command {
         wait: bool,
         json: bool,
         timeout: Duration,
+        requested_skills: Vec<String>,
     },
     Help,
 }
@@ -129,6 +136,7 @@ fn parse_command(command: Option<&str>, args: &mut impl Iterator<Item = String>)
             let mut wait = false;
             let mut json = false;
             let mut timeout = Duration::from_secs(600);
+            let mut requested_skills = Vec::new();
             let mut positional = Vec::new();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -142,6 +150,12 @@ fn parse_command(command: Option<&str>, args: &mut impl Iterator<Item = String>)
                             Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
                             _ => return Command::Help,
                         };
+                    }
+                    "--skill" => {
+                        let Some(value) = args.next() else {
+                            return Command::Help;
+                        };
+                        requested_skills.push(value);
                     }
                     _ => positional.push(arg),
                 }
@@ -170,6 +184,7 @@ fn parse_command(command: Option<&str>, args: &mut impl Iterator<Item = String>)
                 wait,
                 json,
                 timeout,
+                requested_skills,
             }
         }
         Some("-h") | Some("--help") | None => Command::Help,
@@ -205,7 +220,7 @@ fn print_help() {
     println!("usage:");
     println!("  tuning-agent [--config path] daemon");
     println!(
-        "  tuning-agent [--config path] activate [--wait] [--json] [--timeout-seconds N] [event_type] [info|warning|critical] [cli|internal|name] [cgroup_path]"
+        "  tuning-agent [--config path] activate [--wait] [--json] [--timeout-seconds N] [--skill NAME]... [event_type] [info|warning|critical] [cli|internal|name] [cgroup_path]"
     );
     println!();
     println!("behavior:");

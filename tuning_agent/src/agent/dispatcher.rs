@@ -5,9 +5,10 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::agent::tool_catalog::CatalogKind;
-use crate::agent::{AgentCommand, AgentToolInvocation, ToolCatalog};
+use crate::agent::{AgentCommand, AgentToolInvocation, DecodedToolCall, ToolCatalog};
 use crate::domain::ChangeId;
 use crate::kernel::evaluation::EvaluationIntentSpec;
+use crate::skill::SkillCommand;
 
 pub struct ToolDispatcher<'a> {
     catalog: &'a ToolCatalog,
@@ -18,20 +19,23 @@ impl<'a> ToolDispatcher<'a> {
         Self { catalog }
     }
 
-    pub fn decode(&self, invocation: &AgentToolInvocation) -> Result<AgentCommand, DispatchError> {
+    pub(crate) fn decode(
+        &self,
+        invocation: &AgentToolInvocation,
+    ) -> Result<DecodedToolCall, DispatchError> {
         let entry = self.catalog.entry(&invocation.name).ok_or_else(|| {
             DispatchError::new(format!("unknown agent tool '{}'", invocation.name))
         })?;
         match entry.kind {
-            CatalogKind::Probe => Ok(AgentCommand::Probe {
+            CatalogKind::Probe => Ok(DecodedToolCall::Action(AgentCommand::Probe {
                 call_id: invocation.id.clone(),
                 capability_id: entry
                     .capability_id
                     .clone()
                     .expect("probe catalog entry must have capability id"),
                 arguments: invocation.arguments.clone(),
-            }),
-            CatalogKind::Mutation => Ok(AgentCommand::Mutation {
+            })),
+            CatalogKind::Mutation => Ok(DecodedToolCall::Action(AgentCommand::Mutation {
                 call_id: invocation.id.clone(),
                 capability_id: entry
                     .capability_id
@@ -39,25 +43,38 @@ impl<'a> ToolDispatcher<'a> {
                     .expect("mutation catalog entry must have capability id"),
                 arguments: required_value(&invocation.arguments, "arguments")?.clone(),
                 reason: required_string(&invocation.arguments, "reason")?,
-            }),
-            CatalogKind::BeginExperiment => Ok(AgentCommand::BeginExperiment {
+            })),
+            CatalogKind::BeginExperiment => {
+                Ok(DecodedToolCall::Action(AgentCommand::BeginExperiment {
+                    call_id: invocation.id.clone(),
+                    intent: serde_json::from_value::<EvaluationIntentSpec>(
+                        invocation.arguments.clone(),
+                    )
+                    .map_err(|error| {
+                        DispatchError::new(format!("invalid evaluation intent: {error}"))
+                    })?,
+                }))
+            }
+            CatalogKind::RequestCommit => {
+                Ok(DecodedToolCall::Action(AgentCommand::RequestCommit {
+                    call_id: invocation.id.clone(),
+                    change_ids: parse_change_ids(&invocation.arguments)?,
+                    reason: required_string(&invocation.arguments, "reason")?,
+                }))
+            }
+            CatalogKind::Abort => Ok(DecodedToolCall::Action(AgentCommand::Abort {
                 call_id: invocation.id.clone(),
-                intent: serde_json::from_value::<EvaluationIntentSpec>(
-                    invocation.arguments.clone(),
-                )
-                .map_err(|error| {
-                    DispatchError::new(format!("invalid evaluation intent: {error}"))
-                })?,
-            }),
-            CatalogKind::RequestCommit => Ok(AgentCommand::RequestCommit {
-                call_id: invocation.id.clone(),
-                change_ids: parse_change_ids(&invocation.arguments)?,
                 reason: required_string(&invocation.arguments, "reason")?,
-            }),
-            CatalogKind::Abort => Ok(AgentCommand::Abort {
-                call_id: invocation.id.clone(),
-                reason: required_string(&invocation.arguments, "reason")?,
-            }),
+            })),
+            CatalogKind::LoadSkill => Ok(DecodedToolCall::Context(SkillCommand::LoadSkill {
+                name: required_string(&invocation.arguments, "name")?,
+            })),
+            CatalogKind::LoadSkillReference => {
+                Ok(DecodedToolCall::Context(SkillCommand::LoadReference {
+                    skill: required_string(&invocation.arguments, "skill")?,
+                    path: required_string(&invocation.arguments, "path")?,
+                }))
+            }
         }
     }
 }
@@ -157,5 +174,23 @@ mod tests {
         };
 
         assert!(ToolDispatcher::new(&catalog).decode(&invocation).is_err());
+    }
+
+    #[test]
+    fn skill_loader_decodes_as_a_context_command() {
+        let snapshot = crate::capability::CapabilityRegistry::new(Default::default()).snapshot();
+        let catalog = ToolCatalog::from_snapshots(&snapshot, true);
+        let invocation = AgentToolInvocation {
+            id: "call-skill".to_string(),
+            name: "load_skill".to_string(),
+            arguments: json!({"name": "scheduler-guide"}),
+        };
+
+        assert_eq!(
+            ToolDispatcher::new(&catalog).decode(&invocation).unwrap(),
+            DecodedToolCall::Context(SkillCommand::LoadSkill {
+                name: "scheduler-guide".into()
+            })
+        );
     }
 }

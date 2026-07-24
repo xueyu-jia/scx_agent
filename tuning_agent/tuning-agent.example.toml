@@ -24,6 +24,19 @@ path = "logs/audit.jsonl"
 [transaction]
 wal_dir = "state/transactions"
 
+[skills]
+enabled = false
+# roots = ["/etc/tuning-agent/skills"]
+max_skills = 64
+max_catalog_chars = 8000
+max_loaded_skills = 4
+max_skill_rounds = 4
+max_reference_reads = 8
+max_skill_bytes = 131072
+max_reference_bytes = 262144
+max_references_per_skill = 128
+max_registry_bytes = 16777216
+
 [capabilities]
 allowed_capabilities = []
 denied_capabilities = []

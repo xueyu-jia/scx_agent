@@ -65,6 +65,8 @@ impl ActivationEvent {
 pub struct ActivationRequest {
     pub request_id: String,
     pub wait: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_skills: Vec<String>,
     pub event: ActivationEvent,
 }
 
@@ -73,14 +75,21 @@ impl ActivationRequest {
         Self {
             request_id,
             wait,
+            requested_skills: Vec::new(),
             event,
         }
+    }
+
+    pub fn with_requested_skills(mut self, requested_skills: Vec<String>) -> Self {
+        self.requested_skills = requested_skills;
+        self
     }
 
     pub fn fire_and_forget(event: ActivationEvent) -> Self {
         Self {
             request_id: format!("legacy-{}", event.timestamp_ns),
             wait: false,
+            requested_skills: Vec::new(),
             event,
         }
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -8,12 +9,69 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ADAPTER = Path("bench/integrations/tuning_agent/adapter.py").resolve()
 
 
+def load_adapter_module() -> object:
+    spec = importlib.util.spec_from_file_location("tuning_agent_adapter_test", ADAPTER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class TuningAgentAdapterTest(unittest.TestCase):
+    def test_training_readiness_validates_live_process_identity(self) -> None:
+        adapter = load_adapter_module()
+        identity = adapter._process_identity(os.getpid())
+        ready = adapter._validate_training_ready(
+            {
+                "version": 1,
+                "ready": True,
+                "workload_digest": "sha256:" + "a" * 64,
+                "processes": [identity],
+            }
+        )
+
+        self.assertTrue(ready["ready"])
+        stale = {**identity, "start_time_ticks": identity["start_time_ticks"] + 1}
+        with self.assertRaisesRegex(adapter.AdapterError, "identity changed"):
+            adapter._validate_training_ready(
+                {
+                    "version": 1,
+                    "ready": True,
+                    "workload_digest": "sha256:" + "a" * 64,
+                    "processes": [stale],
+                }
+            )
+
+    def test_training_readiness_rejects_unknown_fields_and_invalid_digest(self) -> None:
+        adapter = load_adapter_module()
+        identity = adapter._process_identity(os.getpid())
+        with self.assertRaisesRegex(adapter.AdapterError, "strict V1"):
+            adapter._validate_training_ready(
+                {
+                    "version": 1,
+                    "ready": True,
+                    "workload_digest": "sha256:" + "a" * 64,
+                    "processes": [identity],
+                    "extra": True,
+                }
+            )
+        with self.assertRaisesRegex(adapter.AdapterError, "sha256"):
+            adapter._validate_training_ready(
+                {
+                    "version": 1,
+                    "ready": True,
+                    "workload_digest": "not-a-digest",
+                    "processes": [identity],
+                }
+            )
+
     def test_activation_statuses_map_to_treatment_outcomes(self) -> None:
         cases = (
             ("committed", "stop", "proceed", "tuning_agent.committed"),
@@ -63,6 +121,20 @@ class TuningAgentAdapterTest(unittest.TestCase):
             self.assertTrue(scope.is_dir())
             self.assertEqual(outcome["details"]["cgroup_path"], str(scope))
             self.assertEqual(outcome["details"]["cgroup_lifecycle"], "vm")
+
+    def test_generated_config_redacts_api_key_from_bench_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {"SCX_TUNING_AGENT_LLM_API_KEY": "super-secret-test-key"},
+        ):
+            root = Path(temp_dir)
+            result, outcome = self._run_adapter_at(root, "committed")
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertIsNotNone(outcome)
+            config = (root / "out" / "tuning-agent.toml").read_text(encoding="utf-8")
+            self.assertNotIn("super-secret-test-key", config)
+            self.assertIn('api_key = "<redacted>"', config)
 
     def _run_adapter(
         self,

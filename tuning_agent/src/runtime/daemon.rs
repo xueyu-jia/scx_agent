@@ -19,12 +19,14 @@ use crate::runtime::episode::EpisodeCoordinator;
 use crate::runtime::recovery::{
     recover_available_before_plugin_bootstrap, recover_before_activation,
 };
+use crate::skill::{SkillRegistry, SkillSnapshot};
 
 pub struct Runtime {
     config: Config,
     activation: ActivationKernel,
     audit: JsonlAuditSink,
     capabilities: CapabilityRegistry,
+    skills: SkillSnapshot,
     transactions: TransactionStore,
 }
 
@@ -37,6 +39,7 @@ impl Runtime {
             .map_err(|error| error.to_string())?;
         let mut bootstrap = build_local_registry(&config.capabilities, &config.mcp);
         recover_available_before_plugin_bootstrap(&transactions, bootstrap.registry.snapshot());
+        let skills = SkillRegistry::load(&config.skills)?;
         extend_registry_with_mcp(&mut bootstrap, &config.mcp);
         let RegistryBootstrap {
             registry: capabilities,
@@ -81,6 +84,16 @@ impl Runtime {
         )) {
             activation_blockers.push(format!("failed to initialize audit sink: {error}"));
         }
+        if let Err(error) = audit.record(&AuditRecord::runtime(
+            "skill_registry_ready",
+            json!({
+                "skill_count": skills.len(),
+                "registry_digest": skills.digest().to_string(),
+                "enabled": config.skills.enabled,
+            }),
+        )) {
+            activation_blockers.push(format!("failed to audit skill registry: {error}"));
+        }
 
         if !activation_blockers.is_empty() {
             return Err(format!(
@@ -93,6 +106,7 @@ impl Runtime {
             activation: ActivationKernel::default(),
             audit,
             capabilities,
+            skills,
             transactions,
         })
     }
@@ -172,14 +186,32 @@ impl Runtime {
             self.config.reasoning.max_rounds,
             Duration::from_millis(self.config.safety.evaluation_timeout_ms),
             self.capabilities.snapshot(),
+            self.skills.clone(),
+            self.config.skills.clone(),
             &self.transactions,
             &mut self.audit,
         )
-        .and_then(|mut coordinator| coordinator.run(episode_id, activation, &mut reasoner))
-        {
+        .and_then(|mut coordinator| {
+            coordinator.run(
+                episode_id,
+                activation,
+                &request.requested_skills,
+                &mut reasoner,
+            )
+        }) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.activation.sleep();
+                self.audit.record(&AuditRecord::episode(
+                    "episode_rejected",
+                    episode_id,
+                    EpisodePhase::Clean,
+                    json!({
+                        "error": error.to_string(),
+                        "request_id": request.request_id,
+                        "requested_skills": request.requested_skills,
+                    }),
+                ))?;
                 return Ok(ActivationResponse::error(
                     request.request_id,
                     error.to_string(),

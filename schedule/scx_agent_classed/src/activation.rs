@@ -3,13 +3,14 @@ use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam::channel::{self, Receiver, Sender, TrySendError};
-use serde::Serialize;
+use crossbeam::channel::{self, Receiver, Sender, TryRecvError, TrySendError};
+use serde::{Deserialize, Serialize};
 use socket2::{Domain, SockAddr, Socket, Type};
+
+use crate::rules::Comm;
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -21,91 +22,168 @@ pub struct RuleMissActivation {
     pub revision: u64,
 }
 
+#[derive(Debug)]
+pub struct ActivationBatcher {
+    pending: BTreeSet<Comm>,
+    pending_since: Option<Instant>,
+    in_flight: Option<Vec<Comm>>,
+    coalesce: Duration,
+    max_batch: usize,
+}
+
+impl ActivationBatcher {
+    pub fn new(coalesce: Duration, max_batch: usize) -> Self {
+        assert!(max_batch > 0);
+        Self {
+            pending: BTreeSet::new(),
+            pending_since: None,
+            in_flight: None,
+            coalesce,
+            max_batch,
+        }
+    }
+
+    pub fn observe(&mut self, comm: Comm, now: Instant) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|batch| batch.contains(&comm))
+        {
+            return;
+        }
+        if self.pending.insert(comm) && self.pending_since.is_none() {
+            self.pending_since = Some(now);
+        }
+    }
+
+    pub fn remove_pending(&mut self, comm: &Comm) {
+        self.pending.remove(comm);
+        if self.pending.is_empty() {
+            self.pending_since = None;
+        }
+    }
+
+    pub fn pending(&self) -> impl Iterator<Item = &Comm> {
+        self.pending.iter()
+    }
+
+    pub fn take_ready(&mut self, now: Instant) -> Option<Vec<Comm>> {
+        if self.in_flight.is_some() || self.pending.is_empty() {
+            return None;
+        }
+        let ready = self.pending.len() >= self.max_batch
+            || self
+                .pending_since
+                .is_some_and(|started| now.duration_since(started) >= self.coalesce);
+        if !ready {
+            return None;
+        }
+
+        let batch = self
+            .pending
+            .iter()
+            .take(self.max_batch)
+            .cloned()
+            .collect::<Vec<_>>();
+        for comm in &batch {
+            self.pending.remove(comm);
+        }
+        if self.pending.is_empty() {
+            self.pending_since = None;
+        }
+        self.in_flight = Some(batch.clone());
+        Some(batch)
+    }
+
+    pub fn finish(&mut self) -> Option<Vec<Comm>> {
+        self.in_flight.take()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationResponse {
+    pub accepted: bool,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivationCompletion {
+    Response(ActivationResponse),
+    Failed(String),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NotifyOutcome {
-    Queued,
-    Suppressed,
-    Full,
+pub enum NotifierError {
+    Busy,
     Disconnected,
 }
 
 pub struct ActivationNotifier {
-    sender: Option<Sender<RuleMissActivation>>,
-    claimed_comms: Arc<Mutex<BTreeSet<String>>>,
+    commands: Option<Sender<RuleMissActivation>>,
+    completions: Receiver<ActivationCompletion>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ActivationNotifier {
     pub fn start(socket_path: PathBuf, scheduler_instance_id: String) -> Self {
-        let (sender, receiver) = channel::bounded::<RuleMissActivation>(64);
+        let (commands, command_receiver) = channel::bounded::<RuleMissActivation>(1);
+        let (completion_sender, completions) = channel::bounded::<ActivationCompletion>(1);
         let (stop, stopped) = channel::bounded::<()>(1);
-        let claimed_comms = Arc::new(Mutex::new(BTreeSet::new()));
-        let worker_claimed_comms = Arc::clone(&claimed_comms);
         let worker = std::thread::spawn(move || loop {
-            if stopped.try_recv().is_ok() {
-                break;
-            }
+            let activation = crossbeam::select! {
+                recv(stopped) -> _ => break,
+                recv(command_receiver) -> command => match command {
+                    Ok(command) => command,
+                    Err(_) => break,
+                },
+            };
+            let completion =
+                match send_activation(&socket_path, &scheduler_instance_id, activation, &stopped) {
+                    Ok(response) => ActivationCompletion::Response(response),
+                    Err(error) => ActivationCompletion::Failed(error.to_string()),
+                };
             crossbeam::select! {
                 recv(stopped) -> _ => break,
-                recv(receiver) -> activation => match activation {
-                    Ok(activation) => {
-                        let comms = activation.comms.clone();
-                        if let Err(error) = send_activation(
-                            &socket_path,
-                            &scheduler_instance_id,
-                            activation,
-                            &stopped,
-                        ) {
-                            log::warn!("failed to notify tuning-agent: {error}");
-                        }
-                        release_claims(&worker_claimed_comms, &comms);
+                send(completion_sender, completion) -> result => {
+                    if result.is_err() {
+                        break;
                     }
-                    Err(_) => break,
-                }
+                },
             }
         });
         Self {
-            sender: Some(sender),
-            claimed_comms,
+            commands: Some(commands),
+            completions,
             stop,
             worker: Some(worker),
         }
     }
 
-    pub fn notify(&self, mut activation: RuleMissActivation) -> NotifyOutcome {
-        let Some(sender) = &self.sender else {
-            log::warn!("dropping tuning-agent activation: notifier is disconnected");
-            return NotifyOutcome::Disconnected;
+    pub fn start_activation(&self, activation: RuleMissActivation) -> Result<(), NotifierError> {
+        let Some(commands) = &self.commands else {
+            return Err(NotifierError::Disconnected);
         };
-
-        if claim_unseen(&self.claimed_comms, &mut activation.comms).is_err() {
-            log::warn!("dropping tuning-agent activation: comm claim lock is poisoned");
-            return NotifyOutcome::Disconnected;
+        match commands.try_send(activation) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(NotifierError::Busy),
+            Err(TrySendError::Disconnected(_)) => Err(NotifierError::Disconnected),
         }
-        if activation.comms.is_empty() {
-            return NotifyOutcome::Suppressed;
-        }
+    }
 
-        match sender.try_send(activation) {
-            Ok(()) => NotifyOutcome::Queued,
-            Err(TrySendError::Full(activation)) => {
-                release_claims(&self.claimed_comms, &activation.comms);
-                log::warn!("delaying tuning-agent activation: notifier queue is full");
-                NotifyOutcome::Full
-            }
-            Err(TrySendError::Disconnected(activation)) => {
-                release_claims(&self.claimed_comms, &activation.comms);
-                log::warn!("dropping tuning-agent activation: notifier is disconnected");
-                NotifyOutcome::Disconnected
-            }
+    pub fn poll_completion(&self) -> Result<Option<ActivationCompletion>, NotifierError> {
+        match self.completions.try_recv() {
+            Ok(completion) => Ok(Some(completion)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(NotifierError::Disconnected),
         }
     }
 }
 
 impl Drop for ActivationNotifier {
     fn drop(&mut self) {
-        self.sender.take();
+        self.commands.take();
         let _ = self.stop.try_send(());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -142,12 +220,20 @@ struct ActivationEvidence<'a> {
     persistent_revision: u64,
 }
 
+#[derive(Deserialize)]
+struct WireActivationResponse {
+    request_id: String,
+    status: String,
+    accepted: bool,
+    error: Option<String>,
+}
+
 fn send_activation(
     socket_path: &PathBuf,
     scheduler_instance_id: &str,
     activation: RuleMissActivation,
     stop: &Receiver<()>,
-) -> std::io::Result<()> {
+) -> std::io::Result<ActivationResponse> {
     let timestamp_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -197,24 +283,19 @@ fn send_activation(
         }
     }
 
-    let value: serde_json::Value = serde_json::from_slice(&response)?;
-    if value.get("request_id").and_then(serde_json::Value::as_str) != Some(&request_id) {
+    let response: WireActivationResponse =
+        serde_json::from_slice(&response).map_err(std::io::Error::other)?;
+    if response.request_id != request_id {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "tuning-agent activation response has the wrong request_id",
         ));
     }
-    if value
-        .get("accepted")
-        .and_then(serde_json::Value::as_bool)
-        .is_none()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "tuning-agent activation response has no accepted flag",
-        ));
-    }
-    Ok(())
+    Ok(ActivationResponse {
+        accepted: response.accepted,
+        status: response.status,
+        error: response.error,
+    })
 }
 
 fn encode_activation(
@@ -242,26 +323,13 @@ fn encode_activation(
     serde_json::to_vec(&request).map_err(std::io::Error::other)
 }
 
-fn release_claims(claimed_comms: &Mutex<BTreeSet<String>>, comms: &[String]) {
-    if let Ok(mut claimed) = claimed_comms.lock() {
-        for comm in comms {
-            claimed.remove(comm);
-        }
-    }
-}
-
-fn claim_unseen(
-    claimed_comms: &Mutex<BTreeSet<String>>,
-    comms: &mut Vec<String>,
-) -> Result<(), ()> {
-    let mut claimed = claimed_comms.lock().map_err(|_| ())?;
-    comms.retain(|comm| claimed.insert(comm.clone()));
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn comm(value: &str) -> Comm {
+        Comm::new(value).unwrap()
+    }
 
     #[test]
     fn activation_matches_tuning_agent_wire_shape() {
@@ -287,20 +355,73 @@ mod tests {
     }
 
     #[test]
-    fn comm_claims_suppress_duplicates_until_release() {
-        let claims = Mutex::new(BTreeSet::new());
+    fn batcher_waits_for_the_fixed_coalescing_window() {
+        let start = Instant::now();
+        let mut batcher = ActivationBatcher::new(Duration::from_millis(250), 128);
+        batcher.observe(comm("worker-b"), start);
+        batcher.observe(comm("worker-a"), start + Duration::from_millis(100));
 
-        let mut first = vec!["worker".to_string(), "service".to_string()];
-        claim_unseen(&claims, &mut first).unwrap();
-        assert_eq!(first, ["worker", "service"]);
+        assert!(batcher
+            .take_ready(start + Duration::from_millis(249))
+            .is_none());
+        assert_eq!(
+            batcher.take_ready(start + Duration::from_millis(250)),
+            Some(vec![comm("worker-a"), comm("worker-b")])
+        );
+    }
 
-        let mut duplicate = vec!["worker".to_string()];
-        claim_unseen(&claims, &mut duplicate).unwrap();
-        assert!(duplicate.is_empty());
+    #[test]
+    fn batcher_accumulates_one_next_batch_while_busy() {
+        let start = Instant::now();
+        let mut batcher = ActivationBatcher::new(Duration::from_millis(250), 128);
+        batcher.observe(comm("first"), start);
+        assert_eq!(
+            batcher.take_ready(start + Duration::from_millis(250)),
+            Some(vec![comm("first")])
+        );
 
-        release_claims(&claims, &["worker".to_string()]);
-        let mut retry = vec!["worker".to_string()];
-        claim_unseen(&claims, &mut retry).unwrap();
-        assert_eq!(retry, ["worker"]);
+        batcher.observe(comm("third"), start + Duration::from_millis(300));
+        batcher.observe(comm("second"), start + Duration::from_millis(350));
+        assert!(batcher
+            .take_ready(start + Duration::from_millis(600))
+            .is_none());
+        assert_eq!(batcher.finish(), Some(vec![comm("first")]));
+        assert_eq!(
+            batcher.take_ready(start + Duration::from_millis(600)),
+            Some(vec![comm("second"), comm("third")])
+        );
+    }
+
+    #[test]
+    fn batcher_sends_at_capacity_and_preserves_the_remainder() {
+        let start = Instant::now();
+        let mut batcher = ActivationBatcher::new(Duration::from_secs(60), 2);
+        for value in ["worker-c", "worker-a", "worker-b"] {
+            batcher.observe(comm(value), start);
+        }
+
+        assert_eq!(
+            batcher.take_ready(start),
+            Some(vec![comm("worker-a"), comm("worker-b")])
+        );
+        assert_eq!(batcher.finish().unwrap().len(), 2);
+        assert_eq!(
+            batcher.take_ready(start + Duration::from_secs(60)),
+            Some(vec![comm("worker-c")])
+        );
+    }
+
+    #[test]
+    fn batcher_suppresses_pending_and_in_flight_duplicates() {
+        let start = Instant::now();
+        let mut batcher = ActivationBatcher::new(Duration::ZERO, 128);
+        batcher.observe(comm("worker"), start);
+        batcher.observe(comm("worker"), start);
+        assert_eq!(batcher.pending().count(), 1);
+        assert_eq!(batcher.take_ready(start), Some(vec![comm("worker")]));
+
+        batcher.observe(comm("worker"), start);
+        assert_eq!(batcher.pending().count(), 0);
+        assert_eq!(batcher.finish(), Some(vec![comm("worker")]));
     }
 }

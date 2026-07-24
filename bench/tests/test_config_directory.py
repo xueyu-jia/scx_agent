@@ -18,11 +18,11 @@ from bench.env.manager import _build_local_config, _write_config
 class ConfigDirectoryLoadingTest(unittest.TestCase):
     def test_tracked_config_directories_are_valid(self) -> None:
         example = load_config_data("bench/configs/example_config")
-        cgroup = load_config_data("bench/configs/cgroup_cpu_tuning")
+        redis = load_config_data("bench/configs/redis_cpu_tuning")
 
         self.assertIn("scx_agent_classed_llm_latency", example["schedulers"])
         self.assertIn("llm_latency_classify", example["treatments"])
-        self.assertIn("cgroup_cpu_agent_positive", cgroup["treatments"])
+        self.assertIn("redis_cpu_agent_positive", redis["treatments"])
 
     def test_example_config_contains_only_the_active_performance_matrix(self) -> None:
         config = load_config_data("bench/configs/example_config")
@@ -54,6 +54,8 @@ class ConfigDirectoryLoadingTest(unittest.TestCase):
             {
                 "kernel_migration_smoke",
                 "single_latency_candidate_gate",
+                "single_batch_candidate_gate",
+                "mixed_candidate_gate",
                 "single_latency_core_priming",
                 "single_latency_core_measured",
                 "single_batch_core_priming",
@@ -72,8 +74,14 @@ class ConfigDirectoryLoadingTest(unittest.TestCase):
         self.assertEqual(config["plans"]["mixed_fixed_rps_core_measured"]["runs"], 4)
         for treatment in config["treatments"].values():
             duration_index = treatment["args"].index("--duration-seconds")
-            self.assertEqual(treatment["args"][duration_index + 1], "120")
-            self.assertEqual(treatment["timeout_seconds"], 180)
+            self.assertEqual(treatment["args"][duration_index + 1], "240")
+            self.assertEqual(treatment["timeout_seconds"], 300)
+            mode_index = treatment["args"].index("--mode")
+            if treatment["args"][mode_index + 1] == "classify":
+                classify_index = treatment["args"].index(
+                    "--classify-timeout-seconds"
+                )
+                self.assertEqual(treatment["args"][classify_index + 1], "180")
         self.assertEqual(
             set(config["benches"]),
             {

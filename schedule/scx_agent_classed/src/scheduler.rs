@@ -20,7 +20,9 @@ use scx_utils::{
     UserExitInfo,
 };
 
-use crate::activation::{ActivationNotifier, NotifyOutcome, RuleMissActivation};
+use crate::activation::{
+    ActivationBatcher, ActivationCompletion, ActivationNotifier, RuleMissActivation,
+};
 use crate::bpf_intf;
 use crate::cli::{Opts, WorkloadClass};
 use crate::control::ControlServer;
@@ -40,7 +42,7 @@ use crate::{BpfSkel, BpfSkelBuilder, SCHEDULER_NAME};
 const MAX_STEAL_SCAN: u32 = bpf_intf::agent_consts_AGENT_STEAL_SCAN_MAX;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const ACTIVATION_DEBOUNCE: Duration = Duration::from_millis(250);
+const ACTIVATION_COALESCE: Duration = Duration::from_millis(250);
 const RULE_MISS_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_ACTIVATION_COMMS: usize = 128;
 const _: () = assert!(std::mem::size_of::<bpf_intf::agent_cpu_topology>() == 16);
@@ -54,8 +56,7 @@ pub(crate) struct Scheduler<'a> {
     rule_miss_rx: crossbeam::channel::Receiver<[u8; COMM_LEN]>,
     activation_notifier: Option<ActivationNotifier>,
     activation_allowlist: Option<BTreeSet<Comm>>,
-    pending_rule_misses: BTreeSet<Comm>,
-    last_activation: Instant,
+    activation_batcher: ActivationBatcher,
     last_rule_miss_rescan: Instant,
     scheduler_instance_id: String,
     default_class: RuleClass,
@@ -280,8 +281,7 @@ impl<'a> Scheduler<'a> {
             rule_miss_rx,
             activation_notifier,
             activation_allowlist,
-            pending_rule_misses: BTreeSet::new(),
-            last_activation: now.checked_sub(ACTIVATION_DEBOUNCE).unwrap_or(now),
+            activation_batcher: ActivationBatcher::new(ACTIVATION_COALESCE, MAX_ACTIVATION_COMMS),
             last_rule_miss_rescan: now,
             scheduler_instance_id,
             default_class: opts.default_class.as_rule_class(),
@@ -629,7 +629,7 @@ impl<'a> Scheduler<'a> {
         {
             let _ = self.skel.maps.rule_miss_comms.delete(&key);
         }
-        self.pending_rule_misses.remove(comm);
+        self.activation_batcher.remove_pending(comm);
     }
 
     fn record_rule_miss(&mut self, comm: Comm) {
@@ -648,14 +648,14 @@ impl<'a> Scheduler<'a> {
         if already_classified {
             self.clear_rule_miss(&comm);
         } else {
-            self.pending_rule_misses.insert(comm);
+            self.activation_batcher.observe(comm, Instant::now());
         }
     }
 
     fn discard_resolved_rule_misses(&mut self) {
         let resolved = self
-            .pending_rule_misses
-            .iter()
+            .activation_batcher
+            .pending()
             .filter(|comm| {
                 self.rule_store
                     .as_ref()
@@ -681,6 +681,49 @@ impl<'a> Scheduler<'a> {
             }
             if let Some(error) = self.fatal_control_error.take() {
                 bail!("fatal dynamic-rule control failure: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_activation_completion(&mut self) -> Result<()> {
+        let Some(notifier) = self.activation_notifier.as_ref() else {
+            return Ok(());
+        };
+        let completion = match notifier.poll_completion() {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return Ok(()),
+            Err(error) => bail!("tuning-agent activation notifier failed: {error:?}"),
+        };
+        let Some(comms) = self.activation_batcher.finish() else {
+            warn!("received a tuning-agent completion without an in-flight activation");
+            return Ok(());
+        };
+        match completion {
+            ActivationCompletion::Response(response) if response.accepted => info!(
+                "tuning-agent activation completed with status={} for {} comms",
+                response.status,
+                comms.len()
+            ),
+            ActivationCompletion::Response(response) => warn!(
+                "tuning-agent rejected activation for {} comms: status={} error={}",
+                comms.len(),
+                response.status,
+                response.error.as_deref().unwrap_or("none")
+            ),
+            ActivationCompletion::Failed(error) => warn!(
+                "tuning-agent activation failed for {} comms: {error}",
+                comms.len()
+            ),
+        }
+        for comm in comms {
+            if self
+                .rule_store
+                .as_ref()
+                .and_then(|store| store.effective_rule(&comm))
+                .is_some()
+            {
+                self.clear_rule_miss(&comm);
             }
         }
         Ok(())
@@ -718,31 +761,19 @@ impl<'a> Scheduler<'a> {
         }
 
         self.discard_resolved_rule_misses();
-        if self.pending_rule_misses.is_empty()
-            || self.last_activation.elapsed() < ACTIVATION_DEBOUNCE
-        {
+        let Some(comms) = self.activation_batcher.take_ready(Instant::now()) else {
             return Ok(());
-        }
-        let comms = self
-            .pending_rule_misses
-            .iter()
-            .take(MAX_ACTIVATION_COMMS)
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(notifier) = &self.activation_notifier {
-            let outcome = notifier.notify(RuleMissActivation {
-                comms: comms.iter().map(|comm| comm.as_str().to_string()).collect(),
-                revision: self.rule_store.as_ref().map_or(0, RuleStore::revision),
-            });
-            match outcome {
-                NotifyOutcome::Queued | NotifyOutcome::Suppressed => {
-                    for comm in &comms {
-                        self.pending_rule_misses.remove(comm);
-                    }
-                }
-                NotifyOutcome::Full | NotifyOutcome::Disconnected => {}
-            }
-            self.last_activation = Instant::now();
+        };
+        let activation = RuleMissActivation {
+            comms: comms.iter().map(|comm| comm.as_str().to_string()).collect(),
+            revision: self.rule_store.as_ref().map_or(0, RuleStore::revision),
+        };
+        let notifier = self
+            .activation_notifier
+            .as_ref()
+            .expect("rule-miss collection checked the notifier");
+        if let Err(error) = notifier.start_activation(activation) {
+            bail!("failed to start tuning-agent activation: {error:?}");
         }
         Ok(())
     }
@@ -877,6 +908,7 @@ impl<'a> Scheduler<'a> {
                 Err(error) => Err(error)?,
             }
             self.poll_control()?;
+            self.poll_activation_completion()?;
             self.collect_rule_misses()?;
         }
 

@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +59,9 @@ def main(argv: list[str] | None = None) -> int:
         details["config_path"] = str(config_path)
         _start_support_processes(processes, output_dir)
         _start_daemon(processes, output_dir)
-        _start_training_workload(processes, cgroup.path, output_dir)
+        training_ready = _start_training_workload(processes, cgroup.path, output_dir)
+        if training_ready is not None:
+            details["training_ready"] = training_ready
         baseline_state = _snapshot_cgroup(cgroup.scope)
         details["baseline_state"] = baseline_state
         response = _activate(cgroup.path, output_dir)
@@ -67,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         failure = exc
     finally:
         _stop_processes(processes)
+        _remove_generated_config()
 
     if failure is not None:
         if cgroup is not None and not cgroup.preserve:
@@ -166,11 +171,18 @@ def _ensure_config(output_dir: Path, cgroup_path: Path) -> Path:
     base_url = os.environ.get("SCX_TUNING_AGENT_LLM_BASE_URL", "http://127.0.0.1:18080")
     api_key = os.environ.get("SCX_TUNING_AGENT_LLM_API_KEY", "test")
     model = os.environ.get("SCX_TUNING_AGENT_LLM_MODEL", "mock")
+    llm_timeout_ms = _positive_int_env("SCX_TUNING_AGENT_LLM_TIMEOUT_MS", 30_000)
     llm_retry_count = _non_negative_int_env("SCX_TUNING_AGENT_LLM_RETRY_COUNT", 0)
     max_reasoning_rounds = _positive_int_env(
         "SCX_TUNING_AGENT_MAX_REASONING_ROUNDS", 6
     )
-    config_path = output_dir / "tuning-agent.toml"
+    evaluation_timeout_ms = _positive_int_env(
+        "SCX_TUNING_AGENT_EVALUATION_TIMEOUT_MS", 60_000
+    )
+    mcp_request_timeout_ms = _positive_int_env(
+        "SCX_TUNING_AGENT_MCP_REQUEST_TIMEOUT_MS", 30_000
+    )
+    redacted_config_path = output_dir / "tuning-agent.toml"
     socket_path = output_dir / "tuning-agent.sock"
     audit_path = output_dir / "audit.jsonl"
     wal_dir = output_dir / "transactions"
@@ -187,20 +199,19 @@ def _ensure_config(output_dir: Path, cgroup_path: Path) -> Path:
         f"{json.dumps(key)} = {json.dumps(value)}"
         for key, value in sorted(mcp_env.items())
     )
-    config_path.write_text(
-        f"""
+    config_text = f"""
 [llm]
 base_url = {base_url_json}
 api_key = {api_key_json}
 model = {model_json}
-timeout_ms = 30000
+timeout_ms = {llm_timeout_ms}
 retry_count = {llm_retry_count}
 
 [reasoning]
 max_rounds = {max_reasoning_rounds}
 
 [safety]
-evaluation_timeout_ms = 60000
+evaluation_timeout_ms = {evaluation_timeout_ms}
 cooldown_ms = 0
 
 [activation]
@@ -219,18 +230,36 @@ enabled = true
 id = {mcp_server_id_json}
 enabled = true
 command = {mcp_command_json}
-request_timeout_ms = 30000
+request_timeout_ms = {mcp_request_timeout_ms}
 allow_mutations = true
 
 [mcp.servers.env]
 {mcp_env_toml}
-""".lstrip(),
+""".lstrip()
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="scx-tuning-agent-adapter-",
+        suffix=".toml",
+        dir="/tmp",
+        delete=False,
+    ) as config_file:
+        config_file.write(config_text)
+        config_path = Path(config_file.name)
+    config_path.chmod(0o600)
+    redacted_config_path.write_text(
+        config_text.replace(
+            f"api_key = {api_key_json}",
+            'api_key = "<redacted>"',
+            1,
+        ),
         encoding="utf-8",
     )
     os.environ["SCX_TUNING_AGENT_CONFIG"] = str(config_path)
+    os.environ["SCX_TUNING_AGENT_GENERATED_CONFIG"] = str(config_path)
     os.environ.setdefault("SCX_TUNING_AGENT_BIN", binary)
     os.environ["SCX_TUNING_AGENT_SOCKET_PATH"] = str(socket_path)
-    return config_path
+    return redacted_config_path
 
 
 def _mcp_environment(output_dir: Path, cgroup_path: Path) -> dict[str, str]:
@@ -308,10 +337,10 @@ def _start_training_workload(
     processes: list[ManagedProcess],
     cgroup_path: Path,
     output_dir: Path,
-) -> None:
+) -> dict[str, Any] | None:
     workload_argv = _json_env("SCX_TUNING_AGENT_TRAINING_ARGV", None)
     if workload_argv is None:
-        return
+        return None
     argv = _argv(workload_argv, "training workload")
     process = _spawn("training-workload", argv, output_dir=output_dir)
     try:
@@ -321,8 +350,117 @@ def _start_training_workload(
         process.wait()
         raise AdapterError(f"failed to move training workload into {cgroup_path}: {exc}") from exc
     processes.append(ManagedProcess("training-workload", process))
+    ready_path = os.environ.get("SCX_TUNING_AGENT_TRAINING_READY_PATH")
+    if ready_path:
+        path = Path(ready_path)
+        if not path.is_absolute():
+            path = output_dir / path
+        timeout = float(
+            _positive_int_env("SCX_TUNING_AGENT_TRAINING_READY_TIMEOUT_SECONDS", 60)
+        )
+        ready = _wait_for_training_ready(path, processes[-1], timeout)
+        return {"path": str(path), **ready}
+
     time.sleep(_non_negative_float_env("SCX_TUNING_AGENT_TRAINING_SETTLE_SECONDS", 0.0))
     _require_running([processes[-1]])
+    return None
+
+
+def _wait_for_training_ready(
+    path: Path,
+    training: ManagedProcess,
+    timeout: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _require_running([training])
+        try:
+            stat = path.lstat()
+        except FileNotFoundError:
+            time.sleep(0.05)
+            continue
+        except OSError as exc:
+            raise AdapterError(f"failed to inspect training readiness file {path}: {exc}") from exc
+        if not path.is_file() or path.is_symlink():
+            raise AdapterError(f"training readiness path must be a regular file: {path}")
+        if stat.st_size > 65_536:
+            raise AdapterError(f"training readiness file exceeds 64 KiB: {path}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AdapterError(f"training readiness file is invalid: {path}: {exc}") from exc
+        ready = _validate_training_ready(value)
+        if ready["ready"]:
+            return ready
+        time.sleep(0.05)
+    raise AdapterError(f"timed out waiting for training readiness at {path}")
+
+
+def _validate_training_ready(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "ready",
+        "workload_digest",
+        "processes",
+    }:
+        raise AdapterError("training readiness must be a strict V1 object")
+    if value.get("version") != 1:
+        raise AdapterError("training readiness version must be 1")
+    if not isinstance(value.get("ready"), bool):
+        raise AdapterError("training readiness ready must be a boolean")
+    digest = value.get("workload_digest")
+    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise AdapterError("training readiness workload_digest must be a sha256 digest")
+    processes = value.get("processes")
+    if not isinstance(processes, list) or not processes:
+        raise AdapterError("training readiness processes must be a non-empty array")
+
+    seen: set[int] = set()
+    normalized = []
+    for item in processes:
+        if not isinstance(item, dict) or set(item) != {
+            "pid",
+            "start_time_ticks",
+            "executable",
+        }:
+            raise AdapterError("training readiness process identity has an invalid schema")
+        pid = item.get("pid")
+        start_time = item.get("start_time_ticks")
+        executable = item.get("executable")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1 or pid in seen:
+            raise AdapterError("training readiness process PID is invalid or duplicated")
+        if isinstance(start_time, bool) or not isinstance(start_time, int) or start_time < 1:
+            raise AdapterError("training readiness process start_time_ticks is invalid")
+        if not isinstance(executable, str) or not executable or not Path(executable).is_absolute():
+            raise AdapterError("training readiness process executable must be an absolute path")
+        observed = _process_identity(pid)
+        if observed["start_time_ticks"] != start_time or observed["executable"] != executable:
+            raise AdapterError(f"training readiness process identity changed for PID {pid}")
+        seen.add(pid)
+        normalized.append(item)
+
+    return {
+        "version": 1,
+        "ready": value["ready"],
+        "workload_digest": digest,
+        "processes": normalized,
+    }
+
+
+def _process_identity(pid: int) -> dict[str, Any]:
+    proc = Path("/proc") / str(pid)
+    try:
+        stat_text = (proc / "stat").read_text(encoding="utf-8")
+        _, tail = stat_text.rsplit(")", 1)
+        start_time = int(tail.split()[19])
+        executable = os.readlink(proc / "exe")
+    except (OSError, ValueError, IndexError) as exc:
+        raise AdapterError(f"training readiness process {pid} is not alive: {exc}") from exc
+    return {
+        "pid": pid,
+        "start_time_ticks": start_time,
+        "executable": executable,
+    }
 
 
 def _activate(cgroup_path: Path, output_dir: Path) -> dict[str, Any]:
@@ -552,6 +690,16 @@ def _signal_process_group(pgid: int, value: signal.Signals) -> None:
 def _remove_cgroup(path: Path) -> None:
     try:
         path.rmdir()
+    except OSError:
+        pass
+
+
+def _remove_generated_config() -> None:
+    configured = os.environ.pop("SCX_TUNING_AGENT_GENERATED_CONFIG", None)
+    if not configured:
+        return
+    try:
+        Path(configured).unlink(missing_ok=True)
     except OSError:
         pass
 

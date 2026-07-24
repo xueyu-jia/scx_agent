@@ -39,12 +39,12 @@ bench/
       mock_llm.py
 
   scenarios/
-    cgroup_cpu/
+    redis_cpu/
       common.py
       fixture.py
+      loadgen.py
       workload.py
       mcp_server.py
-      mock_llm.py
       matrix.py
   benchmarks/
     generic.py
@@ -61,7 +61,7 @@ bench/
       environment.config
       benches.config
       plan.config
-    cgroup_cpu_tuning/
+    redis_cpu_tuning/
       environment.config
       benches.config
       plan.config
@@ -290,10 +290,11 @@ verification.
 ### `bench/scenarios/`
 
 Owns self-contained experiment assets that are not generic framework code.
-The cgroup CPU scenario contains its fixture, held-out workload, MCP server,
-mock LLM, matrix runner, and scenario-specific config references. Scenario
-workloads use benchmark staging; training and adapter dependencies use
-treatment staging.
+The Redis CPU scenario contains its fixture, rolling load generator, held-out
+workload, MCP server, real-LLM matrix runner, and scenario-specific config
+references. Scenario workloads use benchmark staging; training and adapter
+dependencies use treatment staging. Live-model outcomes are classified
+separately from deterministic provider and safety invariants.
 
 ### `bench/benchmarks/generic.py`
 

@@ -2,6 +2,13 @@ use serde_json::Value;
 
 use crate::domain::{CapabilityId, ChangeId};
 use crate::kernel::evaluation::EvaluationIntentSpec;
+use crate::skill::SkillCommand;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DecodedToolCall {
+    Context(SkillCommand),
+    Action(AgentCommand),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentCommand {

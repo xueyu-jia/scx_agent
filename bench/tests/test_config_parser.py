@@ -206,27 +206,25 @@ class TreatmentConfigTest(unittest.TestCase):
                 }
             )
 
-    def test_example_cgroup_cpu_matrix_is_internally_consistent(self) -> None:
-        config = load_config_data(Path("bench/configs/cgroup_cpu_tuning"))
+    def test_redis_cpu_matrix_is_internally_consistent(self) -> None:
+        config = load_config_data(Path("bench/configs/redis_cpu_tuning"))
 
         _validate_treatments(config)
-        _validate_benches(
-            {"benches": {"cgroup_cpu_share": config["benches"]["cgroup_cpu_share"]}}
-        )
+        _validate_benches({"benches": {"redis_cpu": config["benches"]["redis_cpu"]}})
         _validate_metric_profiles(config)
         _validate_suites(config)
         _validate_plans(config)
 
-        self.assertEqual(config["plans"]["cgroup_cpu_smoke"]["runs"], 1)
-        self.assertEqual(config["plans"]["cgroup_cpu"]["runs"], 10)
-        self.assertNotIn(
-            "--no-commit-disposition",
-            config["treatments"]["cgroup_cpu_agent_positive"].get("args", []),
-        )
+        self.assertEqual(config["plans"]["redis_cpu_smoke"]["runs"], 1)
+        self.assertEqual(config["plans"]["redis_cpu"]["runs"], 10)
         self.assertEqual(
-            config["treatments"]["cgroup_cpu_agent_no_signal"]["args"],
+            config["treatments"]["redis_cpu_agent_no_signal"]["args"],
             ["--no-commit-disposition", "proceed"],
         )
+        support = config["treatments"]["redis_cpu_agent_positive"][
+            "host_support_files"
+        ]
+        self.assertNotIn("bench/scenarios/redis_cpu/mock_llm.py", support)
 
 
 class BenchTimingTest(unittest.TestCase):

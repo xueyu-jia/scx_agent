@@ -5,6 +5,7 @@ mod tool_call;
 mod tool_catalog;
 
 pub use command::AgentCommand;
+pub(crate) use command::DecodedToolCall;
 pub use dispatcher::ToolDispatcher;
 pub use reasoner::{AgentReasoner, AgentTurn};
 pub use tool_call::{AgentToolInvocation, AgentToolResult, AgentToolSpec};

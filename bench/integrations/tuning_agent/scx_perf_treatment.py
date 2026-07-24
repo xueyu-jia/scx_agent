@@ -16,8 +16,6 @@ from typing import Any
 
 
 OUTCOME_VERSION = 2
-DEFAULT_COMM = "redis-server"
-DEFAULT_CLASS = "latency"
 DEFAULT_DURATION_SECONDS = 60.0
 DEFAULT_CLASSIFY_TIMEOUT_SECONDS = 300.0
 DEFAULT_IO_TIMEOUT_SECONDS = 5.0
@@ -25,10 +23,27 @@ DEFAULT_EXPECTED_MODEL = "deepseek-v4-flash"
 DEFAULT_STATE_DIR = Path("/tmp/scx-real-llm")
 CONTROL_VERSION = 1
 MAX_FRAME_BYTES = 1024 * 1024
-TARGET_SCRIPT = r"""
+CONTROL_TARGET_SCRIPT = r"""
 import sys
 import time
 
+with open("/proc/self/comm", "w", encoding="utf-8") as stream:
+    stream.write(sys.argv[1])
+while True:
+    time.sleep(0.005)
+"""
+GROUP_TARGET_SCRIPT = r"""
+import os
+import sys
+import time
+
+ready_fd = int(sys.argv[2])
+release_fd = int(sys.argv[3])
+os.write(ready_fd, b"1")
+os.close(ready_fd)
+if os.read(release_fd, 1) != b"1":
+    raise SystemExit("classification barrier closed before release")
+os.close(release_fd)
 with open("/proc/self/comm", "w", encoding="utf-8") as stream:
     stream.write(sys.argv[1])
 while True:
@@ -187,22 +202,9 @@ def _parser() -> argparse.ArgumentParser:
         "--target",
         action="append",
         type=_target,
-        default=[],
+        required=True,
         metavar="COMM=CLASS",
-        help="target classification; repeat for every workload comm",
-    )
-    parser.add_argument(
-        "--comm",
-        default=os.environ.get(
-            "SCX_PERF_TARGET_COMM",
-            os.environ.get("SCX_REAL_LLM_TARGET_COMM", DEFAULT_COMM),
-        ),
-        help="single-target compatibility option used when --target is absent",
-    )
-    parser.add_argument(
-        "--expected-class",
-        choices=("latency", "batch"),
-        default=os.environ.get("SCX_PERF_EXPECTED_CLASS", DEFAULT_CLASS),
+        help="classification target; repeat for every workload comm",
     )
     parser.add_argument(
         "--classify-timeout-seconds",
@@ -227,8 +229,6 @@ def _parser() -> argparse.ArgumentParser:
 
 def _options(args: argparse.Namespace, output_dir: Path) -> Options:
     targets = list(args.target)
-    if not targets:
-        targets = [_target(f"{args.comm}={args.expected_class}")]
     comms = [target.comm for target in targets]
     if len(comms) != len(set(comms)):
         raise TreatmentError("target comms must be unique")
@@ -264,7 +264,7 @@ def _run_control(
         try:
             for target in options.targets:
                 process = subprocess.Popen(
-                    [sys.executable, "-c", TARGET_SCRIPT, target.comm],
+                    [sys.executable, "-c", CONTROL_TARGET_SCRIPT, target.comm],
                     stdout=stdout,
                     stderr=stderr,
                     start_new_session=True,
@@ -311,14 +311,8 @@ def _run_classification(options: Options) -> dict[str, Any]:
         )
 
     control = ControlClient(options.control_socket, options.io_timeout_seconds)
-    expected_rules: dict[str, str] = {}
-    episodes: list[dict[str, Any]] = []
-    for target in options.targets:
-        episode = _classify_target(options, target, paths, control)
-        episodes.append(episode)
-        expected_rules[target.comm] = target.rule_class
-        learned = _read_json(paths["learned"])
-        _verify_learned(learned, expected_rules, episode["revision_after"])
+    episode = _classify_group(options, paths, control)
+    expected_rules = {target.comm: target.rule_class for target in options.targets}
 
     learned = _read_json(paths["learned"])
     final_snapshot = _snapshot(control, options.targets, "final")
@@ -328,13 +322,17 @@ def _run_classification(options: Options) -> dict[str, Any]:
     _verify_learned(learned, expected_rules, final_revision)
     audit = _read_jsonl(paths["audit"])
     _require_all_episodes_finished(audit)
-    episode_count = _require_episode_count(audit, len(options.targets))
+    episode_count = _require_episode_count(audit, 1)
 
     verification = {
         "schema_version": 1,
+        "classification_mode": "group",
         "model": supervisor.get("model"),
         "base_url": supervisor.get("base_url"),
-        "episodes": episodes,
+        "activation_comms": [target.comm for target in options.targets],
+        "mutation_count": episode["mutation_count"],
+        "classification_seconds": episode["classification_seconds"],
+        "episodes": [episode],
         "final_revision": final_revision,
         "final_rules_seq": final_seq,
         "learned_sha256": _sha256(paths["learned"]),
@@ -349,57 +347,56 @@ def _run_classification(options: Options) -> dict[str, Any]:
     }
 
 
-def _classify_target(
+def _classify_group(
     options: Options,
-    target: Target,
     paths: dict[str, Path],
     control: ControlClient,
 ) -> dict[str, Any]:
-    before = _wait_for_snapshot(control, target, options.io_timeout_seconds)
-    _assert_no_comm_collision(target.comm)
-    process: subprocess.Popen[bytes] | None = None
+    before = _wait_for_snapshot(control, options.targets, options.io_timeout_seconds)
+    for target in options.targets:
+        _verify_rule(before, target, learned=False)
+        _assert_no_comm_collision(target.comm)
+
     started = time.monotonic()
+    processes: list[tuple[Target, subprocess.Popen[bytes]]] = []
     try:
-        process = subprocess.Popen(
-            [sys.executable, "-c", TARGET_SCRIPT, target.comm],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        _wait_for_comm(process, target.comm, options.io_timeout_seconds)
-        episode_id, finished, audit = _wait_for_episode(
+        processes = _start_target_group(options.targets, options.io_timeout_seconds)
+        episode_id, finished, audit = _wait_for_group_episode(
             paths["audit"],
-            target.comm,
-            process,
+            options.targets,
+            processes,
             options.classify_timeout_seconds,
         )
-        after = _snapshot(control, (target,), "after")
+        after = _snapshot(control, options.targets, "after")
     finally:
-        if process is not None:
+        for _target, process in processes:
             _terminate(process)
 
     before_revision, before_seq = _control_state(before, "before")
     after_revision, after_seq = _control_state(after, "after")
-    _verify_rule(before, target, learned=False)
-    _verify_rule(after, target, learned=True)
-    if after_revision - before_revision != 3:
+    _verify_snapshot_rules(after, options.targets)
+    expected_revision_delta = 3 * len(options.targets)
+    expected_seq_delta = 6 * len(options.targets)
+    if after_revision - before_revision != expected_revision_delta:
         raise TreatmentError(
-            f"{target.comm!r} revision delta was {after_revision - before_revision}, expected 3"
+            "group revision delta was "
+            f"{after_revision - before_revision}, expected {expected_revision_delta}"
         )
-    if after_seq - before_seq != 6:
+    if after_seq - before_seq != expected_seq_delta:
         raise TreatmentError(
-            f"{target.comm!r} rules_seq delta was {after_seq - before_seq}, expected 6"
+            f"group rules_seq delta was {after_seq - before_seq}, "
+            f"expected {expected_seq_delta}"
         )
     if before_seq & 1 or after_seq & 1:
         raise TreatmentError("rules_seq was odd outside rule publication")
-    _verify_episode(audit, episode_id, finished, target)
+    mutation_count = _verify_group_episode(audit, episode_id, finished, options.targets)
     return {
-        "comm": target.comm,
-        "class": target.rule_class,
+        "comms": [target.comm for target in options.targets],
         "episode_id": episode_id,
         "phase": finished.get("phase"),
         "verdict": (finished.get("data", {}).get("decision") or {}).get("verdict"),
-        "latency_seconds": time.monotonic() - started,
+        "mutation_count": mutation_count,
+        "classification_seconds": time.monotonic() - started,
         "revision_before": before_revision,
         "revision_after": after_revision,
         "rules_seq_before": before_seq,
@@ -407,12 +404,124 @@ def _classify_target(
     }
 
 
-def _verify_episode(
+def _start_target_group(
+    targets: tuple[Target, ...],
+    timeout: float,
+) -> list[tuple[Target, subprocess.Popen[bytes]]]:
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    processes: list[tuple[Target, subprocess.Popen[bytes]]] = []
+    try:
+        for target in targets:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    GROUP_TARGET_SCRIPT,
+                    target.comm,
+                    str(ready_write),
+                    str(release_read),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(ready_write, release_read),
+                start_new_session=True,
+            )
+            processes.append((target, process))
+        os.close(ready_write)
+        ready_write = -1
+        os.close(release_read)
+        release_read = -1
+        _wait_for_group_ready(processes, ready_read, timeout)
+        released = os.write(release_write, b"1" * len(processes))
+        if released != len(processes):
+            raise TreatmentError("classification barrier release was incomplete")
+        os.close(release_write)
+        release_write = -1
+        for target, process in processes:
+            _wait_for_comm(process, target.comm, timeout)
+        return processes
+    except Exception:
+        for _target, process in processes:
+            _terminate(process)
+        raise
+    finally:
+        for descriptor in (ready_read, ready_write, release_read, release_write):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _wait_for_group_ready(
+    processes: list[tuple[Target, subprocess.Popen[bytes]]],
+    ready_fd: int,
+    timeout: float,
+) -> None:
+    os.set_blocking(ready_fd, False)
+    deadline = time.monotonic() + timeout
+    ready = 0
+    while ready < len(processes) and time.monotonic() < deadline:
+        _require_processes_running(processes)
+        try:
+            data = os.read(ready_fd, len(processes) - ready)
+        except BlockingIOError:
+            data = b""
+        ready += len(data)
+        if ready < len(processes):
+            time.sleep(0.01)
+    if ready != len(processes):
+        raise TreatmentError(
+            f"classification barrier received {ready} ready processes; "
+            f"expected {len(processes)}"
+        )
+
+
+def _wait_for_group_episode(
+    audit_path: Path,
+    targets: tuple[Target, ...],
+    processes: list[tuple[Target, subprocess.Popen[bytes]]],
+    timeout: float,
+) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+    expected_comms = sorted(target.comm for target in targets)
+    deadline = time.monotonic() + timeout
+    episode_id: int | None = None
+    while time.monotonic() < deadline:
+        _require_processes_running(processes)
+        records = _read_jsonl(audit_path)
+        started = [
+            record for record in records if record.get("event") == "episode_started"
+        ]
+        if len(started) > 1:
+            raise TreatmentError(
+                f"group classification started {len(started)} tuning episodes"
+            )
+        if started:
+            unknown = _unknown_comms(started[0])
+            if unknown != expected_comms:
+                raise TreatmentError(
+                    f"group activation contained {unknown!r}, expected {expected_comms!r}"
+                )
+            observed_id = started[0].get("episode_id")
+            if not isinstance(observed_id, int):
+                raise TreatmentError("group episode_started omitted its episode_id")
+            episode_id = observed_id
+        if episode_id is not None:
+            for record in records:
+                if (
+                    record.get("event") == "episode_finished"
+                    and record.get("episode_id") == episode_id
+                ):
+                    return episode_id, record, records
+        time.sleep(0.1)
+    raise TreatmentError("timed out waiting for the completed group classification episode")
+
+
+def _verify_group_episode(
     audit: list[dict[str, Any]],
     episode_id: int,
     finished: dict[str, Any],
-    target: Target,
-) -> None:
+    targets: tuple[Target, ...],
+) -> int:
     started = next(
         (
             record
@@ -423,22 +532,174 @@ def _verify_episode(
         None,
     )
     if started is None:
-        raise TreatmentError(f"missing episode_started record for {target.comm!r}")
+        raise TreatmentError("missing group episode_started record")
+    expected_rules = {target.comm: target.rule_class for target in targets}
+    unknown = _unknown_comms(started)
+    if unknown != sorted(expected_rules):
+        raise TreatmentError(
+            f"group activation contained {unknown!r}, expected {sorted(expected_rules)!r}"
+        )
+    decision = finished.get("data", {}).get("decision") or {}
+    if finished.get("phase") != "committed" or decision.get("verdict") != "improved":
+        raise TreatmentError("group episode did not commit as improved")
+    return _verify_group_transaction(audit, episode_id, expected_rules)
+
+
+def _verify_group_transaction(
+    audit: list[dict[str, Any]],
+    episode_id: int,
+    expected_rules: dict[str, str],
+) -> int:
+    records = [record for record in audit if record.get("episode_id") == episode_id]
+    commands = {
+        record.get("data", {}).get("call_id"): record
+        for record in records
+        if record.get("event") == "agent_command"
+        and isinstance(record.get("data", {}).get("call_id"), str)
+    }
+    mutations: dict[str, str] = {}
+    change_ids: set[str] = set()
+    for record in records:
+        data = record.get("data", {})
+        content = data.get("content", {})
+        change = content.get("change", {}) if isinstance(content, dict) else {}
+        if (
+            record.get("event") != "agent_command_result"
+            or not data.get("ok")
+            or change.get("capability_id")
+            != "mcp/scx-agent-classed/rule.upsert.v1"
+        ):
+            continue
+        command = commands.get(data.get("call_id"), {}).get("data", {})
+        arguments = command.get("arguments", {}).get("arguments", {})
+        comm = arguments.get("comm")
+        rule_class = arguments.get("class")
+        change_id = change.get("change_id")
+        if not all(isinstance(value, str) for value in (comm, rule_class, change_id)):
+            raise TreatmentError("group mutation audit record is incomplete")
+        if comm in mutations or change_id in change_ids:
+            raise TreatmentError("group episode contains duplicate mutations")
+        mutations[comm] = rule_class
+        change_ids.add(change_id)
+    if mutations != expected_rules:
+        raise TreatmentError(
+            f"group mutations differ from requested targets: {mutations!r}"
+        )
+
+    begin_commands = [
+        record
+        for record in records
+        if record.get("event") == "agent_command"
+        and record.get("data", {}).get("tool") == "begin_experiment"
+    ]
+    if len(begin_commands) != 1:
+        raise TreatmentError(
+            f"group episode issued {len(begin_commands)} begin_experiment commands"
+        )
+    measurement_targets = (
+        begin_commands[0]
+        .get("data", {})
+        .get("arguments", {})
+        .get("evaluation_contract", {})
+        .get("measurement", {})
+        .get("specification", {})
+        .get("targets")
+    )
+    if _target_rules(measurement_targets) != expected_rules:
+        raise TreatmentError("group measurement targets differ from requested targets")
+
+    commit_commands = [
+        record
+        for record in records
+        if record.get("event") == "agent_command"
+        and record.get("data", {}).get("tool") == "request_commit"
+    ]
+    if len(commit_commands) != 1:
+        raise TreatmentError(
+            f"group episode issued {len(commit_commands)} request_commit commands"
+        )
+    commit_data = commit_commands[0].get("data", {})
+    committed_ids = commit_data.get("arguments", {}).get("change_ids")
+    if (
+        not isinstance(committed_ids, list)
+        or not all(isinstance(change_id, str) for change_id in committed_ids)
+        or len(committed_ids) != len(change_ids)
+        or set(committed_ids) != change_ids
+    ):
+        raise TreatmentError("group request_commit omitted mutation change IDs")
+
+    commit_result = next(
+        (
+            record.get("data", {})
+            for record in records
+            if record.get("event") == "agent_command_result"
+            and record.get("data", {}).get("call_id") == commit_data.get("call_id")
+        ),
+        None,
+    )
+    if not isinstance(commit_result, dict) or not commit_result.get("ok"):
+        raise TreatmentError("group request_commit did not succeed")
+    result_content = commit_result.get("content", {})
+    if not isinstance(result_content, dict):
+        raise TreatmentError("group request_commit returned invalid content")
+    finalized = result_content.get("finalized_changes")
+    finalized_ids = (
+        {
+            change.get("change_id")
+            for change in finalized
+            if isinstance(change, dict) and isinstance(change.get("change_id"), str)
+        }
+        if isinstance(finalized, list)
+        else set()
+    )
+    if (
+        not result_content.get("committed")
+        or not isinstance(finalized, list)
+        or len(finalized) != len(change_ids)
+        or finalized_ids != change_ids
+    ):
+        raise TreatmentError("group commit did not finalize every mutation")
+    return len(mutations)
+
+
+def _target_rules(value: Any) -> dict[str, str]:
+    if not isinstance(value, list):
+        return {}
+    observed: dict[str, str] = {}
+    for target in value:
+        if not isinstance(target, dict) or set(target) != {"comm", "class"}:
+            return {}
+        comm, rule_class = target.get("comm"), target.get("class")
+        if not isinstance(comm, str) or not isinstance(rule_class, str) or comm in observed:
+            return {}
+        observed[comm] = rule_class
+    return observed
+
+
+def _unknown_comms(record: dict[str, Any]) -> list[str]:
     unknown = (
-        started.get("data", {})
+        record.get("data", {})
         .get("activation", {})
         .get("evidence", {})
         .get("unknown_comms")
     )
-    if unknown != [target.comm]:
-        raise TreatmentError(
-            f"episode activation was not isolated to {target.comm!r}: {unknown!r}"
-        )
-    decision = finished.get("data", {}).get("decision") or {}
-    if finished.get("phase") != "committed" or decision.get("verdict") != "improved":
-        raise TreatmentError(
-            f"episode for {target.comm!r} did not commit as improved"
-        )
+    if (
+        not isinstance(unknown, list)
+        or not all(isinstance(comm, str) for comm in unknown)
+        or len(unknown) != len(set(unknown))
+    ):
+        raise TreatmentError("group activation has invalid unknown_comms")
+    return sorted(unknown)
+
+
+def _require_processes_running(
+    processes: list[tuple[Target, subprocess.Popen[bytes]]],
+) -> None:
+    for target, process in processes:
+        if process.poll() is not None:
+            raise TreatmentError(
+                f"target {target.comm!r} exited with status {process.returncode}"
+            )
 
 
 def _verify_quiet_state(
@@ -495,14 +756,14 @@ def _snapshot(
 
 def _wait_for_snapshot(
     control: ControlClient,
-    target: Target,
+    targets: tuple[Target, ...],
     timeout: float,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_error = "not attempted"
     while time.monotonic() < deadline:
         try:
-            return _snapshot(control, (target,), "before")
+            return _snapshot(control, targets, "before")
         except (OSError, TreatmentError) as error:
             last_error = str(error)
             time.sleep(0.05)
@@ -521,44 +782,6 @@ def _wait_for_json(path: Path, timeout: float) -> dict[str, Any]:
             last_error = str(error)
             time.sleep(0.05)
     raise TreatmentError(f"timed out reading {path}: {last_error}")
-
-
-def _wait_for_episode(
-    audit_path: Path,
-    comm: str,
-    target: subprocess.Popen[bytes],
-    timeout: float,
-) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
-    deadline = time.monotonic() + timeout
-    episode_id: int | None = None
-    while time.monotonic() < deadline:
-        if target.poll() is not None:
-            raise TreatmentError(f"target task exited with status {target.returncode}")
-        records = _read_jsonl(audit_path)
-        if episode_id is None:
-            for record in records:
-                if record.get("event") != "episode_started":
-                    continue
-                unknown = (
-                    record.get("data", {})
-                    .get("activation", {})
-                    .get("evidence", {})
-                    .get("unknown_comms", [])
-                )
-                if comm in unknown and isinstance(record.get("episode_id"), int):
-                    episode_id = record["episode_id"]
-                    break
-        if episode_id is not None:
-            for record in records:
-                if (
-                    record.get("event") == "episode_finished"
-                    and record.get("episode_id") == episode_id
-                ):
-                    return episode_id, record, records
-        time.sleep(0.1)
-    raise TreatmentError(
-        f"timed out waiting for a completed episode for comm {comm!r}"
-    )
 
 
 def _control_state(snapshot: dict[str, Any], label: str) -> tuple[int, int]:

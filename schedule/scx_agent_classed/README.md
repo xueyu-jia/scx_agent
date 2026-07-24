@@ -253,13 +253,14 @@ sudo scx_agent_classed \
 ```
 
 `--control-socket` requires `--learned-rules`.
-`--tuning-agent-socket` requires both options and sends a debounced activation
-when a previously unseen unmatched `comm` is recorded. The ring buffer is only
-used on that first-miss path; a slow map rescan recovers dropped notifications
-while the key remains in the bounded 1024-entry miss LRU. Bursts exceeding both
-the ring-buffer and miss-map capacity are a documented V1 coverage bound.
-Notifications for the same `comm` are coalesced until tuning-agent finishes the
-episode; transport failures release the claim so the slow rescan can retry it.
+`--tuning-agent-socket` requires both options. The scheduler collects unmatched
+`comm` values for a fixed 250 ms window and sends up to 128 values in one
+activation. Only one activation may be in flight; misses observed during its
+episode remain in one mutable pending set and are sent as the next group after
+the episode completes. The ring buffer is only used on that first-miss path; a
+slow map rescan recovers unresolved or dropped notifications while the key
+remains in the bounded 1024-entry miss LRU. Bursts exceeding both the
+ring-buffer and miss-map capacity are a documented V1 coverage bound.
 Repeated `--activation-comm COMM` options restrict notifications to those exact
 `comm` values; omitting the option preserves the unrestricted default.
 

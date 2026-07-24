@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::agent::{
-    AgentCommand, AgentReasoner, AgentToolInvocation, AgentToolResult, AgentTurn, ToolCatalog,
-    ToolDispatcher,
+    AgentCommand, AgentReasoner, AgentToolInvocation, AgentToolResult, AgentTurn, DecodedToolCall,
+    ToolCatalog, ToolDispatcher,
 };
 use crate::audit::{AuditRecord, AuditSink};
 use crate::capability::CapabilitySnapshot;
+use crate::config::SkillConfig;
 use crate::domain::{
     Candidate, ChangeId, CommitId, ContractId, Digest, EpisodeId, EpisodePhase, InvocationContext,
     OperationId, TransactionId,
@@ -24,6 +25,7 @@ use crate::kernel::transaction::{
     ChangeState, TransactionErrorKind, TransactionKernel, TransactionStore, TransactionWal,
 };
 use crate::runtime::episode::{AgentAction, CommitStep, EpisodeStateMachine};
+use crate::skill::{SkillSession, SkillSnapshot};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EpisodeOutcome {
@@ -79,6 +81,8 @@ pub struct EpisodeCoordinator<'a> {
     max_rounds: usize,
     evaluation_timeout: Duration,
     capabilities: CapabilitySnapshot,
+    skills: SkillSnapshot,
+    skill_config: SkillConfig,
     transactions: &'a TransactionStore,
     audit: &'a mut dyn AuditSink,
 }
@@ -88,6 +92,8 @@ impl<'a> EpisodeCoordinator<'a> {
         max_rounds: usize,
         evaluation_timeout: Duration,
         capabilities: CapabilitySnapshot,
+        skills: SkillSnapshot,
+        skill_config: SkillConfig,
         transactions: &'a TransactionStore,
         audit: &'a mut dyn AuditSink,
     ) -> Result<Self, RuntimeError> {
@@ -105,6 +111,8 @@ impl<'a> EpisodeCoordinator<'a> {
             max_rounds,
             evaluation_timeout,
             capabilities,
+            skills,
+            skill_config,
             transactions,
             audit,
         })
@@ -114,9 +122,18 @@ impl<'a> EpisodeCoordinator<'a> {
         &mut self,
         episode_id: EpisodeId,
         activation: Value,
+        requested_skills: &[String],
         reasoner: &mut dyn AgentReasoner,
     ) -> Result<EpisodeOutcome, RuntimeError> {
-        let catalog = ToolCatalog::from_snapshot(&self.capabilities);
+        let mut skill_session =
+            SkillSession::new(self.skills.clone(), &self.skill_config, requested_skills)
+                .map_err(RuntimeError::new)?;
+        let skills_available = skill_session.has_available_skills();
+        let skill_catalog = skills_available
+            .then(|| skill_session.catalog())
+            .transpose()
+            .map_err(RuntimeError::new)?;
+        let catalog = ToolCatalog::from_snapshots(&self.capabilities, skills_available);
         let dispatcher = ToolDispatcher::new(&catalog);
         let mut session = EpisodeSession::new(
             episode_id,
@@ -133,10 +150,22 @@ impl<'a> EpisodeCoordinator<'a> {
                 "capability_generation": self.capabilities.generation(),
                 "capability_count": self.capabilities.len(),
                 "evaluation_timeout_ms": self.evaluation_timeout.as_millis(),
+                "skill_count": skill_session.skill_count(),
+                "skill_registry_digest": skill_session.registry_digest(),
+                "requested_skills": requested_skills,
             }),
         ))?;
 
-        let context = json!({
+        for data in skill_session.explicit_audit_data() {
+            self.record(AuditRecord::episode(
+                "skill_loaded",
+                episode_id,
+                session.state.phase(),
+                data,
+            ))?;
+        }
+
+        let mut context = json!({
             "episode_id": episode_id.get(),
             "activation": activation,
             "capability_generation": self.capabilities.generation(),
@@ -148,6 +177,33 @@ impl<'a> EpisodeCoordinator<'a> {
                 "commit_pending_blocks_agent_calls": true,
             }
         });
+        if let Some(skill_catalog) = &skill_catalog {
+            context["available_skills"] = Value::Array(skill_catalog.entries.clone());
+            context["skill_catalog_truncated"] = json!(skill_catalog.truncated);
+            context["skills_omitted_count"] = json!(skill_catalog.omitted);
+            let explicitly_loaded = skill_session.explicit_context();
+            if !explicitly_loaded.is_empty() {
+                context["loaded_skills"] = Value::Array(explicitly_loaded);
+            }
+            context["runtime_policy"]["skills"] = json!({
+                "progressive_disclosure": true,
+                "references_only": true,
+                "scripts_supported": false,
+                "skill_permissions": "none",
+                "context_calls_must_not_mix_with_actions": true,
+            });
+            if skill_catalog.truncated {
+                self.record(AuditRecord::episode(
+                    "skill_catalog_truncated",
+                    episode_id,
+                    session.state.phase(),
+                    json!({
+                        "omitted": skill_catalog.omitted,
+                        "max_catalog_chars": self.skill_config.max_catalog_chars,
+                    }),
+                ))?;
+            }
+        }
         let first_turn = reasoner.begin(&context, catalog.specs());
         let mut turn = match first_turn {
             Ok(turn) => turn,
@@ -157,14 +213,24 @@ impl<'a> EpisodeCoordinator<'a> {
             }
         };
 
-        'rounds: for round in 0..self.max_rounds {
+        let mut action_rounds = 0usize;
+        let mut skill_rounds = 0usize;
+        'rounds: loop {
             match turn {
                 AgentTurn::Final(content) => {
+                    if action_rounds == self.max_rounds {
+                        session.summary = format!(
+                            "agent reached the configured limit of {} reasoning rounds",
+                            self.max_rounds
+                        );
+                        break;
+                    }
+                    action_rounds += 1;
                     if let Err(error) = self.record(AuditRecord::episode(
                         "agent_final",
                         episode_id,
                         session.state.phase(),
-                        json!({"round": round + 1, "content": content}),
+                        json!({"round": action_rounds, "content": content}),
                     )) {
                         session.fail_closed(error.to_string());
                         break;
@@ -177,39 +243,129 @@ impl<'a> EpisodeCoordinator<'a> {
                         session.summary = "agent returned an empty tool-call batch".to_string();
                         break;
                     }
-                    let mut results = Vec::with_capacity(calls.len());
-                    for invocation in calls {
-                        if let Err(error) = self.record(AuditRecord::episode(
-                            "agent_command",
-                            episode_id,
-                            session.state.phase(),
-                            json!({
-                                "round": round + 1,
-                                "call_id": invocation.id,
-                                "tool": invocation.name,
-                                "arguments": invocation.arguments,
-                            }),
-                        )) {
-                            session.fail_closed(error.to_string());
-                            break 'rounds;
+                    let decoded = calls
+                        .iter()
+                        .map(|invocation| {
+                            dispatcher
+                                .decode(invocation)
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Vec<_>>();
+                    let has_context = decoded
+                        .iter()
+                        .any(|call| matches!(call, Ok(DecodedToolCall::Context(_))));
+                    let has_action = decoded
+                        .iter()
+                        .any(|call| matches!(call, Ok(DecodedToolCall::Action(_))));
+                    let mixed_batch = has_context && has_action;
+                    let context_round = has_context && !has_action;
+                    if context_round {
+                        if skill_rounds == skill_session.max_skill_rounds() {
+                            session.summary = format!(
+                                "agent reached the configured limit of {} skill context rounds",
+                                skill_session.max_skill_rounds()
+                            );
+                            break;
                         }
-                        let result = match dispatcher.decode(&invocation) {
-                            Ok(command) => session.execute(command, &invocation),
-                            Err(error) => AgentToolResult::failure(&invocation, error.to_string()),
+                        skill_rounds += 1;
+                    } else {
+                        if action_rounds == self.max_rounds {
+                            session.summary = format!(
+                                "agent reached the configured limit of {} reasoning rounds",
+                                self.max_rounds
+                            );
+                            break;
+                        }
+                        action_rounds += 1;
+                    }
+                    let mut results = Vec::with_capacity(calls.len());
+                    for (invocation, decoded_call) in calls.into_iter().zip(decoded) {
+                        let result = if mixed_batch {
+                            AgentToolResult::failure(
+                                &invocation,
+                                "skill context calls and tuning actions must use separate tool-call batches",
+                            )
+                        } else {
+                            match decoded_call {
+                                Ok(DecodedToolCall::Context(command)) => {
+                                    let execution = skill_session.execute(command, &invocation);
+                                    let mut audit_data = execution.audit_data;
+                                    if let Some(data) = audit_data.as_object_mut() {
+                                        data.insert(
+                                            "call_id".to_string(),
+                                            Value::String(invocation.id.clone()),
+                                        );
+                                        data.insert(
+                                            "tool".to_string(),
+                                            Value::String(invocation.name.clone()),
+                                        );
+                                        data.insert("skill_round".to_string(), json!(skill_rounds));
+                                        data.insert("ok".to_string(), json!(execution.result.ok));
+                                    }
+                                    if let Err(error) = self.record(AuditRecord::episode(
+                                        execution.audit_event,
+                                        episode_id,
+                                        session.state.phase(),
+                                        audit_data,
+                                    )) {
+                                        session.fail_closed(error.to_string());
+                                        break 'rounds;
+                                    }
+                                    execution.result
+                                }
+                                Ok(DecodedToolCall::Action(command)) => {
+                                    if let Err(error) = self.record(AuditRecord::episode(
+                                        "agent_command",
+                                        episode_id,
+                                        session.state.phase(),
+                                        json!({
+                                            "round": action_rounds,
+                                            "call_id": invocation.id,
+                                            "tool": invocation.name,
+                                            "arguments": invocation.arguments,
+                                        }),
+                                    )) {
+                                        session.fail_closed(error.to_string());
+                                        break 'rounds;
+                                    }
+                                    session.execute(command, &invocation)
+                                }
+                                Err(error) => {
+                                    if context_round {
+                                        if let Err(audit_error) = self.record(AuditRecord::episode(
+                                            "skill_load_failed",
+                                            episode_id,
+                                            session.state.phase(),
+                                            json!({
+                                                "call_id": invocation.id,
+                                                "tool": invocation.name,
+                                                "skill_round": skill_rounds,
+                                                "error": error,
+                                            }),
+                                        )) {
+                                            session.fail_closed(audit_error.to_string());
+                                            break 'rounds;
+                                        }
+                                    }
+                                    AgentToolResult::failure(&invocation, error)
+                                }
+                            }
                         };
-                        if let Err(error) = self.record(AuditRecord::episode(
-                            "agent_command_result",
-                            episode_id,
-                            session.state.phase(),
-                            json!({
-                                "call_id": result.call_id,
-                                "tool": result.name,
-                                "ok": result.ok,
-                                "content": result.content,
-                            }),
-                        )) {
-                            session.fail_closed(error.to_string());
-                            break 'rounds;
+                        if !context_round {
+                            if let Err(error) = self.record(AuditRecord::episode(
+                                "agent_command_result",
+                                episode_id,
+                                session.state.phase(),
+                                json!({
+                                    "call_id": result.call_id,
+                                    "tool": result.name,
+                                    "ok": result.ok,
+                                    "content": result.content,
+                                }),
+                            )) {
+                                session.fail_closed(error.to_string());
+                                break 'rounds;
+                            }
                         }
                         results.push(result);
                         if session.state.is_reasoning_stopped() {
@@ -219,7 +375,7 @@ impl<'a> EpisodeCoordinator<'a> {
                     if session.state.is_reasoning_stopped() {
                         break;
                     }
-                    if round + 1 == self.max_rounds {
+                    if !context_round && action_rounds == self.max_rounds {
                         session.summary = format!(
                             "agent reached the configured limit of {} reasoning rounds",
                             self.max_rounds
@@ -837,6 +993,7 @@ mod tests {
         PreparedMutation, ProviderClass, ProviderError, ProviderId, ProviderPin, ProviderVersion,
         ResourceKey,
     };
+    use crate::skill::SkillRegistry;
 
     struct ScriptedReasoner {
         stage: usize,
@@ -1130,6 +1287,195 @@ mod tests {
             self.0.push(record.clone());
             Ok(())
         }
+    }
+
+    struct ExplicitSkillReasoner;
+
+    impl AgentReasoner for ExplicitSkillReasoner {
+        fn begin(&mut self, context: &Value, tools: &[AgentToolSpec]) -> Result<AgentTurn, String> {
+            assert_eq!(context["loaded_skills"][0]["skill"], "scheduler-guide");
+            assert!(context["loaded_skills"][0]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("Inspect scheduler evidence"));
+            assert!(tools.iter().any(|tool| tool.name == "load_skill_reference"));
+            Ok(AgentTurn::Final("explicit skill loaded".into()))
+        }
+
+        fn resume(&mut self, _results: &[AgentToolResult]) -> Result<AgentTurn, String> {
+            Err("explicit skill test must not resume".into())
+        }
+    }
+
+    struct ImplicitSkillReasoner {
+        stage: usize,
+    }
+
+    impl AgentReasoner for ImplicitSkillReasoner {
+        fn begin(&mut self, context: &Value, tools: &[AgentToolSpec]) -> Result<AgentTurn, String> {
+            assert_eq!(context["available_skills"][0]["name"], "scheduler-guide");
+            assert!(context.get("loaded_skills").is_none());
+            assert!(tools.iter().any(|tool| tool.name == "load_skill"));
+            self.stage = 1;
+            Ok(AgentTurn::ToolCalls(vec![AgentToolInvocation {
+                id: "load-skill".into(),
+                name: "load_skill".into(),
+                arguments: json!({"name": "scheduler-guide"}),
+            }]))
+        }
+
+        fn resume(&mut self, results: &[AgentToolResult]) -> Result<AgentTurn, String> {
+            assert_eq!(results.len(), 1);
+            assert!(results[0].ok);
+            match self.stage {
+                1 => {
+                    assert!(results[0].content["instructions"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Inspect scheduler evidence"));
+                    self.stage = 2;
+                    Ok(AgentTurn::ToolCalls(vec![AgentToolInvocation {
+                        id: "load-reference".into(),
+                        name: "load_skill_reference".into(),
+                        arguments: json!({
+                            "skill": "scheduler-guide",
+                            "path": "references/signals.md"
+                        }),
+                    }]))
+                }
+                2 => {
+                    assert_eq!(results[0].content["content"], "PSI CPU reference\n");
+                    self.stage = 3;
+                    Ok(AgentTurn::Final("reference loaded".into()))
+                }
+                _ => Err("unexpected implicit skill test stage".into()),
+            }
+        }
+    }
+
+    struct MixedBatchReasoner {
+        resumed: bool,
+    }
+
+    impl AgentReasoner for MixedBatchReasoner {
+        fn begin(
+            &mut self,
+            _context: &Value,
+            _tools: &[AgentToolSpec],
+        ) -> Result<AgentTurn, String> {
+            Ok(AgentTurn::ToolCalls(vec![
+                AgentToolInvocation {
+                    id: "load-skill".into(),
+                    name: "load_skill".into(),
+                    arguments: json!({"name": "scheduler-guide"}),
+                },
+                AgentToolInvocation {
+                    id: "begin".into(),
+                    name: "begin_experiment".into(),
+                    arguments: json!({
+                        "objective": "must not freeze",
+                        "evaluation_contract": evaluation_contract(10.0)
+                    }),
+                },
+            ]))
+        }
+
+        fn resume(&mut self, results: &[AgentToolResult]) -> Result<AgentTurn, String> {
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|result| !result.ok));
+            assert!(results.iter().all(|result| result.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("separate")));
+            self.resumed = true;
+            Ok(AgentTurn::Final("mixed batch rejected".into()))
+        }
+    }
+
+    #[test]
+    fn explicit_skill_is_preloaded_into_first_reasoner_context() {
+        let mut reasoner = ExplicitSkillReasoner;
+        let (outcome, audit) = run_skill_episode(&mut reasoner, &["scheduler-guide".into()]);
+
+        assert_eq!(outcome.phase, EpisodePhase::Clean);
+        let loaded = audit
+            .0
+            .iter()
+            .find(|record| record.event == "skill_loaded")
+            .unwrap();
+        assert_eq!(loaded.data["invocation"], "explicit");
+        assert!(loaded.data.get("instructions").is_none());
+    }
+
+    #[test]
+    fn implicit_skill_and_reference_use_context_only_rounds() {
+        let mut reasoner = ImplicitSkillReasoner { stage: 0 };
+        let (outcome, audit) = run_skill_episode(&mut reasoner, &[]);
+
+        assert_eq!(outcome.phase, EpisodePhase::Clean);
+        assert_eq!(reasoner.stage, 3);
+        assert!(audit
+            .0
+            .iter()
+            .any(|record| record.event == "skill_reference_loaded"));
+        assert!(audit.0.iter().all(|record| {
+            record.event != "skill_reference_loaded" || record.data.get("content").is_none()
+        }));
+    }
+
+    #[test]
+    fn mixed_skill_and_action_batch_executes_neither_command() {
+        let mut reasoner = MixedBatchReasoner { resumed: false };
+        let (outcome, audit) = run_skill_episode(&mut reasoner, &[]);
+
+        assert!(reasoner.resumed);
+        assert!(outcome.intent.is_none());
+        assert!(!audit.0.iter().any(|record| record.event == "skill_loaded"));
+    }
+
+    fn run_skill_episode(
+        reasoner: &mut dyn AgentReasoner,
+        requested_skills: &[String],
+    ) -> (EpisodeOutcome, MemoryAudit) {
+        let root = unique_test_root("skills");
+        let skills_root = root.join("skill-root");
+        let skill = skills_root.join("scheduler-guide");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: scheduler-guide\ndescription: Diagnose scheduler pressure. Use for PSI CPU and run-queue events.\n---\nInspect scheduler evidence. Read references/signals.md when needed.\n",
+        )
+        .unwrap();
+        fs::write(skill.join("references/signals.md"), "PSI CPU reference\n").unwrap();
+        let skill_config = SkillConfig {
+            enabled: true,
+            roots: vec![skills_root],
+            ..SkillConfig::default()
+        };
+        let skills = SkillRegistry::load(&skill_config).unwrap();
+        let transactions = TransactionStore::new(root.join("transactions")).unwrap();
+        let capabilities = CapabilityRegistry::new(AdminPolicy::default()).snapshot();
+        let mut audit = MemoryAudit::default();
+        let outcome = EpisodeCoordinator::new(
+            3,
+            Duration::from_secs(600),
+            capabilities,
+            skills,
+            skill_config,
+            &transactions,
+            &mut audit,
+        )
+        .unwrap()
+        .run(
+            EpisodeId::new(99),
+            json!({"kind": "skill-test"}),
+            requested_skills,
+            reasoner,
+        )
+        .unwrap();
+        drop(transactions);
+        let _ = fs::remove_dir_all(root);
+        (outcome, audit)
     }
 
     #[test]
@@ -1436,11 +1782,18 @@ mod tests {
             3,
             Duration::from_secs(600),
             registry.snapshot(),
+            SkillSnapshot::empty(),
+            SkillConfig::default(),
             &store,
             &mut audit,
         )
         .unwrap()
-        .run(EpisodeId::new(42), json!({"kind": "test"}), &mut reasoner)
+        .run(
+            EpisodeId::new(42),
+            json!({"kind": "test"}),
+            &[],
+            &mut reasoner,
+        )
         .unwrap();
         assert!(audit
             .0
@@ -1469,6 +1822,8 @@ mod tests {
             3,
             Duration::from_secs(600),
             snapshot.clone(),
+            SkillSnapshot::empty(),
+            SkillConfig::default(),
             &store,
             &mut audit,
         )

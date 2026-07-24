@@ -12,6 +12,7 @@ pub struct Config {
     pub activation: ActivationConfig,
     pub audit: AuditConfig,
     pub transaction: TransactionConfig,
+    pub skills: SkillConfig,
     pub capabilities: CapabilityConfig,
     pub mcp: McpConfig,
 }
@@ -35,6 +36,7 @@ impl Config {
             return Err("audit.path must not be empty".to_string());
         }
         self.transaction.validate()?;
+        self.skills.validate()?;
         self.capabilities.validate()?;
         self.mcp.validate()
     }
@@ -155,6 +157,114 @@ impl TransactionConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillConfig {
+    pub enabled: bool,
+    pub roots: Vec<PathBuf>,
+    pub max_skills: usize,
+    pub max_catalog_chars: usize,
+    pub max_loaded_skills: usize,
+    pub max_skill_rounds: usize,
+    pub max_reference_reads: usize,
+    pub max_skill_bytes: usize,
+    pub max_reference_bytes: usize,
+    pub max_references_per_skill: usize,
+    pub max_registry_bytes: usize,
+}
+
+impl Default for SkillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            roots: Vec::new(),
+            max_skills: 64,
+            max_catalog_chars: 8_000,
+            max_loaded_skills: 4,
+            max_skill_rounds: 4,
+            max_reference_reads: 8,
+            max_skill_bytes: 128 * 1024,
+            max_reference_bytes: 256 * 1024,
+            max_references_per_skill: 128,
+            max_registry_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl SkillConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.roots.is_empty() {
+            return Err("skills.roots must not be empty when skills are enabled".to_string());
+        }
+        let mut roots = BTreeSet::new();
+        for root in &self.roots {
+            if !root.is_absolute() {
+                return Err(format!(
+                    "skills root '{}' must be an absolute path",
+                    root.display()
+                ));
+            }
+            if !roots.insert(root) {
+                return Err(format!(
+                    "skills.roots contains duplicate path '{}'",
+                    root.display()
+                ));
+            }
+        }
+        validate_bounded("skills.max_skills", self.max_skills, 1, 256)?;
+        validate_bounded(
+            "skills.max_catalog_chars",
+            self.max_catalog_chars,
+            256,
+            65_536,
+        )?;
+        validate_bounded("skills.max_loaded_skills", self.max_loaded_skills, 1, 32)?;
+        validate_bounded("skills.max_skill_rounds", self.max_skill_rounds, 1, 32)?;
+        validate_bounded(
+            "skills.max_reference_reads",
+            self.max_reference_reads,
+            1,
+            256,
+        )?;
+        validate_bounded(
+            "skills.max_skill_bytes",
+            self.max_skill_bytes,
+            1_024,
+            1024 * 1024,
+        )?;
+        validate_bounded(
+            "skills.max_reference_bytes",
+            self.max_reference_bytes,
+            1_024,
+            2 * 1024 * 1024,
+        )?;
+        validate_bounded(
+            "skills.max_references_per_skill",
+            self.max_references_per_skill,
+            1,
+            1_024,
+        )?;
+        validate_bounded(
+            "skills.max_registry_bytes",
+            self.max_registry_bytes,
+            self.max_skill_bytes,
+            256 * 1024 * 1024,
+        )
+    }
+}
+
+fn validate_bounded(
+    field: &str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), String> {
+    if value < minimum || value > maximum {
+        return Err(format!("{field} must be between {minimum} and {maximum}"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -420,6 +530,8 @@ mod tests {
         );
         assert!(config.mcp.enabled);
         assert!(config.mcp.servers.is_empty());
+        assert!(!config.skills.enabled);
+        assert!(config.skills.roots.is_empty());
         assert_eq!(config.safety.evaluation_timeout_ms, 600_000);
         assert_eq!(config.safety.cooldown_ms, 30_000);
         config.validate().unwrap();
@@ -495,6 +607,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn enabled_skills_require_absolute_unique_roots() {
+        let mut config = Config::default();
+        config.skills.enabled = true;
+        assert!(config.validate().unwrap_err().contains("must not be empty"));
+
+        config.skills.roots = vec![PathBuf::from("relative")];
+        assert!(config.validate().unwrap_err().contains("absolute path"));
+
+        config.skills.roots = vec![PathBuf::from("/skills"), PathBuf::from("/skills")];
+        assert!(config.validate().unwrap_err().contains("duplicate path"));
     }
 
     #[test]

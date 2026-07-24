@@ -23,6 +23,7 @@ An extension can add tuning knowledge. It cannot add a second transaction path, 
 src/
   activation/             activation events, sources, global freeze state
   agent/                  model-visible tool catalog and command decoding
+  skill/                  Agent Skills parsing, snapshots, prompt catalog, references
   capability/             provider traits, registry, snapshots, admin policy
   domain/                 IDs and serializable cross-boundary value objects
   kernel/
@@ -161,6 +162,28 @@ Empty `allowed_phases` is fail-closed. `ManagedObservation` and `IrreversibleMut
 ### Snapshot semantics
 
 The mutable Registry exists only at bootstrap. Each episode receives an immutable `CapabilitySnapshot` containing metadata and `Arc` provider handles. Tool names and the evaluation-contract schema are generated from that snapshot. An active episode cannot observe provider hot-reload.
+
+## Skill context model
+
+Skills extend Agent reasoning but are not capabilities and never receive Runtime authority. When
+`[skills].enabled = true`, startup scans each configured trusted root for direct child directories
+containing a standard `SKILL.md`. YAML frontmatter, the complete `SKILL.md`, optional
+`agents/openai.yaml`, and all UTF-8 files beneath `references/` are validated, bounded, hashed, and
+stored in one immutable `SkillSnapshot`. `scripts/` and `assets/` are not indexed or exposed.
+
+The initial reasoner context contains only eligible Skill names, descriptions, and logical paths,
+subject to a deterministic catalog budget. An explicitly requested Skill is preloaded. For implicit
+selection the Agent calls `load_skill`, then may call `load_skill_reference` with an exact path from
+that Skill's reference index. These are context-only calls with a separate round budget. The
+coordinator decodes a complete tool-call batch before execution and rejects any batch that mixes a
+Skill context call with a probe, experiment, commit, or abort action.
+
+Skill content is subordinate to the fixed system prompt. Frontmatter `allowed-tools` is metadata,
+not authorization. OpenAI tool dependencies are rejected in the current reference-only mode, and
+no Skill can install an MCP server, execute a script, add a capability, bypass evaluation, or alter
+commit authority. Audit records contain Skill and reference paths, byte counts, and content digests,
+never instruction or reference bodies. Skill provenance remains separate from Evaluation Intent and
+the transaction WAL because recovery and the central verdict do not depend on prompt content.
 
 ## Evaluation intent freezing
 

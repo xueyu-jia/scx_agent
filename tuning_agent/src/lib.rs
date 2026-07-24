@@ -7,3 +7,4 @@ pub mod config;
 mod domain;
 mod kernel;
 pub mod runtime;
+mod skill;

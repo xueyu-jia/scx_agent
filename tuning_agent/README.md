@@ -130,6 +130,47 @@ ComparisonPolicy     pure + deterministic，CommitPending
 
 crate 对外只暴露高层 `Config`、`Runtime`、activation DTO 和发送函数。Transaction Kernel、WAL、Coordinator、provider execution handle 与具体 adapter 都是 crate-private，避免嵌入方绕过 recovery、A/B 或 commit authority。代码型 capability 作为受信任代码在仓库内实现 SPI，并且只能由 `runtime/bootstrap.rs` 注册；进程外扩展使用 MCP。
 
+## Skills 与 References
+
+Runtime 支持标准 Agent Skill 目录中的 `SKILL.md` 和 `references/`。Skill 只扩展推理上下文，不是 capability，也不会获得新的执行权限：
+
+```text
+skills-root/
+  scheduler-guide/
+    SKILL.md
+    references/
+      signals.md
+    agents/
+      openai.yaml
+```
+
+启动时 Runtime 严格解析并有界读入全部 Skill 指令与 UTF-8 Reference，计算内容 digest 后生成不可变 snapshot。首轮上下文只包含 `name`、`description` 和逻辑路径；显式请求会预加载完整 `SKILL.md`，隐式匹配则由 Agent 单独调用 `load_skill`。选中 Skill 后可用 `load_skill_reference` 按精确的 `references/...` 路径加载资料。
+
+```toml
+[skills]
+enabled = true
+roots = ["/etc/tuning-agent/skills"]
+max_skills = 64
+max_catalog_chars = 8000
+max_loaded_skills = 4
+max_skill_rounds = 4
+max_reference_reads = 8
+max_skill_bytes = 131072
+max_reference_bytes = 262144
+max_references_per_skill = 128
+max_registry_bytes = 16777216
+```
+
+显式调用使用可重复的 `--skill`：
+
+```bash
+cargo run -- --config tuning-agent.toml activate --wait --json \
+  --skill scheduler-guide \
+  "diagnose scheduler pressure" warning cli
+```
+
+`agents/openai.yaml` 当前只应用 `policy.allow_implicit_invocation`。声明 tool dependency 的 Skill 在 reference-only 模式下会被拒绝。`allowed-tools` 不授予权限；`scripts/` 和 `assets/` 不被索引、读取或执行。Skill/Reference 调用不能和 Probe、Experiment、Commit 或 Abort 混在同一 tool-call batch。
+
 ## 内置能力
 
 - `builtin/probe.linux-proc-snapshot.v1`：有界读取 loadavg、meminfo 摘要、PSI、CPU 和 scheduler 计数。调用者不能指定路径或命令。

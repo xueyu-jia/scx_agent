@@ -219,7 +219,7 @@ class RunnerExecutionPlanTest(unittest.TestCase):
             machine={"memory": "1G", "vcpus": 1, "pin_cpus": "0"},
             suite={},
             bench={
-                "host_support_files": ["bench/scenarios/cgroup_cpu/workload.py"],
+                "host_support_files": ["bench/scenarios/redis_cpu/workload.py"],
                 "measurement": {
                     "command": "measure",
                     "args": ["--seconds", "10"],
@@ -271,7 +271,7 @@ class RunnerExecutionPlanTest(unittest.TestCase):
         self.assertNotIn("host_support_files", execution_plan)
         self.assertEqual(
             result["spec"]["bench_config"]["host_support_files"],
-            ["bench/scenarios/cgroup_cpu/workload.py"],
+            ["bench/scenarios/redis_cpu/workload.py"],
         )
         written_plan = write_guest.call_args.args[1]
         self.assertEqual(written_plan.to_dict(), execution_plan)

@@ -15,12 +15,13 @@ MODEL="deepseek-v4-flash"
 PROGRESS_INTERVAL=30
 PREFLIGHT_ONLY=0
 DRY_RUN=0
-LATENCY_GATE=0
+GROUP_GATE=0
 SYSTEMD_SOCKET_PROXYD="/usr/lib/systemd/systemd-socket-proxyd"
 GATEWAY_PID=""
 RELAY_PID=""
 OWN_GATEWAY=0
 OWN_RELAY=0
+VALIDATION_FAILURES=0
 
 usage() {
   cat <<'EOF'
@@ -37,8 +38,9 @@ Options:
   --relay HOST:PORT   VM-visible relay endpoint (default: 192.168.122.1:17001)
   --progress SECONDS  run.py progress interval (default: 30)
   --preflight-only    check host and one real LLM tool call without running VMs
-  --latency-gate      run one formal LATENCY baseline/candidate pair only
+  --group-gate        run one LATENCY, BATCH, and MIX candidate pair
   --dry-run           generate all 44 runs without starting VMs or calling LLM
+                      continue remaining experiment groups after validation failures
   -h, --help          show this help
 EOF
 }
@@ -50,6 +52,12 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+record_validation_failure() {
+  VALIDATION_FAILURES=$((VALIDATION_FAILURES + 1))
+  printf 'validation failure recorded; continuing remaining experiments (%d total)\n' \
+    "$VALIDATION_FAILURES" >&2
 }
 
 while (($# > 0)); do
@@ -88,8 +96,8 @@ while (($# > 0)); do
       PREFLIGHT_ONLY=1
       shift
       ;;
-    --latency-gate)
-      LATENCY_GATE=1
+    --group-gate)
+      GROUP_GATE=1
       shift
       ;;
     --dry-run)
@@ -117,8 +125,8 @@ done
 UPSTREAM_URL=${UPSTREAM_URL%/}
 ((PREFLIGHT_ONLY == 0 || DRY_RUN == 0)) || die \
   "--preflight-only and --dry-run cannot be combined"
-((PREFLIGHT_ONLY == 0 || LATENCY_GATE == 0)) || die \
-  "--preflight-only and --latency-gate cannot be combined"
+((PREFLIGHT_ONLY == 0 || GROUP_GATE == 0)) || die \
+  "--preflight-only and --group-gate cannot be combined"
 
 require_command curl
 require_command jq
@@ -339,7 +347,7 @@ jq -n \
   --arg relay "http://${RELAY_ENDPOINT}" \
   --arg gateway "http://${GATEWAY_ENDPOINT}" \
   --arg upstream "$UPSTREAM_URL" \
-  --argjson latency_gate "$LATENCY_GATE" \
+  --argjson group_gate "$GROUP_GATE" \
   '{schema_version: 1, config: $config, config_sha256: $config_sha256,
     output: $output, git_commit: $git_commit, git_dirty: $git_dirty,
     artifacts: {kernel_sha256: $kernel_sha256, scheduler_sha256: $scheduler_sha256,
@@ -348,8 +356,9 @@ jq -n \
     llm: {protocol: "openai-compatible", model: $model, relay: $relay,
           gateway: $gateway, upstream: $upstream},
     order: "alternating", parallel: 1, dry_run: ($dry_run == 1),
-    mode: (if $latency_gate == 1 then "latency_gate" else "full" end),
-    experiments: (if $latency_gate == 1 then ["latency_gate"] else
+    mode: (if $group_gate == 1 then "group_gate" else "full" end),
+    experiments: (if $group_gate == 1 then
+      ["gate_latency", "gate_batch", "gate_mixed"] else
       ["aa_latency", "aa_batch", "aa_mixed",
        "measured_latency", "measured_batch", "measured_mixed"] end)}' \
   >"$OUTPUT_ROOT/experiment-manifest.json"
@@ -400,16 +409,22 @@ validate_pass_results() {
   local expected_results=$((expected_runs * 2))
   local -a results=()
   mapfile -d '' results < <(find "$output/runs" -name result.json -print0 | sort -z)
-  (( ${#results[@]} == expected_results )) || die \
-    "$output produced ${#results[@]} result files; expected $expected_results"
+  if (( ${#results[@]} != expected_results )); then
+    printf 'validation failed: %s produced %d result files; expected %d\n' \
+      "$output" "${#results[@]}" "$expected_results" >&2
+    return 1
+  fi
   local result
   local expected_status=PASS
   if ((DRY_RUN)); then
     expected_status=DRY_RUN
   fi
   for result in "${results[@]}"; do
-    jq -e --arg status "$expected_status" '.status == $status' "$result" >/dev/null || die \
-      "unexpected run status in $result; expected $expected_status"
+    if ! jq -e --arg status "$expected_status" '.status == $status' "$result" >/dev/null; then
+      printf 'validation failed: unexpected run status in %s; expected %s\n' \
+        "$result" "$expected_status" >&2
+      return 1
+    fi
   done
 }
 
@@ -417,7 +432,6 @@ validate_llm_results() {
   local output=$1
   local candidate_label=$2
   local expected_runs=$3
-  local expected_episodes=$4
   if ((DRY_RUN)); then
     return
   fi
@@ -426,78 +440,118 @@ validate_llm_results() {
   mapfile -d '' verifications < <(
     find "$candidate_dir" -path '*/real_llm/perf-verification.json' -print0 | sort -z
   )
-  (( ${#verifications[@]} == expected_runs )) || die \
-    "$output contains ${#verifications[@]} LLM verification files; expected $expected_runs"
+  if (( ${#verifications[@]} != expected_runs )); then
+    printf 'validation failed: %s contains %d LLM verification files; expected %d\n' \
+      "$output" "${#verifications[@]}" "$expected_runs" >&2
+    return 1
+  fi
 
   local verification outcome
   for verification in "${verifications[@]}"; do
-    jq -e --argjson expected "$expected_episodes" --arg model "$MODEL" '
+    if ! jq -e --arg model "$MODEL" '
       .model == $model and
-      .audit_episode_count == $expected and
-      (.episodes | length == $expected) and
-      all(.episodes[]; .phase == "committed" and .verdict == "improved")
-    ' "$verification" >/dev/null || die "LLM verification failed: $verification"
+      .classification_mode == "group" and
+      .audit_episode_count == 1 and
+      (.episodes | length == 1) and
+      (.activation_comms | length) as $targets |
+      .mutation_count == $targets and
+      .episodes[0].mutation_count == $targets and
+      .episodes[0].phase == "committed" and
+      .episodes[0].verdict == "improved"
+    ' "$verification" >/dev/null; then
+      printf 'validation failed: LLM verification failed: %s\n' "$verification" >&2
+      return 1
+    fi
 
     outcome=${verification%/real_llm/perf-verification.json}/treatment/outcome.json
-    [[ -f "$outcome" ]] || die "missing treatment outcome: $outcome"
-    jq -e --argjson expected "$expected_episodes" '
+    if [[ ! -f "$outcome" ]]; then
+      printf 'validation failed: missing treatment outcome: %s\n' "$outcome" >&2
+      return 1
+    fi
+    if ! jq -e '
       .version == 2 and .disposition == "proceed" and
-      .details.quiet_state.episode_count == $expected
-    ' "$outcome" >/dev/null || die "LLM treatment did not reach quiet state: $outcome"
+      .details.quiet_state.episode_count == 1
+    ' "$outcome" >/dev/null; then
+      printf 'validation failed: LLM treatment did not reach quiet state: %s\n' \
+        "$outcome" >&2
+      return 1
+    fi
   done
 }
 
-if ((LATENCY_GATE)); then
-  printf 'starting one-pair formal LATENCY candidate gate\n'
+if ((GROUP_GATE)); then
+  printf 'starting one-pair group activation gates\n'
   run_plan single_latency_candidate_gate default scx_agent_classed_llm_latency \
-    llm_latency_control llm_latency_classify "$OUTPUT_ROOT/latency_gate"
-  validate_pass_results "$OUTPUT_ROOT/latency_gate" 1
-  validate_llm_results "$OUTPUT_ROOT/latency_gate" \
-    scx_agent_classed_llm_latency__llm_latency_classify 1 1
-  if ((DRY_RUN)); then
-    printf '\nLATENCY candidate gate dry run passed\n'
+    llm_latency_control llm_latency_classify "$OUTPUT_ROOT/gate_latency"
+  validate_pass_results "$OUTPUT_ROOT/gate_latency" 1 || record_validation_failure
+  validate_llm_results "$OUTPUT_ROOT/gate_latency" \
+    scx_agent_classed_llm_latency__llm_latency_classify 1 || record_validation_failure
+
+  run_plan single_batch_candidate_gate default scx_agent_classed_llm_batch \
+    llm_batch_control llm_batch_classify "$OUTPUT_ROOT/gate_batch"
+  validate_pass_results "$OUTPUT_ROOT/gate_batch" 1 || record_validation_failure
+  validate_llm_results "$OUTPUT_ROOT/gate_batch" \
+    scx_agent_classed_llm_batch__llm_batch_classify 1 || record_validation_failure
+
+  run_plan mixed_candidate_gate default scx_agent_classed_llm_mixed \
+    llm_mixed_control llm_mixed_classify "$OUTPUT_ROOT/gate_mixed"
+  validate_pass_results "$OUTPUT_ROOT/gate_mixed" 1 || record_validation_failure
+  validate_llm_results "$OUTPUT_ROOT/gate_mixed" \
+    scx_agent_classed_llm_mixed__llm_mixed_classify 1 || record_validation_failure
+  if ((VALIDATION_FAILURES)); then
+    printf '\ngroup activation gates completed with validation failures\n' >&2
+  elif ((DRY_RUN)); then
+    printf '\ngroup activation gate dry run passed\n'
   else
-    printf '\nLATENCY candidate gate passed\n'
+    printf '\ngroup activation gates passed\n'
   fi
-  printf 'results: %s\nreport: %s\n' \
-    "$(realpath "$OUTPUT_ROOT")" \
-    "$(realpath "$OUTPUT_ROOT/latency_gate/analysis/report.html")"
+  printf 'results: %s\nreports:\n' "$(realpath "$OUTPUT_ROOT")"
+  find "$OUTPUT_ROOT" -path '*/analysis/report.html' -print | sort
+  if ((VALIDATION_FAILURES)); then
+    exit 1
+  fi
   exit 0
 fi
 
 printf 'starting A/A EEVDF noise comparisons\n'
 run_plan single_latency_core_priming alt_default default "" "" "$OUTPUT_ROOT/aa_latency"
-validate_pass_results "$OUTPUT_ROOT/aa_latency" 2
+validate_pass_results "$OUTPUT_ROOT/aa_latency" 2 || record_validation_failure
 
 run_plan single_batch_core_priming alt_default default "" "" "$OUTPUT_ROOT/aa_batch"
-validate_pass_results "$OUTPUT_ROOT/aa_batch" 2
+validate_pass_results "$OUTPUT_ROOT/aa_batch" 2 || record_validation_failure
 
 run_plan mixed_fixed_rps_core_priming alt_default default "" "" "$OUTPUT_ROOT/aa_mixed"
-validate_pass_results "$OUTPUT_ROOT/aa_mixed" 2
+validate_pass_results "$OUTPUT_ROOT/aa_mixed" 2 || record_validation_failure
 
 printf 'starting formal real-LLM comparisons\n'
 run_plan single_latency_core_measured default scx_agent_classed_llm_latency \
   llm_latency_control llm_latency_classify "$OUTPUT_ROOT/measured_latency"
-validate_pass_results "$OUTPUT_ROOT/measured_latency" 8
+validate_pass_results "$OUTPUT_ROOT/measured_latency" 8 || record_validation_failure
 validate_llm_results "$OUTPUT_ROOT/measured_latency" \
-  scx_agent_classed_llm_latency__llm_latency_classify 8 1
+  scx_agent_classed_llm_latency__llm_latency_classify 8 || record_validation_failure
 
 run_plan single_batch_core_measured default scx_agent_classed_llm_batch \
   llm_batch_control llm_batch_classify "$OUTPUT_ROOT/measured_batch"
-validate_pass_results "$OUTPUT_ROOT/measured_batch" 4
+validate_pass_results "$OUTPUT_ROOT/measured_batch" 4 || record_validation_failure
 validate_llm_results "$OUTPUT_ROOT/measured_batch" \
-  scx_agent_classed_llm_batch__llm_batch_classify 4 2
+  scx_agent_classed_llm_batch__llm_batch_classify 4 || record_validation_failure
 
 run_plan mixed_fixed_rps_core_measured default scx_agent_classed_llm_mixed \
   llm_mixed_control llm_mixed_classify "$OUTPUT_ROOT/measured_mixed"
-validate_pass_results "$OUTPUT_ROOT/measured_mixed" 4
+validate_pass_results "$OUTPUT_ROOT/measured_mixed" 4 || record_validation_failure
 validate_llm_results "$OUTPUT_ROOT/measured_mixed" \
-  scx_agent_classed_llm_mixed__llm_mixed_classify 4 3
+  scx_agent_classed_llm_mixed__llm_mixed_classify 4 || record_validation_failure
 
-if ((DRY_RUN)); then
+if ((VALIDATION_FAILURES)); then
+  printf '\nall experiments completed with %d validation failure(s)\n' \
+    "$VALIDATION_FAILURES" >&2
+elif ((DRY_RUN)); then
   printf '\nall experiment dry runs passed\nresults: %s\n' "$(realpath "$OUTPUT_ROOT")"
 else
   printf '\nall experiments passed\nresults: %s\n' "$(realpath "$OUTPUT_ROOT")"
 fi
 printf 'reports:\n'
 find "$OUTPUT_ROOT" -path '*/analysis/report.html' -print | sort
+if ((VALIDATION_FAILURES)); then
+  exit 1
+fi

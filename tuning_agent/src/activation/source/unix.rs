@@ -239,6 +239,22 @@ pub fn send_unix_activation_request(
     serde_json::from_slice::<ActivationResponse>(&response).map_err(std::io::Error::other)
 }
 
+pub fn send_unix_activation_request_nowait(
+    path: impl AsRef<Path>,
+    request: &ActivationRequest,
+) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(path)?;
+    let payload = serde_json::to_vec(request)?;
+    if payload.len() as u64 > MAX_ACTIVATION_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "activation request exceeds 64 KiB",
+        ));
+    }
+    stream.write_all(&payload)?;
+    stream.shutdown(std::net::Shutdown::Write)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -328,6 +344,25 @@ mod tests {
             read_activation(&mut oversized).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn legacy_request_without_requested_skills_remains_compatible() {
+        let value = serde_json::json!({
+            "request_id": "legacy-request",
+            "wait": false,
+            "event": {
+                "source": "Cli",
+                "event_type": "manual",
+                "severity": "Info",
+                "scope": "Host",
+                "timestamp_ns": 1,
+                "evidence": {}
+            }
+        });
+
+        let request: ActivationRequest = serde_json::from_value(value).unwrap();
+        assert!(request.requested_skills.is_empty());
     }
 
     fn poll_until_event(source: &mut UnixIpcSource) -> Vec<UnixActivation> {
