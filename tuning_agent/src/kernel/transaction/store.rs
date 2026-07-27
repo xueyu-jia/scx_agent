@@ -57,6 +57,7 @@ pub struct PendingTransaction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryChange {
     pub change_id: ChangeId,
+    pub supersedes: Option<ChangeId>,
     pub capability_id: crate::domain::CapabilityId,
     pub resource: ResourceKey,
     pub experiment_verified: bool,
@@ -480,7 +481,9 @@ fn inspect_log(
     let mut intent_pin = None;
     let mut capability_generation = None;
     let mut changes: BTreeMap<ChangeId, RecoveryChange> = BTreeMap::new();
-    let mut resource_owners = BTreeMap::new();
+    let mut resource_heads = BTreeMap::new();
+    let mut resource_baselines = BTreeMap::new();
+    let mut resource_providers = BTreeMap::new();
     let mut known_changes = BTreeSet::new();
     let mut pending_operations = BTreeMap::new();
     let mut seal = None;
@@ -533,9 +536,16 @@ fn inspect_log(
                         change.change_id
                     )));
                 }
+                if change.prepared.baseline.value == change.prepared.desired.value {
+                    return Err(WalError::new(format!(
+                        "change '{}' has identical baseline and desired states",
+                        change.change_id
+                    )));
+                }
                 if let Some(previous) = changes.get(&change.change_id) {
                     if previous.resource != change.resource
                         || previous.capability_id != change.capability_id
+                        || previous.supersedes != change.supersedes
                     {
                         return Err(WalError::new(format!(
                             "change '{}' changed capability or resource identity in the WAL",
@@ -561,18 +571,56 @@ fn inspect_log(
                     return Err(WalError::new(format!(
                         "transaction WAL contains more than {MAX_CHANGES_PER_TRANSACTION} changes"
                     )));
-                } else if let Some(owner) =
-                    resource_owners.insert(change.resource.clone(), change.change_id.clone())
-                {
-                    return Err(WalError::new(format!(
-                        "resource '{}' is owned by both '{}' and '{}'",
-                        change.resource, owner, change.change_id
-                    )));
                 } else if change.experiment_verified {
                     return Err(WalError::new(format!(
                         "first WAL record for change '{}' is already experiment-verified",
                         change.change_id
                     )));
+                } else if change.state != ChangeState::IntentDurable {
+                    return Err(WalError::new(format!(
+                        "first WAL record for change '{}' is not an apply intent",
+                        change.change_id
+                    )));
+                } else {
+                    match &change.supersedes {
+                        None => {
+                            if let Some(owner) = resource_heads.get(&change.resource) {
+                                return Err(WalError::new(format!(
+                                    "resource '{}' is already owned by '{}' but '{}' has no revision link",
+                                    change.resource, owner, change.change_id
+                                )));
+                            }
+                            resource_baselines.insert(
+                                change.resource.clone(),
+                                change.prepared.baseline.digest.clone(),
+                            );
+                            resource_providers
+                                .insert(change.resource.clone(), change.prepared.provider.clone());
+                        }
+                        Some(previous_id) => {
+                            let previous = changes.get(previous_id).ok_or_else(|| {
+                                WalError::new(format!(
+                                    "change '{}' supersedes unknown change '{}'",
+                                    change.change_id, previous_id
+                                ))
+                            })?;
+                            if resource_heads.get(&change.resource) != Some(previous_id)
+                                || previous.state != ChangeState::BaselineRestored
+                                || !previous.experiment_verified
+                                || previous.capability_id != change.capability_id
+                                || resource_baselines.get(&change.resource)
+                                    != Some(&change.prepared.baseline.digest)
+                                || resource_providers.get(&change.resource)
+                                    != Some(&change.prepared.provider)
+                            {
+                                return Err(WalError::new(format!(
+                                    "change '{}' has an invalid predecessor '{}'",
+                                    change.change_id, previous_id
+                                )));
+                            }
+                        }
+                    }
+                    resource_heads.insert(change.resource.clone(), change.change_id.clone());
                 }
                 if matches!(
                     change.state,
@@ -597,6 +645,7 @@ fn inspect_log(
                     change.change_id.clone(),
                     RecoveryChange {
                         change_id: change.change_id.clone(),
+                        supersedes: change.supersedes.clone(),
                         capability_id: change.capability_id.clone(),
                         resource: change.resource.clone(),
                         experiment_verified: change.experiment_verified,
@@ -674,6 +723,7 @@ fn inspect_log(
                     })?;
                     if previous.capability_id != terminal.capability_id
                         || previous.resource != terminal.resource
+                        || previous.supersedes != terminal.supersedes
                         || previous.experiment_verified != terminal.experiment_verified
                         || (terminal.state == ChangeState::Finalized
                             && previous.state != ChangeState::CandidateApplied)
@@ -682,6 +732,14 @@ fn inspect_log(
                     {
                         return Err(WalError::new(format!(
                             "commit seal changed identity or experiment evidence for '{}'",
+                            terminal.change_id
+                        )));
+                    }
+                    if terminal.state == ChangeState::Finalized
+                        && resource_heads.get(&terminal.resource) != Some(&terminal.change_id)
+                    {
+                        return Err(WalError::new(format!(
+                            "commit seal finalized superseded change '{}'",
                             terminal.change_id
                         )));
                     }
@@ -712,6 +770,7 @@ fn inspect_log(
                         terminal.change_id.clone(),
                         RecoveryChange {
                             change_id: terminal.change_id.clone(),
+                            supersedes: terminal.supersedes.clone(),
                             capability_id: terminal.capability_id.clone(),
                             resource: terminal.resource.clone(),
                             experiment_verified: terminal.experiment_verified,
@@ -1031,6 +1090,64 @@ mod tests {
     }
 
     #[test]
+    fn discovery_accepts_only_linear_resource_revisions() {
+        let root = temp_store("resource-revisions");
+        let store = TransactionStore::new(&root).unwrap();
+        let transaction_id = TransactionId::new("revisions").unwrap();
+        let mut wal = store.create(&transaction_id).unwrap();
+        append_start(&mut wal, transaction_id.clone(), EpisodeId::new(21), 1);
+
+        let mut first = test_change(transaction_id.clone());
+        append_change(&mut wal, 1, &transaction_id, first.clone());
+        first.experiment_verified = true;
+        first.state = ChangeState::AppliedVerified;
+        first.last_operation_id = OperationId::new("operation/first-applied").unwrap();
+        append_change(&mut wal, 2, &transaction_id, first.clone());
+
+        let restore_id = OperationId::new("operation/first-restore").unwrap();
+        append_operation_intent(
+            &mut wal,
+            3,
+            &transaction_id,
+            &first.change_id,
+            restore_id.clone(),
+            crate::kernel::transaction::OperationIntentKind::Restore,
+        );
+        first.state = ChangeState::BaselineRestored;
+        first.last_operation_id = restore_id;
+        append_change(&mut wal, 4, &transaction_id, first.clone());
+
+        let mut second = first.clone();
+        second.change_id = ChangeId::new("change/revision-2").unwrap();
+        second.supersedes = Some(first.change_id.clone());
+        second.prepared.desired = MutationState {
+            value: Value::String("other".into()),
+            digest: content_digest(&Value::String("other".into())).unwrap(),
+        };
+        second.experiment_verified = false;
+        second.state = ChangeState::IntentDurable;
+        second.last_operation_id = OperationId::new("operation/second-apply").unwrap();
+        append_change(&mut wal, 5, &transaction_id, second.clone());
+        second.experiment_verified = true;
+        second.state = ChangeState::AppliedVerified;
+        append_change(&mut wal, 6, &transaction_id, second.clone());
+        drop(wal);
+
+        let inventory = store.discover().unwrap();
+        assert!(inventory.corrupt.is_empty());
+        assert_eq!(inventory.pending.len(), 1);
+        assert_eq!(inventory.pending[0].changes.len(), 2);
+        let recovered_second = inventory.pending[0]
+            .changes
+            .iter()
+            .find(|change| change.change_id == second.change_id)
+            .unwrap();
+        assert_eq!(recovered_second.supersedes, Some(first.change_id));
+        assert!(!inventory.pending[0].has_applied_unknown);
+        cleanup(root);
+    }
+
+    #[test]
     fn create_never_reuses_or_overwrites_an_existing_log() {
         let root = temp_store("no-overwrite");
         let store = TransactionStore::new(&root).unwrap();
@@ -1338,6 +1455,7 @@ mod tests {
         crate::kernel::transaction::ChangeRecord {
             transaction_id,
             change_id: ChangeId::new("change/pending").unwrap(),
+            supersedes: None,
             capability_id: capability_id.clone(),
             resource: resource.clone(),
             prepared: PreparedMutation {

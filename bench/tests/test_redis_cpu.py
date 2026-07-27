@@ -62,6 +62,17 @@ def full_metrics(weight: float = 100.0) -> dict[str, float]:
 
 
 class RedisCpuCommonTest(unittest.TestCase):
+    def test_scoped_exec_allows_empty_command_arguments(self) -> None:
+        command = ["redis-server", "--save", ""]
+
+        scoped = common.scoped_exec_argv(Path("/sys/fs/cgroup/test"), (0, 1), command)
+
+        self.assertEqual(scoped[-len(command) :], command)
+        with self.assertRaisesRegex(common.RedisCpuError, "non-empty argv"):
+            common.scoped_exec_argv(Path("/sys/fs/cgroup/test"), (0, 1), [])
+        with self.assertRaisesRegex(common.RedisCpuError, "non-empty argv"):
+            common.scoped_exec_argv(Path("/sys/fs/cgroup/test"), (0, 1), [""])
+
     def test_redis_output_and_two_shard_aggregation(self) -> None:
         output = """
         Latency summary (msec):
@@ -218,6 +229,7 @@ class RedisCpuMcpTest(unittest.TestCase):
             schema = capabilities[-1]["input_schema"]["properties"]["value"]
             self.assertEqual(schema, {"type": "integer", "minimum": 1, "maximum": 10_000})
             self.assertNotIn("enum", schema)
+            self.assertIn("called repeatedly in one episode", capabilities[-1]["description"])
 
     def test_mutation_readback_persistence_drift_and_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

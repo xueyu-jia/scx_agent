@@ -126,7 +126,7 @@ def set_current_affinity(cpus: tuple[int, ...]) -> None:
 
 
 def scoped_exec_argv(path: Path, cpus: tuple[int, ...], argv: list[str]) -> list[str]:
-    if not argv or any(not item for item in argv):
+    if not argv or not argv[0]:
         raise RedisCpuError("scoped exec requires a non-empty argv")
     return [
         sys.executable,

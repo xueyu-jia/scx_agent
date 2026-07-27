@@ -617,7 +617,8 @@ class RedisCpuMcp:
                         "restore": "mutation.restore",
                         "finalize": "mutation.finalize",
                     },
-                    "Set only the bound Redis cgroup cpu.weight to any Linux-valid integer from 1 through 10000",
+                    "Set only the bound Redis cgroup cpu.weight to any Linux-valid integer from 1 through 10000. "
+                    "It may be called repeatedly in one episode to try another value; each verified call supersedes the prior value",
                     idempotent=True,
                 ),
             ],
