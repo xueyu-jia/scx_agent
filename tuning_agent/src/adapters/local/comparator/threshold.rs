@@ -97,6 +97,7 @@ impl ThresholdComparisonPolicy {
             }),
         )
         .with_allowed_phases([EpisodePhase::CommitPending]);
+        meta.limits.timeout_ms = 1_000;
         meta.deterministic = true;
         meta.idempotent = true;
         Self { meta }
@@ -259,6 +260,13 @@ mod tests {
 
         assert_eq!(evidence.conclusion, ComparisonConclusion::Improved);
         assert!(evidence.conditions[0].passed);
+    }
+
+    #[test]
+    fn declares_a_bounded_local_computation_timeout() {
+        let policy = ThresholdComparisonPolicy::new();
+
+        assert_eq!(policy.meta().limits.timeout_ms, 1_000);
     }
 
     #[test]
