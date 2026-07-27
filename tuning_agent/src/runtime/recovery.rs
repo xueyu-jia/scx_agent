@@ -600,6 +600,7 @@ mod tests {
         ChangeRecord {
             transaction_id,
             change_id: ChangeId::new("change/missing").unwrap(),
+            supersedes: None,
             capability_id: capability_id.clone(),
             resource: resource.clone(),
             prepared: PreparedMutation {

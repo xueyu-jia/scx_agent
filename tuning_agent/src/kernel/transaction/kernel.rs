@@ -22,7 +22,7 @@ pub struct TransactionKernel {
     capabilities: CapabilitySnapshot,
     wal: Box<dyn TransactionWal>,
     changes: BTreeMap<ChangeId, ChangeRecord>,
-    resource_owners: BTreeMap<ResourceKey, ChangeId>,
+    resource_heads: BTreeMap<ResourceKey, ChangeId>,
     change_order: Vec<ChangeId>,
     next_sequence: u64,
     operation_counter: u64,
@@ -44,7 +44,7 @@ impl TransactionKernel {
             capabilities,
             wal,
             changes: BTreeMap::new(),
-            resource_owners: BTreeMap::new(),
+            resource_heads: BTreeMap::new(),
             change_order: Vec::new(),
             next_sequence: 0,
             operation_counter: 0,
@@ -68,7 +68,7 @@ impl TransactionKernel {
         let entries = wal.load().map_err(wal_error)?;
         let mut changes = BTreeMap::new();
         let mut change_order = Vec::new();
-        let mut resource_owners = BTreeMap::new();
+        let mut resource_heads = BTreeMap::new();
         let mut pending_intents = BTreeMap::new();
         let mut sealed = None;
         let mut commit_authorization = None;
@@ -127,17 +127,8 @@ impl TransactionKernel {
                                 ),
                             ));
                         }
-                        if let Some(owner) = resource_owners
-                            .insert(change.resource.clone(), change.change_id.clone())
-                        {
-                            return Err(TransactionError::new(
-                                TransactionErrorKind::CorruptWal,
-                                format!(
-                                    "resource '{}' is owned by changes '{}' and '{}'",
-                                    change.resource, owner, change.change_id
-                                ),
-                            ));
-                        }
+                        validate_recovered_revision(change, &changes, &resource_heads)?;
+                        resource_heads.insert(change.resource.clone(), change.change_id.clone());
                         change_order.push(change.change_id.clone());
                     }
                     if pending_intents
@@ -238,6 +229,17 @@ impl TransactionKernel {
                                 "commit seal contains duplicate or non-terminal changes",
                             ));
                         }
+                        if terminal.state == ChangeState::Finalized
+                            && resource_heads.get(&terminal.resource) != Some(&terminal.change_id)
+                        {
+                            return Err(TransactionError::new(
+                                TransactionErrorKind::CorruptWal,
+                                format!(
+                                    "commit seal finalized superseded change '{}'",
+                                    terminal.change_id
+                                ),
+                            ));
+                        }
                     }
                     let committed_candidate = Candidate::new(
                         terminal_changes
@@ -315,13 +317,23 @@ impl TransactionKernel {
                 ));
             }
         }
-        let candidate_ids = changes
-            .values()
-            .filter(|change| {
-                change.state == ChangeState::CandidateApplied && change.experiment_verified
+        let candidate_ids = change_order
+            .iter()
+            .filter_map(|change_id| {
+                let change = &changes[change_id];
+                (change.state == ChangeState::CandidateApplied && change.experiment_verified)
+                    .then(|| change_id.clone())
             })
-            .map(|change| change.change_id.clone())
             .collect::<Vec<_>>();
+        for change_id in &candidate_ids {
+            let change = &changes[change_id];
+            if resource_heads.get(&change.resource) != Some(change_id) {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::CorruptWal,
+                    format!("superseded change '{change_id}' is candidate-applied"),
+                ));
+            }
+        }
         let active_candidate =
             if candidate_ids.is_empty() {
                 None
@@ -337,7 +349,7 @@ impl TransactionKernel {
             capabilities,
             wal,
             changes,
-            resource_owners,
+            resource_heads,
             change_order,
             next_sequence: expected_sequence,
             operation_counter: expected_sequence,
@@ -390,30 +402,87 @@ impl TransactionKernel {
             ));
         }
         let driver = self.driver(&capability_id)?;
-        let operation_id = self.next_operation_id("experiment")?;
-        let prepared = driver
+        let mut operation_id = self.next_operation_id("experiment")?;
+        let mut prepared = driver
             .prepare(&MutationPrepareRequest {
                 context: InvocationContext {
                     episode_id: self.intent_pin.episode_id(),
                     operation_id: operation_id.clone(),
                 },
-                arguments,
+                arguments: arguments.clone(),
             })
             .map_err(provider_error)?;
         self.validate_prepared(&capability_id, &prepared)?;
-        if let Some(owner) = self.resource_owners.get(&prepared.resource) {
-            return Err(TransactionError::new(
-                TransactionErrorKind::DuplicateResource,
-                format!(
-                    "resource '{}' is already owned by change '{}'",
-                    prepared.resource, owner
-                ),
-            ));
+        let supersedes = self.resource_heads.get(&prepared.resource).cloned();
+        if let Some(previous_id) = &supersedes {
+            let previous = self.changes.get(previous_id).cloned().ok_or_else(|| {
+                TransactionError::new(
+                    TransactionErrorKind::InvalidState,
+                    format!("resource head references unknown change '{previous_id}'"),
+                )
+            })?;
+            if previous.state != ChangeState::AppliedVerified || !previous.experiment_verified {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::InvalidState,
+                    format!(
+                        "resource '{}' cannot be revised from change '{}' in state {:?}",
+                        previous.resource, previous.change_id, previous.state
+                    ),
+                ));
+            }
+            if previous.capability_id != capability_id
+                || previous.prepared.provider != prepared.provider
+            {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::PinMismatch,
+                    format!(
+                        "resource '{}' must be revised through the same pinned capability",
+                        previous.resource
+                    ),
+                ));
+            }
+            self.ensure_expected(previous_id, ExpectedState::Desired)?;
+            if prepared.baseline != previous.prepared.desired {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::InvalidState,
+                    format!(
+                        "revision prepare for resource '{}' did not observe the latest desired state",
+                        previous.resource
+                    ),
+                ));
+            }
+            self.restore_one(previous_id, ChangeState::BaselineRestored)?;
+
+            let initially_prepared = prepared;
+            operation_id = self.next_operation_id("revision")?;
+            prepared = driver
+                .prepare(&MutationPrepareRequest {
+                    context: InvocationContext {
+                        episode_id: self.intent_pin.episode_id(),
+                        operation_id: operation_id.clone(),
+                    },
+                    arguments,
+                })
+                .map_err(provider_error)?;
+            self.validate_prepared(&capability_id, &prepared)?;
+            if prepared.resource != previous.resource
+                || prepared.baseline != previous.prepared.baseline
+                || prepared.desired != initially_prepared.desired
+            {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::InvalidState,
+                    format!(
+                        "resource '{}' revision changed identity, original baseline, or desired state during prepare",
+                        previous.resource
+                    ),
+                ));
+            }
         }
 
         let record = ChangeRecord {
             transaction_id: self.transaction_id.clone(),
             change_id: change_id.clone(),
+            supersedes,
             capability_id,
             resource: prepared.resource.clone(),
             prepared,
@@ -427,7 +496,7 @@ impl TransactionKernel {
         self.append_event(WalEvent::ChangeUpsert {
             change: Box::new(record.clone()),
         })?;
-        self.resource_owners
+        self.resource_heads
             .insert(record.resource.clone(), change_id.clone());
         self.change_order.push(change_id.clone());
         self.changes.insert(change_id.clone(), record);
@@ -516,8 +585,12 @@ impl TransactionKernel {
         let ids = self.change_order.clone();
         // Complete all drift checks before the first irreversible finalize call.
         for change_id in &ids {
+            let change = &self.changes[change_id];
+            if self.resource_heads.get(&change.resource) != Some(change_id) {
+                continue;
+            }
             if candidate.contains(change_id) {
-                if self.changes[change_id].state != ChangeState::CandidateApplied {
+                if change.state != ChangeState::CandidateApplied {
                     return Err(TransactionError::new(
                         TransactionErrorKind::InvalidState,
                         format!("candidate change '{change_id}' is not applied"),
@@ -583,6 +656,10 @@ impl TransactionKernel {
         // Ack collection can take time. Recheck the complete candidate/baseline
         // boundary immediately before making the commit decision durable.
         for change_id in &ids {
+            let change = &self.changes[change_id];
+            if self.resource_heads.get(&change.resource) != Some(change_id) {
+                continue;
+            }
             self.ensure_expected(
                 change_id,
                 if candidate.contains(change_id) {
@@ -1016,6 +1093,12 @@ impl TransactionKernel {
                     format!("candidate change '{change_id}' has no durable successful experiment"),
                 ));
             }
+            if self.resource_heads.get(&change.resource) != Some(change_id) {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::InvalidCandidate,
+                    format!("candidate change '{change_id}' has been superseded"),
+                ));
+            }
             if !resources.insert(change.resource.clone()) {
                 return Err(TransactionError::new(
                     TransactionErrorKind::DuplicateResource,
@@ -1182,6 +1265,7 @@ fn validate_recovered_change(
     if &change.transaction_id != transaction_id
         || change.resource != change.prepared.resource
         || change.capability_id != change.prepared.capability_id
+        || change.supersedes.as_ref() == Some(&change.change_id)
     {
         return Err(TransactionError::new(
             TransactionErrorKind::CorruptWal,
@@ -1196,6 +1280,15 @@ fn validate_recovered_change(
         "persisted baseline",
         TransactionErrorKind::CorruptWal,
     )?;
+    if change.prepared.baseline == change.prepared.desired {
+        return Err(TransactionError::new(
+            TransactionErrorKind::CorruptWal,
+            format!(
+                "change '{}' has identical baseline and desired states",
+                change.change_id
+            ),
+        ));
+    }
     validate_state_digest(
         &change.prepared.desired,
         "persisted desired state",
@@ -1237,6 +1330,70 @@ fn validate_recovered_change(
     Ok(())
 }
 
+fn validate_recovered_revision(
+    change: &ChangeRecord,
+    changes: &BTreeMap<ChangeId, ChangeRecord>,
+    resource_heads: &BTreeMap<ResourceKey, ChangeId>,
+) -> Result<(), TransactionError> {
+    if change.state != ChangeState::IntentDurable {
+        return Err(TransactionError::new(
+            TransactionErrorKind::CorruptWal,
+            format!(
+                "first WAL record for change '{}' is not an apply intent",
+                change.change_id
+            ),
+        ));
+    }
+    match &change.supersedes {
+        None => {
+            if let Some(owner) = resource_heads.get(&change.resource) {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::CorruptWal,
+                    format!(
+                        "resource '{}' is already owned by change '{}' but '{}' has no revision link",
+                        change.resource, owner, change.change_id
+                    ),
+                ));
+            }
+        }
+        Some(previous_id) => {
+            if resource_heads.get(&change.resource) != Some(previous_id) {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::CorruptWal,
+                    format!(
+                        "change '{}' does not supersede the latest revision of resource '{}'",
+                        change.change_id, change.resource
+                    ),
+                ));
+            }
+            let previous = changes.get(previous_id).ok_or_else(|| {
+                TransactionError::new(
+                    TransactionErrorKind::CorruptWal,
+                    format!(
+                        "change '{}' supersedes unknown change '{}'",
+                        change.change_id, previous_id
+                    ),
+                )
+            })?;
+            if previous.state != ChangeState::BaselineRestored
+                || !previous.experiment_verified
+                || previous.capability_id != change.capability_id
+                || previous.prepared.provider != change.prepared.provider
+                || previous.prepared.baseline != change.prepared.baseline
+            {
+                return Err(TransactionError::new(
+                    TransactionErrorKind::CorruptWal,
+                    format!(
+                        "change '{}' has an invalid predecessor '{}'",
+                        change.change_id, previous_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_state_digest(
     state: &MutationState,
     label: &str,
@@ -1260,6 +1417,7 @@ fn validate_recovered_transition(
 ) -> Result<(), TransactionError> {
     if previous.transaction_id != next.transaction_id
         || previous.change_id != next.change_id
+        || previous.supersedes != next.supersedes
         || previous.capability_id != next.capability_id
         || previous.resource != next.resource
         || previous.prepared != next.prepared
@@ -1571,25 +1729,158 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_resources_are_rejected_before_second_apply() {
+    fn later_resource_revision_supersedes_the_previous_change() {
         let mut fixture = fixture(ApplyMode::Normal);
         let mut kernel = fixture.kernel.take().unwrap();
-        kernel
+        let first = ChangeId::new("change/one").unwrap();
+        let second = ChangeId::new("change/two").unwrap();
+        let first_record = kernel
             .experiment(
-                ChangeId::new("change/one").unwrap(),
+                first.clone(),
                 fixture.capability_id.clone(),
                 json!({"resource": "resource/a", "value": "new"}),
             )
             .unwrap();
+        assert_eq!(first_record.supersedes, None);
+
+        let second_record = kernel
+            .experiment(
+                second.clone(),
+                fixture.capability_id.clone(),
+                json!({"resource": "resource/a", "value": "other"}),
+            )
+            .unwrap();
+
+        assert_eq!(second_record.supersedes, Some(first.clone()));
+        assert_eq!(second_record.prepared.baseline, state("old"));
+        assert_eq!(fixture.current("resource/a"), "other");
+        assert_eq!(
+            kernel.change(&first).unwrap().state,
+            ChangeState::BaselineRestored
+        );
+
+        kernel.restore_baseline().unwrap();
+        assert_eq!(fixture.current("resource/a"), "old");
+        let superseded = Candidate::new(vec![first.clone()]).unwrap();
+        let error = kernel.replay_candidate(&superseded).unwrap_err();
+        assert_eq!(error.kind, TransactionErrorKind::InvalidCandidate);
+        assert!(error.message.contains("superseded"));
+
+        let candidate = Candidate::new(vec![second.clone()]).unwrap();
+        kernel.replay_candidate(&candidate).unwrap();
+        assert_eq!(fixture.current("resource/a"), "other");
+        kernel
+            .finalize_candidate(&candidate, &authorization_for(&candidate))
+            .unwrap();
+        assert_eq!(
+            kernel.change(&first).unwrap().state,
+            ChangeState::RolledBack
+        );
+        assert_eq!(
+            kernel.change(&second).unwrap().state,
+            ChangeState::Finalized
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_a_linear_revision_chain_and_rolls_back_to_original_baseline() {
+        let mut fixture = fixture(ApplyMode::Normal);
+        let mut kernel = fixture.kernel.take().unwrap();
+        let first = ChangeId::new("change/revision-1").unwrap();
+        let second = ChangeId::new("change/revision-2").unwrap();
+        kernel
+            .experiment(
+                first.clone(),
+                fixture.capability_id.clone(),
+                json!({"resource": "resource/a", "value": "new"}),
+            )
+            .unwrap();
+        kernel
+            .experiment(
+                second.clone(),
+                fixture.capability_id.clone(),
+                json!({"resource": "resource/a", "value": "other"}),
+            )
+            .unwrap();
+        let entries = fixture.wal_entries.lock().unwrap().clone();
+        drop(kernel);
+
+        let mut recovered = TransactionKernel::recover(
+            TransactionId::new("transaction/test").unwrap(),
+            intent_pin(),
+            fixture.capability_snapshot.clone(),
+            Box::new(MemoryWal {
+                entries: Arc::new(Mutex::new(entries.clone())),
+                sealed: false,
+                fail_at_sequence: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered.change(&second).unwrap().supersedes, Some(first));
+        recovered.rollback_all().unwrap();
+        assert_eq!(fixture.current("resource/a"), "old");
+
+        let mut tampered = entries;
+        let revision = tampered
+            .iter_mut()
+            .find_map(|entry| match &mut entry.event {
+                WalEvent::ChangeUpsert { change }
+                    if change.change_id == second && change.state == ChangeState::IntentDurable =>
+                {
+                    Some(change)
+                }
+                _ => None,
+            })
+            .expect("revision apply intent must exist");
+        revision.supersedes = None;
+        let error = TransactionKernel::recover(
+            TransactionId::new("transaction/test").unwrap(),
+            intent_pin(),
+            fixture.capability_snapshot,
+            Box::new(MemoryWal {
+                entries: Arc::new(Mutex::new(tampered)),
+                sealed: false,
+                fail_at_sequence: None,
+            }),
+        )
+        .err()
+        .expect("a duplicate resource without a revision link must be rejected");
+        assert_eq!(error.kind, TransactionErrorKind::CorruptWal);
+    }
+
+    #[test]
+    fn resource_revision_refuses_to_overwrite_external_drift() {
+        let mut fixture = fixture(ApplyMode::Normal);
+        let mut kernel = fixture.kernel.take().unwrap();
+        let first = ChangeId::new("change/drifted-revision").unwrap();
+        kernel
+            .experiment(
+                first.clone(),
+                fixture.capability_id.clone(),
+                json!({"resource": "resource/a", "value": "new"}),
+            )
+            .unwrap();
+        fixture
+            .current
+            .lock()
+            .unwrap()
+            .insert("resource/a".into(), "administrator-value".into());
+
         let error = kernel
             .experiment(
-                ChangeId::new("change/two").unwrap(),
+                ChangeId::new("change/must-not-apply").unwrap(),
                 fixture.capability_id.clone(),
                 json!({"resource": "resource/a", "value": "other"}),
             )
             .unwrap_err();
-        assert_eq!(error.kind, TransactionErrorKind::DuplicateResource);
-        assert_eq!(fixture.current("resource/a"), "new");
+
+        assert_eq!(error.kind, TransactionErrorKind::ExternalDrift);
+        assert_eq!(fixture.current("resource/a"), "administrator-value");
+        assert_eq!(
+            kernel.change(&first).unwrap().state,
+            ChangeState::DriftDetected
+        );
+        assert_eq!(kernel.changes().count(), 1);
     }
 
     #[test]

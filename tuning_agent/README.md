@@ -65,9 +65,9 @@ Objective 是面向人类和审计的目标陈述；Contract 中的 primary comp
 
 1. provider `prepare` 捕获 resource、baseline、desired state 和 provider pin，且不得产生副作用；
 2. WAL 先持久化 intent，再允许 `apply`；
-3. apply 后必须 readback verify，成功后生成 `change_id`；
-4. baseline restore 按修改顺序的逆序执行；
-5. candidate replay 只接受本 episode 中曾成功实验并验证过的 change；
+3. apply 后必须 readback verify，成功后生成 `change_id`；同一 resource 再次试值会恢复原始 baseline，并生成指向上一版的新 revision；
+4. baseline restore 按修改顺序的逆序执行，所有 revision 都回到首版捕获的 baseline；
+5. candidate replay 只接受本 episode 中每个 resource 最新且曾成功实验并验证过的 change；
 6. 外部 drift、丢失响应或 WAL 写入失败均 fail-closed；
 7. provider finalize 只是幂等、无系统副作用的 commit acknowledgement；中央 WAL seal 才是 commit point；
 8. `Started` WAL 在任何 mutation effect 前持久化完整 `EvaluationIntentPin`；

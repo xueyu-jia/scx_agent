@@ -82,7 +82,7 @@ impl ToolCatalog {
         catalog.add_builtin(
             "request_commit",
             CatalogKind::RequestCommit,
-            "Request deterministic evaluation of verified change IDs. Runtime alone may commit.",
+            "Request the episode's single deterministic evaluation using only the latest verified change ID for each selected resource. Runtime alone may commit.",
             json!({
                 "type": "object",
                 "additionalProperties": false,

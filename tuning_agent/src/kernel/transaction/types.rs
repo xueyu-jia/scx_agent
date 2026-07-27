@@ -34,6 +34,8 @@ pub enum OperationIntentKind {
 pub struct ChangeRecord {
     pub transaction_id: TransactionId,
     pub change_id: ChangeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<ChangeId>,
     pub capability_id: CapabilityId,
     pub resource: ResourceKey,
     pub prepared: PreparedMutation,

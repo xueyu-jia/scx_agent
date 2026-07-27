@@ -173,6 +173,8 @@ impl<'a> EpisodeCoordinator<'a> {
                 "probe_is_a_capability": true,
                 "evaluation_protocol": "fixed_ab",
                 "evaluation_timeout_ms": self.evaluation_timeout.as_millis(),
+                "max_reasoning_rounds": self.max_rounds,
+                "reserve_final_action_round": true,
                 "commit_authority": "runtime_only",
                 "commit_pending_blocks_agent_calls": true,
             }
@@ -613,6 +615,7 @@ impl<'a> EpisodeSession<'a> {
                 Ok(json!({
                     "change": {
                         "change_id": change.change_id,
+                        "supersedes": change.supersedes,
                         "capability_id": change.capability_id,
                         "resource": change.resource,
                         "state": change.state,
@@ -872,6 +875,15 @@ impl<'a> EpisodeSession<'a> {
             .collect::<BTreeSet<_>>();
         if let Some(unknown) = requested.difference(&known).next() {
             return Err(format!("candidate references unknown change '{unknown}'"));
+        }
+        let superseded = transaction
+            .changes()
+            .filter_map(|change| change.supersedes.as_ref())
+            .collect::<BTreeSet<_>>();
+        if let Some(change_id) = requested.intersection(&superseded).next() {
+            return Err(format!(
+                "candidate change '{change_id}' has been superseded"
+            ));
         }
         let canonical = transaction
             .changes()
@@ -1490,6 +1502,62 @@ mod tests {
             EvaluationVerdict::Improved
         );
         assert_eq!(*value.lock().unwrap(), "new");
+    }
+
+    #[test]
+    fn repeated_resource_trials_commit_only_the_latest_revision() {
+        let value = Arc::new(Mutex::new("old".to_string()));
+        let registry = episode_registry(value.clone(), FailureConfig::default());
+        let root = unique_test_root("resource-revision");
+        let store = TransactionStore::new(&root).unwrap();
+        let mut session = EpisodeSession::new(
+            EpisodeId::new(47),
+            Duration::from_secs(600),
+            registry.snapshot(),
+            &store,
+        );
+        session
+            .begin_experiment(intent_spec(
+                "increase synthetic throughput",
+                evaluation_contract(10.0),
+            ))
+            .unwrap();
+
+        let first = session
+            .mutate(
+                CapabilityId::new("test/mutation").unwrap(),
+                json!({"value": "intermediate"}),
+                "first trial".into(),
+            )
+            .unwrap();
+        let first_id = ChangeId::new(first["change"]["change_id"].as_str().unwrap()).unwrap();
+        assert!(first["change"]["supersedes"].is_null());
+
+        let second = session
+            .mutate(
+                CapabilityId::new("test/mutation").unwrap(),
+                json!({"value": "new"}),
+                "second trial".into(),
+            )
+            .unwrap();
+        let second_id = ChangeId::new(second["change"]["change_id"].as_str().unwrap()).unwrap();
+        assert_eq!(second["change"]["supersedes"], json!(first_id));
+
+        let error = session
+            .request_commit(vec![first_id], "stale trial".into())
+            .unwrap_err();
+        assert!(error.contains("superseded"));
+        assert_eq!(session.state.phase(), EpisodePhase::Experimenting);
+
+        let committed = session
+            .request_commit(vec![second_id], "latest trial".into())
+            .unwrap();
+        assert_eq!(committed["committed"], true);
+        assert_eq!(session.state.phase(), EpisodePhase::Committed);
+        assert_eq!(*value.lock().unwrap(), "new");
+        drop(session);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

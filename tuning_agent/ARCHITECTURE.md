@@ -214,7 +214,7 @@ Runtime then:
 
 The objective is audit semantics. The Contract remains the machine-executable definition of success because Runtime cannot prove that natural-language prose agrees with arbitrary provider specifications. A single objective may therefore contain multiple primary conditions and guardrails without becoming multiple episode targets.
 
-The current episode policy permits one transaction and one final A/B evaluation per episode. A complete rollback sets `Clean + Finished` while retaining the frozen Intent. Changing objective, workload, metrics, thresholds, Measurement, Comparison, or sampling requires a new `EpisodeId`. Future multi-trial support must add explicit `TrialId` and a total trial budget while sharing the same Intent.
+The current episode policy permits one transaction and one final A/B evaluation per episode. Before that evaluation, the Agent may make multiple verified exploratory revisions under the same frozen Intent, including repeated values for one resource. A complete rollback sets `Clean + Finished` while retaining the frozen Intent. Changing objective, workload, metrics, thresholds, Measurement, Comparison, or sampling requires a new `EpisodeId`. Future support for multiple final A/B trials must add explicit `TrialId` and a total trial budget while sharing the same Intent.
 
 The administrator also fixes a total monotonic evaluation budget with `[safety].evaluation_timeout_ms` (default `600000`). Contract freeze, and every later mutation admission, conservatively account for all deterministic A/B waits: both settle periods plus every guardrail/domain sampling interval on both sides. A schedule that already exceeds the budget is rejected before any mutation.
 
@@ -237,7 +237,7 @@ Agent Mutation command
 
 `experiment_verified` is a persistent monotonic fact. Restore or replay cannot create it, clear it, or infer it from current state. A candidate may contain only changes with this fact.
 
-One transaction owns each canonical `ResourceKey` at most once. This prevents ambiguous rollback ordering and conflicting candidate entries.
+Each canonical `ResourceKey` has one linear revision head. A later experiment may supersede that head only after readback proves the prior desired state and Runtime restores the resource to its original baseline. The replacement is prepared again from that baseline, receives a new `change_id`, and durably names its predecessor. Older revisions remain auditable but cannot enter a candidate. This preserves unambiguous rollback while allowing repeated value search.
 
 ### Lost responses and drift
 
@@ -247,7 +247,7 @@ Before overwrite, restore, replay, and commit, readback must match the recorded 
 
 ### Restore and candidate
 
-Baseline restore runs in reverse change order. Candidate IDs are canonicalized back to original transaction order; LLM ordering is not trusted. Candidate digest is computed by `Candidate::new` from the canonical IDs and validated on deserialization.
+Baseline restore runs in reverse change order and always targets the first revision's baseline. Candidate IDs are canonicalized back to original transaction order; LLM ordering is not trusted. A candidate may contain only the latest verified revision of each selected resource. Candidate digest is computed by `Candidate::new` from the canonical IDs and validated on deserialization.
 
 ### Commit protocol
 
