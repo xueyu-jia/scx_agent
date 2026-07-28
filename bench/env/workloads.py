@@ -17,6 +17,7 @@ from bench.core.config import load_config
 SRC = ROOT / "bench" / "workloads" / "src"
 BIN = ROOT / "bench" / "workloads" / "bin"
 BUILD = ROOT / "bench" / "workloads" / "build"
+STRESS_NG_VERSION = "V0.21.04"
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ WORKLOADS = {
     "stress-ng": Workload(
         name="stress-ng",
         repo="https://github.com/ColinIanKing/stress-ng.git",
-        ref="master",
+        ref=STRESS_NG_VERSION,
     ),
     "fio": Workload(
         name="fio",
@@ -230,7 +231,7 @@ def build(name: str, source: Path) -> None:
     builders = {
         "hackbench": build_hackbench,
         "schbench": build_make_binary,
-        "stress-ng": build_make_binary,
+        "stress-ng": build_stress_ng,
         "fio": build_fio,
         "redis": build_redis,
         "rt-tests": build_rt_tests,
@@ -266,6 +267,12 @@ def build_make_binary(source: Path) -> None:
     if not binary.exists():
         binary = find_executable(source, source.name)
     install(binary, BIN / source.name)
+
+
+def build_stress_ng(source: Path) -> None:
+    # stress-ng's feature detection is host-specific and survives source updates.
+    run(["make", "clean"], cwd=source)
+    build_make_binary(source)
 
 
 def build_fio(source: Path) -> None:

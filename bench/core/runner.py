@@ -1272,11 +1272,11 @@ def _libvirt_result(
 
 def _domain_name(label: str, spec: RunSpec, run_dir: Path) -> str:
     suffix = hashlib.sha1(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:8]
-    raw = (
+    prefix = _safe_name(
         f"scxbench-{label}-{spec.plan}-{spec.run_index}-"
-        f"{spec.machine_name}-{spec.suite_name}-{spec.bench_name}-{suffix}"
+        f"{spec.machine_name}-{spec.suite_name}-{spec.bench_name}"
     )
-    return _safe_name(raw)[:63]
+    return f"{prefix[: 63 - len(suffix) - 1]}-{suffix}"
 
 
 def _safe_name(value: str) -> str:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import json
 import os
 import signal
@@ -113,8 +114,8 @@ def _runtime_identity(args: argparse.Namespace, scope: RedisCpuScope) -> dict[st
     loadgen = process_identity(os.getpid())
     if any(item["affinity"] != [0, 1] for item in redis) or batch["affinity"] != [0, 1]:
         raise RedisCpuError("Redis and batch processes must be pinned to CPUs 0-1")
-    if loadgen["affinity"] != [2]:
-        raise RedisCpuError("loadgen must be pinned to CPU 2")
+    if loadgen["affinity"] != list(DRIVER_CPUS):
+        raise RedisCpuError(f"loadgen must be pinned to CPUs {list(DRIVER_CPUS)}")
     cgroups = {
         name: {"path": str(path), "inode": path.stat().st_ino}
         for name, path in (
@@ -127,7 +128,11 @@ def _runtime_identity(args: argparse.Namespace, scope: RedisCpuScope) -> dict[st
         "redis_config_digest": args.redis_config_digest,
         "loadgen_parameters_digest": args.loadgen_parameters_digest,
         "ports": list(REDIS_PORTS),
-        "affinities": {"redis": [0, 1], "batch": [0, 1], "driver": [2]},
+        "affinities": {
+            "redis": [0, 1],
+            "batch": [0, 1],
+            "driver": list(DRIVER_CPUS),
+        },
     }
     return {
         "version": 1,
@@ -166,10 +171,16 @@ def _run_round(
     started_at_ns = time.time_ns()
     monotonic_started_ns = time.monotonic_ns()
 
-    commands = [_benchmark_command(args, port) for port in REDIS_PORTS]
+    process_specs = _benchmark_process_specs(args)
     processes = [
-        subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        for command in commands
+        subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=partial(os.sched_setaffinity, 0, {cpu}),
+        )
+        for cpu, command in process_specs
     ]
     results = []
     for port, process in zip(REDIS_PORTS, processes, strict=True):
@@ -255,6 +266,17 @@ def _benchmark_command(args: argparse.Namespace, port: int) -> list[str]:
         "3",
         "GET",
         "redis_cpu_key",
+    ]
+
+
+def _benchmark_process_specs(
+    args: argparse.Namespace,
+) -> list[tuple[int, list[str]]]:
+    if len(DRIVER_CPUS) != len(REDIS_PORTS):
+        raise RedisCpuError("each Redis shard requires one dedicated driver CPU")
+    return [
+        (cpu, _benchmark_command(args, port))
+        for cpu, port in zip(DRIVER_CPUS, REDIS_PORTS, strict=True)
     ]
 
 

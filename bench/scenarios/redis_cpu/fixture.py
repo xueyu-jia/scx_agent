@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare the Redis CPU contention scenario")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    control = subparsers.add_parser("control", help="establish the 100:100 control state")
+    control = subparsers.add_parser("control", help="establish the configured control state")
     _add_common_arguments(control)
 
     train = subparsers.add_parser("train", help="run Redis, batch, and rolling loadgen")
@@ -73,7 +73,10 @@ def _control(args: argparse.Namespace) -> int:
             "disposition": "proceed",
             "reason": {
                 "code": "redis_cpu.control_ready",
-                "message": "Redis CPU control cgroups are at the verified 100:100 baseline",
+                "message": (
+                    "Redis CPU control cgroups are at the verified "
+                    f"{args.redis_weight}:{args.batch_weight} baseline"
+                ),
             },
             "details": {"fixture": "redis-cpu-v1", "scope": state},
         },
@@ -82,8 +85,8 @@ def _control(args: argparse.Namespace) -> int:
 
 
 def _train(args: argparse.Namespace) -> int:
-    if args.redis_weight != 100 or args.batch_weight != 100:
-        raise RedisCpuError("training must start from redis=100 and batch=100")
+    if args.batch_weight != 100:
+        raise RedisCpuError("training batch cpu.weight must remain 100")
     if args.requests < 1 or args.clients < 1 or args.timeout_seconds < 1:
         raise RedisCpuError("requests, clients, and timeout-seconds must be positive")
     for binary in (
@@ -96,7 +99,11 @@ def _train(args: argparse.Namespace) -> int:
             raise RedisCpuError(f"required scenario executable is missing: {binary}")
 
     scope = RedisCpuScope.from_root(args.root)
-    prepare_scope(scope, redis_weight=100, batch_weight=100)
+    prepare_scope(
+        scope,
+        redis_weight=args.redis_weight,
+        batch_weight=args.batch_weight,
+    )
     set_current_affinity(DRIVER_CPUS)
     output_dir = Path(os.environ.get("SCX_BENCH_OUT", ".")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +148,8 @@ def _train(args: argparse.Namespace) -> int:
             "command": ["GET", "redis_cpu_key"],
             "contention": args.contention,
             "batch_cpu_load": cpu_load,
+            "initial_redis_weight": args.redis_weight,
+            "initial_batch_weight": args.batch_weight,
             "redis_cpus": list(REDIS_CPUS),
             "driver_cpus": list(DRIVER_CPUS),
         }

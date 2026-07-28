@@ -96,6 +96,9 @@ class RedisCpuMcp:
         self.restore_failure = os.environ.get("SCX_REDIS_CPU_RESTORE_FAILURE", "never")
         if self.restore_failure not in {"never", "always"}:
             raise RedisCpuError("SCX_REDIS_CPU_RESTORE_FAILURE must be 'never' or 'always'")
+        self.allowed_weights = _allowed_weights(
+            os.environ.get("SCX_REDIS_CPU_ALLOWED_WEIGHTS")
+        )
         self.operations = OperationStore(operation_path)
         self.sessions: dict[str, dict[str, Any]] = {}
 
@@ -378,6 +381,10 @@ class RedisCpuMcp:
         if set(arguments) != {"value"}:
             raise McpToolError("mutation arguments require only value")
         desired = _bounded_int(arguments.get("value"), MIN_CPU_WEIGHT, MAX_CPU_WEIGHT, "value")
+        if self.allowed_weights is not None and desired not in self.allowed_weights:
+            raise McpToolError(
+                f"cpu.weight must be one of {list(self.allowed_weights)} in this scenario"
+            )
         runtime, fingerprint = self._runtime()
         baseline = read_weight(self.scope.redis)
         if baseline == desired:
@@ -608,7 +615,7 @@ class RedisCpuMcp:
                     "mutation",
                     "reversible_mutation",
                     ["clean", "experimenting"],
-                    _mutation_schema(),
+                    _mutation_schema(self.allowed_weights),
                     {
                         "prepare": "mutation.prepare",
                         "apply": "mutation.apply",
@@ -617,8 +624,7 @@ class RedisCpuMcp:
                         "restore": "mutation.restore",
                         "finalize": "mutation.finalize",
                     },
-                    "Set only the bound Redis cgroup cpu.weight to any Linux-valid integer from 1 through 10000. "
-                    "It may be called repeatedly in one episode to try another value; each verified call supersedes the prior value",
+                    _mutation_description(self.allowed_weights),
                     idempotent=True,
                 ),
             ],
@@ -750,15 +756,58 @@ def _measurement_schema() -> dict[str, Any]:
     }
 
 
-def _mutation_schema() -> dict[str, Any]:
+def _mutation_schema(allowed_weights: tuple[int, ...] | None) -> dict[str, Any]:
+    value_schema: dict[str, Any]
+    if allowed_weights is None:
+        value_schema = {
+            "type": "integer",
+            "minimum": MIN_CPU_WEIGHT,
+            "maximum": MAX_CPU_WEIGHT,
+        }
+    else:
+        value_schema = {"type": "integer", "enum": list(allowed_weights)}
     return {
         "type": "object",
         "additionalProperties": False,
         "required": ["value"],
-        "properties": {
-            "value": {"type": "integer", "minimum": MIN_CPU_WEIGHT, "maximum": MAX_CPU_WEIGHT}
-        },
+        "properties": {"value": value_schema},
     }
+
+
+def _mutation_description(allowed_weights: tuple[int, ...] | None) -> str:
+    if allowed_weights is None:
+        target = "any Linux-valid integer from 1 through 10000"
+    else:
+        target = "one calibrated value from " + ", ".join(map(str, allowed_weights))
+    return (
+        f"Set only the bound Redis cgroup cpu.weight to {target}. It may be called "
+        "repeatedly in one episode to try another value; each verified call "
+        "supersedes the prior value"
+    )
+
+
+def _allowed_weights(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RedisCpuError("SCX_REDIS_CPU_ALLOWED_WEIGHTS must be a JSON array") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise RedisCpuError("SCX_REDIS_CPU_ALLOWED_WEIGHTS must be a non-empty JSON array")
+    weights = []
+    for item in parsed:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise RedisCpuError("SCX_REDIS_CPU_ALLOWED_WEIGHTS entries must be integers")
+        if not MIN_CPU_WEIGHT <= item <= MAX_CPU_WEIGHT:
+            raise RedisCpuError(
+                f"SCX_REDIS_CPU_ALLOWED_WEIGHTS entries must be between "
+                f"{MIN_CPU_WEIGHT} and {MAX_CPU_WEIGHT}"
+            )
+        weights.append(item)
+    if len(set(weights)) != len(weights):
+        raise RedisCpuError("SCX_REDIS_CPU_ALLOWED_WEIGHTS must not contain duplicates")
+    return tuple(weights)
 
 
 def _measurement_spec(value: Any) -> dict[str, int]:

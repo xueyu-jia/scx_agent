@@ -7,13 +7,12 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 
 SUPPORT_DIR = Path("/tmp/scx-bench-scheduler.d")
+LLM_PREFLIGHT_PATH = SUPPORT_DIR / "llm_preflight.py"
 DEFAULT_STATE_DIR = Path("/tmp/scx-real-llm")
 DEFAULT_TARGET_COMM = "redis-server"
 POST_ATTACH_COMMS = {"ctrl-c", "dmesg", "sched_ext_helpe"}
@@ -46,15 +45,10 @@ def main(argv: list[str] | None = None) -> int:
 
     target_comm = os.environ.get("SCX_REAL_LLM_TARGET_COMM", DEFAULT_TARGET_COMM)
     activation_comms = _activation_comms(target_comm)
-    base_url = _normalize_base_url(
-        os.environ.get("SCX_REAL_LLM_BASE_URL", "http://192.168.122.1:17001")
-    )
-    model = os.environ.get("SCX_REAL_LLM_MODEL", "deepseek-v4-flash")
-    api_key = os.environ.get("SCX_REAL_LLM_API_KEY", "local-test")
+    base_url = _normalize_base_url(_required_env("SCX_TUNING_AGENT_LLM_BASE_URL"))
+    model = _required_env("SCX_TUNING_AGENT_LLM_MODEL")
+    api_key = _required_env("SCX_TUNING_AGENT_LLM_API_KEY")
     diagnostic_counters = _bool_env("SCX_REAL_LLM_DIAGNOSTIC_COUNTERS", True)
-    if not model or not api_key:
-        raise RuntimeError("the real LLM model and API key must be non-empty")
-
     tuning_agent = _binary("SCX_REAL_LLM_TUNING_AGENT_BIN", "tuning-agent")
     mcp_server = _binary("SCX_REAL_LLM_MCP_BIN", "scx_agent_classed_mcp")
     scheduler = _binary("SCX_REAL_LLM_SCHEDULER_BIN", "scx_agent_classed")
@@ -72,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         "daemon_stderr": evidence_dir / "tuning-agent.stderr.log",
     }
 
-    readiness = _wait_for_llm(base_url, api_key, model, timeout=30.0)
+    readiness = _preflight_llm_transport()
     _write_json(evidence_dir / "llm-readiness.json", readiness)
     config = _render_config(base_url, api_key, model, mcp_server, paths)
     paths["config"].write_text(config, encoding="utf-8")
@@ -145,12 +139,15 @@ def _binary(env_name: str, default_name: str) -> Path:
 def _normalize_base_url(value: str) -> str:
     normalized = value.strip().rstrip("/")
     if not normalized.startswith(("http://", "https://")):
-        raise RuntimeError("SCX_REAL_LLM_BASE_URL must be an HTTP(S) URL")
-    if normalized.endswith("/v1"):
-        raise RuntimeError(
-            "SCX_REAL_LLM_BASE_URL must not end in /v1; tuning-agent appends it"
-        )
+        raise RuntimeError("SCX_TUNING_AGENT_LLM_BASE_URL must be an HTTP(S) URL")
     return normalized
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} must be a non-empty string")
+    return value
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -216,39 +213,24 @@ def _reset_state_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
-def _wait_for_llm(
-    base_url: str,
-    api_key: str,
-    model: str,
-    timeout: float,
-) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout
-    last_error = "not attempted"
-    while time.monotonic() < deadline:
-        request = urllib.request.Request(
-            f"{base_url}/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=3.0) as response:
-                payload = json.load(response)
-            models = {
-                item.get("id")
-                for item in payload.get("data", [])
-                if isinstance(item, dict) and isinstance(item.get("id"), str)
-            }
-            if model not in models:
-                raise RuntimeError(f"model {model!r} is absent from /v1/models")
-            return {
-                "reachable": True,
-                "model": model,
-                "model_count": len(models),
-                "checked_url": f"{base_url}/v1/models",
-            }
-        except (OSError, ValueError, RuntimeError, urllib.error.URLError) as error:
-            last_error = str(error)
-            time.sleep(0.25)
-    raise RuntimeError(f"real LLM readiness failed: {last_error}")
+def _preflight_llm_transport() -> dict[str, Any]:
+    configured = os.environ.get("SCX_TUNING_AGENT_LLM_PREFLIGHT")
+    preflight = Path(configured) if configured else LLM_PREFLIGHT_PATH
+    if not preflight.is_file():
+        raise RuntimeError(f"LLM preflight helper is missing: {preflight}")
+    completed = subprocess.run(
+        [sys.executable, str(preflight), "--transport-only", "--timeout", "10"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or "configured LLM endpoint transport preflight failed")
+    try:
+        return json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("LLM transport preflight returned invalid JSON") from error
 
 
 def _render_config(

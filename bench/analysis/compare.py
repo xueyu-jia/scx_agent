@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 import math
 import statistics
 from dataclasses import dataclass
@@ -43,6 +44,10 @@ def build_analysis(
         "baseline_label": baseline_label,
         "candidate_label": candidate_label,
         "summary": _summary(comparisons, baseline_runs, candidate_runs),
+        "run_outcomes": {
+            "baseline": _run_outcome_summary(baseline_runs),
+            "candidate": _run_outcome_summary(candidate_runs),
+        },
         "comparisons": comparisons,
         "invalid_runs": _invalid_runs(baseline_runs, candidate_runs),
     }
@@ -275,6 +280,18 @@ def _verdict(
         return "informational"
 
     threshold = abs(_parse_percent(metric_spec.regression) or 0.0)
+    if threshold == 0.0:
+        if metric_spec.direction == "higher":
+            if delta_pct < 0.0:
+                return "regression"
+            if delta_pct > 0.0:
+                return "improvement"
+        else:
+            if delta_pct > 0.0:
+                return "regression"
+            if delta_pct < 0.0:
+                return "improvement"
+        return "no_change"
     if metric_spec.direction == "higher":
         if delta_pct <= -threshold:
             return "regression"
@@ -318,6 +335,27 @@ def _summary(
         "primary_missing": _count(primary, "missing"),
         "invalid_runs": len(_invalid_runs(baseline_runs, candidate_runs)),
     }
+
+
+def _run_outcome_summary(runs: list[RunMetricSet]) -> dict[str, Any]:
+    return {
+        "total": len(runs),
+        "status_counts": _value_counts(run.status for run in runs),
+        "treatment_disposition_counts": _value_counts(
+            run.treatment_disposition for run in runs
+        ),
+        "treatment_reason_counts": _value_counts(
+            run.treatment_reason_code for run in runs
+        ),
+    }
+
+
+def _value_counts(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = value or "missing"
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _invalid_runs(

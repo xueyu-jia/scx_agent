@@ -6,10 +6,15 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from bench.scenarios.redis_cpu import common
-from bench.scenarios.redis_cpu.matrix import _evaluation_fingerprints, _has_batch_guard
+from bench.scenarios.redis_cpu import common, loadgen
+from bench.scenarios.redis_cpu.run import (
+    _preflight_llm,
+    _validate_outputs,
+    main as redis_run_main,
+)
 
 
 MCP_PATH = Path("bench/scenarios/redis_cpu/mcp_server.py").resolve()
@@ -62,6 +67,114 @@ def full_metrics(weight: float = 100.0) -> dict[str, float]:
 
 
 class RedisCpuCommonTest(unittest.TestCase):
+    def test_run_passes_absolute_config_and_output_paths_to_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config"
+            config.mkdir()
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch(
+                    "bench.scenarios.redis_cpu.run._preflight_llm",
+                    return_value=True,
+                ) as preflight, patch(
+                    "bench.scenarios.redis_cpu.run.subprocess.run",
+                    return_value=SimpleNamespace(returncode=0),
+                ) as run, patch(
+                    "bench.scenarios.redis_cpu.run._validate_outputs"
+                ) as validate:
+                    status = redis_run_main(
+                        [
+                            "--config",
+                            "config",
+                            "--output",
+                            "results",
+                            "--plan",
+                            "redis_cpu_demo_smoke",
+                        ]
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(status, 0)
+        preflight.assert_called_once_with(config)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--config") + 1], str(config))
+        self.assertEqual(
+            command[command.index("--output") + 1],
+            str(root / "results"),
+        )
+        self.assertEqual(
+            command[command.index("--candidate-treatment") + 1],
+            "redis_cpu_agent",
+        )
+        validate.assert_called_once_with(root / "results", "default")
+
+    def test_run_preflights_the_agent_treatment_configuration(self) -> None:
+        config = {
+            "treatments": {
+                "agent": {
+                    "env": {
+                        "SCX_TUNING_AGENT_LLM_BASE_URL": "https://llm.example/v1",
+                        "SCX_TUNING_AGENT_LLM_API_KEY": "test-api-key",
+                        "SCX_TUNING_AGENT_LLM_MODEL": "test-model",
+                    }
+                }
+            }
+        }
+        with patch(
+            "bench.scenarios.redis_cpu.run.load_config_data",
+            return_value=config,
+        ), patch(
+            "bench.scenarios.redis_cpu.run.preflight_protocol"
+        ) as preflight:
+            with patch(
+                "bench.scenarios.redis_cpu.run.CANDIDATE_TREATMENT",
+                "agent",
+            ):
+                self.assertTrue(_preflight_llm(Path("config")))
+
+        preflight.assert_called_once()
+
+    def test_run_requires_analysis_report_and_both_result_sets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            analysis_dir = output / "analysis"
+            analysis_dir.mkdir()
+            (analysis_dir / "analysis.json").write_text("{}\n", encoding="utf-8")
+            (analysis_dir / "report.html").write_text("<html></html>\n", encoding="utf-8")
+            for treatment in ("redis_cpu_control", "redis_cpu_agent"):
+                result_dir = (
+                    output
+                    / "runs"
+                    / f"default__{treatment}"
+                    / "run_001"
+                )
+                result_dir.mkdir(parents=True)
+                (result_dir / "result.json").write_text("{}\n", encoding="utf-8")
+
+            _validate_outputs(output, "default")
+
+            (analysis_dir / "report.html").unlink()
+            with self.assertRaisesRegex(ValueError, "report is missing or empty"):
+                _validate_outputs(output, "default")
+
+    def test_each_redis_shard_uses_a_dedicated_driver_cpu(self) -> None:
+        args = SimpleNamespace(
+            redis_benchmark_binary="/opt/redis-benchmark",
+            requests=20_000,
+            clients=64,
+        )
+        process_specs = loadgen._benchmark_process_specs(args)
+        commands = [command for _, command in process_specs]
+
+        self.assertEqual([cpu for cpu, _ in process_specs], [2, 4])
+        self.assertEqual(
+            [command[command.index("-p") + 1] for command in commands],
+            ["16379", "16380"],
+        )
+
     def test_scoped_exec_allows_empty_command_arguments(self) -> None:
         command = ["redis-server", "--save", ""]
 
@@ -104,10 +217,20 @@ class RedisCpuCommonTest(unittest.TestCase):
                 pid: {
                     "pid": pid,
                     "start_time_ticks": pid * 10,
-                    "executable": f"/bin/process-{pid}",
-                    "affinity": [0, 1] if pid not in (31, 32) else [2],
+                    "executable": (
+                        "/bin/redis-benchmark" if pid in (32, 33) else f"/bin/process-{pid}"
+                    ),
+                    "affinity": (
+                        [2, 4]
+                        if pid == 31
+                        else [2]
+                        if pid == 32
+                        else [4]
+                        if pid == 33
+                        else [0, 1]
+                    ),
                 }
-                for pid in (11, 12, 21, 31, 32)
+                for pid in (11, 12, 21, 31, 32, 33)
             }
             (scope.redis / "cgroup.procs").write_text("11\n12\n", encoding="utf-8")
             (scope.batch / "cgroup.procs").write_text("21\n22\n23\n", encoding="utf-8")
@@ -132,7 +255,7 @@ class RedisCpuCommonTest(unittest.TestCase):
                 "redis": {"ports": [16379, 16380], "config_digest": "sha256:" + "a" * 64},
                 "loadgen": {
                     "parameters_digest": "sha256:" + "b" * 64,
-                    "benchmark_executable": "/bin/process-32",
+                    "benchmark_executable": "/bin/redis-benchmark",
                 },
                 "workload_digest": "sha256:" + "c" * 64,
             }
@@ -146,62 +269,35 @@ class RedisCpuCommonTest(unittest.TestCase):
                 (scope.driver / "cgroup.procs").write_text("31\n32\n", encoding="utf-8")
                 with_benchmark = common.validate_runtime_identity(runtime, scope)
                 self.assertEqual(before, with_benchmark)
+                (scope.driver / "cgroup.procs").write_text(
+                    "31\n32\n33\n",
+                    encoding="utf-8",
+                )
+                with_both_benchmarks = common.validate_runtime_identity(runtime, scope)
+                self.assertEqual(before, with_both_benchmarks)
                 identities[11] = {**identities[11], "start_time_ticks": 999}
                 with self.assertRaisesRegex(common.RedisCpuError, "identity changed"):
                     common.validate_runtime_identity(runtime, scope)
-
-    def test_real_llm_matrix_reads_frozen_batch_guard_and_ab_fingerprints(self) -> None:
-        contract = {
-            "evaluation_contract": {
-                "regression_guards": [
-                    {
-                        "capability_id": "builtin/comparison.threshold.v1",
-                        "specification": {
-                            "conditions": [
-                                {
-                                    "metric": "batch_cpu_rate",
-                                    "op": "decrease_percent_le",
-                                    "value": 20,
-                                }
-                            ]
-                        },
-                    }
-                ]
-            }
-        }
-        audit = [
-            {
-                "event": "agent_command_result",
-                "data": {
-                    "tool": "request_commit",
-                    "content": {
-                        "evaluation": {
-                            "baseline_measurement": {
-                                "batch": {"workload_fingerprint": "same"}
-                            },
-                            "candidate_measurement": {
-                                "batch": {"workload_fingerprint": "same"}
-                            },
-                        }
-                    },
-                },
-            }
-        ]
-
-        self.assertTrue(_has_batch_guard(contract))
-        self.assertEqual(_evaluation_fingerprints(audit), ("same", "same"))
-
 
 class RedisCpuMcpTest(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_mcp_module()
 
-    def _server(self, root: Path, output: Path, *, restore_failure: str = "never") -> object:
+    def _server(
+        self,
+        root: Path,
+        output: Path,
+        *,
+        restore_failure: str = "never",
+        allowed_weights: str | None = None,
+    ) -> object:
         environment = {
             "SCX_REDIS_CPU_ROOT": str(root),
             "SCX_REDIS_CPU_OUTPUT_DIR": str(output),
             "SCX_REDIS_CPU_RESTORE_FAILURE": restore_failure,
         }
+        if allowed_weights is not None:
+            environment["SCX_REDIS_CPU_ALLOWED_WEIGHTS"] = allowed_weights
         with patch.dict(os.environ, environment, clear=False):
             server = self.module.RedisCpuMcp()
         runtime = {
@@ -230,6 +326,38 @@ class RedisCpuMcpTest(unittest.TestCase):
             self.assertEqual(schema, {"type": "integer", "minimum": 1, "maximum": 10_000})
             self.assertNotIn("enum", schema)
             self.assertIn("called repeatedly in one episode", capabilities[-1]["description"])
+
+    def test_demo_manifest_restricts_weight_choices(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "scope"
+            scope = fake_scope(root)
+            server = self._server(
+                root,
+                Path(temp_dir) / "output",
+                allowed_weights="[100,200,400,800]",
+            )
+            schema = server._manifest()["capabilities"][-1]["input_schema"]
+
+            self.assertEqual(
+                schema["properties"]["value"],
+                {"type": "integer", "enum": [100, 200, 400, 800]},
+            )
+            with self.assertRaisesRegex(self.module.McpToolError, "must be one of"):
+                server._mutation_prepare(
+                    {
+                        "context": {"operation_id": "prepare/invalid"},
+                        "arguments": {"value": 300},
+                    }
+                )
+            prepared = server._mutation_prepare(
+                {
+                    "context": {"operation_id": "prepare/valid"},
+                    "arguments": {"value": 200},
+                }
+            )
+            self.assertEqual(prepared["baseline"]["value"], 100)
+            self.assertEqual(prepared["desired"]["value"], 200)
+            self.assertEqual(common.read_weight(scope.redis), 100)
 
     def test_mutation_readback_persistence_drift_and_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

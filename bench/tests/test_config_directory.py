@@ -18,11 +18,41 @@ from bench.env.manager import _build_local_config, _write_config
 class ConfigDirectoryLoadingTest(unittest.TestCase):
     def test_tracked_config_directories_are_valid(self) -> None:
         example = load_config_data("bench/configs/example_config")
+        demo = load_config_data("bench/configs/redis_cpu_demo")
         redis = load_config_data("bench/configs/redis_cpu_tuning")
 
         self.assertIn("scx_agent_classed_llm_latency", example["schedulers"])
         self.assertIn("llm_latency_classify", example["treatments"])
-        self.assertIn("redis_cpu_agent_positive", redis["treatments"])
+        self.assertIn("redis_cpu_demo_smoke", demo["plans"])
+        self.assertIn("redis_cpu_agent", redis["treatments"])
+
+    def test_all_config_templates_target_openeuler_6_6(self) -> None:
+        template_dirs = sorted(
+            path.parent
+            for path in Path("bench/configs").glob("*/environment.config")
+            if not path.parent.name.startswith("local_")
+        )
+        self.assertTrue(template_dirs)
+
+        for template_dir in template_dirs:
+            with self.subTest(template=template_dir.name):
+                environment_text = (template_dir / "environment.config").read_text(
+                    encoding="utf-8"
+                )
+                config = load_config_data(template_dir)
+
+                self.assertIn(
+                    "Target: openEuler 24.03 LTS SP4 / 6.6",
+                    environment_text,
+                )
+                self.assertNotIn("6.18", environment_text)
+                self.assertIn("psi=1", config["libvirt"]["kernel_args"].split())
+
+                for scheduler in config.get("schedulers", {}).values():
+                    host_kconfig = scheduler.get("host_kconfig")
+                    if host_kconfig is not None:
+                        self.assertIn("oe2403sp4", host_kconfig)
+                        self.assertNotIn("6.18", host_kconfig)
 
     def test_example_config_contains_only_the_active_performance_matrix(self) -> None:
         config = load_config_data("bench/configs/example_config")
@@ -103,8 +133,20 @@ class ConfigDirectoryLoadingTest(unittest.TestCase):
         self.assertEqual(len(llm_schedulers), 3)
         for scheduler in llm_schedulers.values():
             self.assertEqual(
-                scheduler["env"]["SCX_REAL_LLM_MODEL"],
+                scheduler["env"]["SCX_TUNING_AGENT_LLM_MODEL"],
                 "deepseek-v4-flash",
+            )
+            self.assertEqual(
+                scheduler["env"]["SCX_TUNING_AGENT_LLM_BASE_URL"],
+                "https://api.deepseek.com/v1",
+            )
+            self.assertEqual(
+                scheduler["env"]["SCX_TUNING_AGENT_LLM_API_KEY"],
+                "replace-in-local-profile",
+            )
+            self.assertIn(
+                "bench/integrations/tuning_agent/llm_preflight.py",
+                scheduler["host_support_files"],
             )
             self.assertNotIn(
                 "perf",

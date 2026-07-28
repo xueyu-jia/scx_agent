@@ -206,7 +206,7 @@ class TreatmentConfigTest(unittest.TestCase):
                 }
             )
 
-    def test_redis_cpu_matrix_is_internally_consistent(self) -> None:
+    def test_redis_cpu_scenario_is_internally_consistent(self) -> None:
         config = load_config_data(Path("bench/configs/redis_cpu_tuning"))
 
         _validate_treatments(config)
@@ -217,14 +217,70 @@ class TreatmentConfigTest(unittest.TestCase):
 
         self.assertEqual(config["plans"]["redis_cpu_smoke"]["runs"], 1)
         self.assertEqual(config["plans"]["redis_cpu"]["runs"], 10)
+        self.assertEqual(config["machines"]["small"]["vcpus"], 6)
         self.assertEqual(
-            config["treatments"]["redis_cpu_agent_no_signal"]["args"],
-            ["--no-commit-disposition", "proceed"],
+            config["treatments"]["redis_cpu_agent"]["env"][
+                "SCX_TUNING_AGENT_EVENT_TYPE"
+            ],
+            "redis_cpu_improve_p99_latency_while_preserving_batch_progress",
         )
-        support = config["treatments"]["redis_cpu_agent_positive"][
-            "host_support_files"
-        ]
+        p99_metric = next(
+            metric
+            for metric in config["metric_profiles"]["redis_cpu"]["primary"]
+            if metric["name"] == "redis_p99_latency_us"
+        )
+        self.assertNotIn("regression", p99_metric)
+        self.assertEqual(
+            set(config["treatments"]),
+            {"redis_cpu_control", "redis_cpu_agent"},
+        )
+        support = config["treatments"]["redis_cpu_agent"]["host_support_files"]
         self.assertNotIn("bench/scenarios/redis_cpu/mock_llm.py", support)
+        self.assertIn("bench/integrations/tuning_agent/llm_preflight.py", support)
+        llm_environment = config["treatments"]["redis_cpu_agent"]["env"]
+        self.assertEqual(
+            llm_environment["SCX_TUNING_AGENT_LLM_BASE_URL"],
+            "https://api.deepseek.com/v1",
+        )
+        self.assertEqual(
+            llm_environment["SCX_TUNING_AGENT_LLM_API_KEY"],
+            "replace-in-local-profile",
+        )
+
+    def test_redis_cpu_demo_has_a_bounded_recoverable_fault(self) -> None:
+        config = load_config_data(Path("bench/configs/redis_cpu_demo"))
+
+        _validate_treatments(config)
+        _validate_benches({"benches": config["benches"]})
+        _validate_metric_profiles(config)
+        _validate_suites(config)
+        _validate_plans(config)
+
+        self.assertEqual(config["plans"]["redis_cpu_demo_smoke"]["runs"], 1)
+        self.assertEqual(config["plans"]["redis_cpu_demo"]["runs"], 5)
+        self.assertEqual(
+            config["treatments"]["redis_cpu_control"]["args"][-3:],
+            ["50", "--batch-weight", "100"],
+        )
+        self.assertEqual(
+            set(config["treatments"]),
+            {"redis_cpu_control", "redis_cpu_agent"},
+        )
+        environment = config["treatments"]["redis_cpu_agent"]["env"]
+        self.assertEqual(
+            environment["SCX_TUNING_AGENT_LLM_BASE_URL"],
+            "https://api.deepseek.com/v1",
+        )
+        self.assertEqual(
+            environment["SCX_TUNING_AGENT_LLM_API_KEY"],
+            "replace-in-local-profile",
+        )
+        self.assertIn("--redis-weight\",\"50", environment["SCX_TUNING_AGENT_TRAINING_ARGV"])
+        self.assertIn(
+            '"SCX_REDIS_CPU_ALLOWED_WEIGHTS":"[100,200,400,800]"',
+            environment["SCX_TUNING_AGENT_MCP_ENV"],
+        )
+        self.assertIn("at_least_5_percent", environment["SCX_TUNING_AGENT_EVENT_TYPE"])
 
 
 class BenchTimingTest(unittest.TestCase):

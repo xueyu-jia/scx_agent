@@ -42,7 +42,7 @@ impl OpenAiConfig {
     }
 
     fn url(&self) -> String {
-        format!("{}/v1/chat/completions", self.base_url)
+        format!("{}/chat/completions", self.base_url)
     }
 }
 
@@ -130,6 +130,20 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn complete_url_uses_the_configured_api_base() {
+        let config = LlmConfig {
+            base_url: "https://llm.example/api/v1/".to_string(),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 1000,
+            retry_count: 0,
+        };
+        let config = OpenAiConfig::from_config(&config).unwrap();
+
+        assert_eq!(config.url(), "https://llm.example/api/v1/chat/completions");
+    }
 
     #[test]
     fn retry_count_means_retries_after_the_initial_attempt() {

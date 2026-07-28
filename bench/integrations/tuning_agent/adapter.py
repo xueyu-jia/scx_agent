@@ -19,6 +19,7 @@ OUTCOME_VERSION = 2
 COMMITTED = "committed"
 NO_COMMIT = "no_commit"
 RECOVERY_REQUIRED = "recovery_required"
+LLM_PREFLIGHT_PATH = Path("/tmp/scx-bench-treatment.d/llm_preflight.py")
 
 
 class AdapterError(RuntimeError):
@@ -57,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
         details["cgroup_lifecycle"] = "vm" if cgroup.preserve else "treatment"
         config_path = _ensure_config(output_dir, cgroup.path)
         details["config_path"] = str(config_path)
+        llm_readiness = _preflight_llm_transport(output_dir)
+        if llm_readiness is not None:
+            details["llm_readiness"] = llm_readiness
         _start_support_processes(processes, output_dir)
         _start_daemon(processes, output_dir)
         training_ready = _start_training_workload(processes, cgroup.path, output_dir)
@@ -168,7 +172,10 @@ def _ensure_config(output_dir: Path, cgroup_path: Path) -> Path:
         "/tmp/scx-bench-treatment.d/deterministic_mcp.py",
     )
     mcp_server_id = os.environ.get("SCX_TUNING_AGENT_MCP_SERVER_ID", "deterministic-test")
-    base_url = os.environ.get("SCX_TUNING_AGENT_LLM_BASE_URL", "http://127.0.0.1:18080")
+    base_url = os.environ.get(
+        "SCX_TUNING_AGENT_LLM_BASE_URL",
+        "http://127.0.0.1:18080/v1",
+    )
     api_key = os.environ.get("SCX_TUNING_AGENT_LLM_API_KEY", "test")
     model = os.environ.get("SCX_TUNING_AGENT_LLM_MODEL", "mock")
     llm_timeout_ms = _positive_int_env("SCX_TUNING_AGENT_LLM_TIMEOUT_MS", 30_000)
@@ -285,6 +292,30 @@ def _mcp_environment(output_dir: Path, cgroup_path: Path) -> dict[str, str]:
         key: _replace_placeholders(value, replacements)
         for key, value in configured.items()
     }
+
+
+def _preflight_llm_transport(output_dir: Path) -> dict[str, Any] | None:
+    if "SCX_TUNING_AGENT_LLM_BASE_URL" not in os.environ:
+        return None
+    configured = os.environ.get("SCX_TUNING_AGENT_LLM_PREFLIGHT")
+    preflight = Path(configured) if configured else LLM_PREFLIGHT_PATH
+    if not preflight.is_file():
+        raise AdapterError(f"LLM preflight helper is missing: {preflight}")
+    completed = subprocess.run(
+        [sys.executable, str(preflight), "--transport-only", "--timeout", "10"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise AdapterError(detail or "configured LLM endpoint transport preflight failed")
+    try:
+        readiness = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AdapterError("LLM transport preflight returned invalid JSON") from error
+    _write_json(output_dir / "llm-readiness.json", readiness)
+    return readiness
 
 
 def _replace_placeholders(value: str, replacements: dict[str, str]) -> str:

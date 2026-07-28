@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import csv
 from dataclasses import replace
+import json
 import math
 import tempfile
 import unittest
 from pathlib import Path
 
 from bench.analysis.compare import build_analysis
-from bench.analysis.loader import RunMetricSet
+from bench.analysis.loader import RunMetricSet, load_result_dir
 from bench.analysis.paired import (
     PairedAnalysisError,
     compare_paired_runs,
     describe,
     write_paired_csv,
 )
+from bench.analysis.report import render_html
 
 
 PROFILE = {
@@ -137,6 +139,102 @@ class PairedStatisticsTest(unittest.TestCase):
 
 
 class UnifiedAnalysisTest(unittest.TestCase):
+    def test_loader_extracts_treatment_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run_001"
+            run_dir.mkdir()
+            (run_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "PASS",
+                        "spec": {
+                            "run_index": 1,
+                            "plan": "plan",
+                            "machine": "small_core",
+                            "suite": "batch_suite",
+                            "bench": "batch_bench",
+                            "metric_profile": "batch_profile",
+                        },
+                        "guest_result": {
+                            "phases": {
+                                "treatment": {
+                                    "status": "PROCEEDED",
+                                    "outcome": {
+                                        "disposition": "proceed",
+                                        "reason": {"code": "tuning_agent.committed"},
+                                    },
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "bench_metrics.json").write_text(
+                '{"metrics":{"throughput":100}}\n',
+                encoding="utf-8",
+            )
+
+            loaded = load_result_dir(root, "candidate")
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].treatment_phase_status, "PROCEEDED")
+        self.assertEqual(loaded[0].treatment_disposition, "proceed")
+        self.assertEqual(loaded[0].treatment_reason_code, "tuning_agent.committed")
+
+    def test_analysis_and_report_include_treatment_outcome_counts(self) -> None:
+        baseline = replace(
+            run("default", 1, throughput=100),
+            treatment_disposition="proceed",
+            treatment_reason_code="redis_cpu.control",
+        )
+        candidate = replace(
+            run("candidate", 1, throughput=110),
+            treatment_disposition="proceed",
+            treatment_reason_code="tuning_agent.committed",
+        )
+
+        analysis = build_analysis([baseline], [candidate], "default", "candidate")
+        rendered = render_html(analysis)
+
+        self.assertEqual(
+            analysis["run_outcomes"]["candidate"],
+            {
+                "total": 1,
+                "status_counts": {"PASS": 1},
+                "treatment_disposition_counts": {"proceed": 1},
+                "treatment_reason_counts": {"tuning_agent.committed": 1},
+            },
+        )
+        self.assertIn("Run Outcomes", rendered)
+        self.assertIn("tuning_agent.committed", rendered)
+
+    def test_metric_without_threshold_reports_any_directional_change(self) -> None:
+        profile = {
+            "primary": [
+                {
+                    "name": "latency",
+                    "direction": "lower",
+                    "unit": "us",
+                }
+            ]
+        }
+        baseline = replace(
+            run("default", 1, latency=100),
+            metric_profile_config=profile,
+        )
+
+        cases = ((99, "improvement"), (100, "no_change"), (101, "regression"))
+        for candidate_value, expected in cases:
+            with self.subTest(candidate_value=candidate_value):
+                candidate = replace(
+                    run("candidate", 1, latency=candidate_value),
+                    metric_profile_config=profile,
+                )
+                analysis = build_analysis([baseline], [candidate])
+                self.assertEqual(analysis["comparisons"][0]["verdict"], expected)
+
     def test_build_analysis_contains_aggregate_and_paired_results(self) -> None:
         analysis = build_analysis(
             [run("default", 1, throughput=100), run("default", 2, throughput=200)],

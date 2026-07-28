@@ -13,7 +13,7 @@ from typing import Any
 
 DEFAULT_SCOPE_ROOT = Path("/sys/fs/cgroup/scx-bench")
 REDIS_CPUS = (0, 1)
-DRIVER_CPUS = (2,)
+DRIVER_CPUS = (2, 4)
 REDIS_PORTS = (16_379, 16_380)
 MIN_CPU_WEIGHT = 1
 MAX_CPU_WEIGHT = 10_000
@@ -290,6 +290,9 @@ def validate_runtime_identity(runtime: dict[str, Any], scope: RedisCpuScope) -> 
         raise RedisCpuError("runtime benchmark executable is invalid")
     loadgen_parent = processes["loadgen"]["pid"]
     benchmark_processes = set(read_members(scope.driver)) - {loadgen_parent}
+    if len(benchmark_processes) > len(DRIVER_CPUS):
+        raise RedisCpuError("driver cgroup contains too many benchmark processes")
+    benchmark_affinities: set[tuple[int, ...]] = set()
     for pid in benchmark_processes:
         try:
             identity = process_identity(pid)
@@ -300,9 +303,16 @@ def validate_runtime_identity(runtime: dict[str, Any], scope: RedisCpuScope) -> 
         if (
             not _is_descendant(pid, loadgen_parent)
             or identity["executable"] != benchmark
-            or identity["affinity"] != list(DRIVER_CPUS)
+            or len(identity["affinity"]) != 1
+            or identity["affinity"][0] not in DRIVER_CPUS
         ):
             raise RedisCpuError("driver cgroup contains an unexpected process")
+        benchmark_affinities.add(tuple(identity["affinity"]))
+    if (
+        len(benchmark_processes) == len(DRIVER_CPUS)
+        and len(benchmark_affinities) != len(DRIVER_CPUS)
+    ):
+        raise RedisCpuError("benchmark processes must use distinct driver CPUs")
 
     fingerprint_payload = {
         "workload_digest": workload_digest,

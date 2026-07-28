@@ -21,6 +21,7 @@ from bench.core.runner import (
     _guest_scheduler,
     _guest_treatment,
     _guest_run_status,
+    _domain_name,
     _manifest_entry,
     _resolve_host_path,
     _run_libvirt,
@@ -31,6 +32,19 @@ from bench.scripts.run import _build_pairs, _variant, main as run_main
 
 
 class RunnerSchedulerStagingTest(unittest.TestCase):
+    def test_domain_name_preserves_unique_hash_after_truncation(self) -> None:
+        spec = RunnerExecutionPlanTest()._spec()
+        first_dir = Path("/tmp") / ("first-" + "x" * 100)
+        second_dir = Path("/tmp") / ("second-" + "x" * 100)
+
+        first = _domain_name("candidate-with-a-long-treatment-name", spec, first_dir)
+        second = _domain_name("candidate-with-a-long-treatment-name", spec, second_dir)
+
+        self.assertLessEqual(len(first), 63)
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"-[0-9a-f]{8}$")
+        self.assertRegex(second, r"-[0-9a-f]{8}$")
+
     def test_guest_scheduler_uses_staged_command_without_mutating_input(self) -> None:
         scheduler = {
             "kind": "scx",

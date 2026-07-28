@@ -7,20 +7,10 @@ cd "$REPO_ROOT"
 
 CONFIG="bench/configs/local_profiles/oe2403sp4_6_6_scx"
 OUTPUT_ROOT="bench/results/oe2403sp4_6_6_scx/real_llm/$(date +%Y%m%dT%H%M%S%z)"
-UPSTREAM_URL=${OPENAI_COMPAT_UPSTREAM:-https://api.deepseek.com}
-GATEWAY_ENDPOINT="127.0.0.1:17002"
-RELAY_ENDPOINT="192.168.122.1:17001"
-API_KEY="local-test"
-MODEL="deepseek-v4-flash"
 PROGRESS_INTERVAL=30
 PREFLIGHT_ONLY=0
 DRY_RUN=0
 GROUP_GATE=0
-SYSTEMD_SOCKET_PROXYD="/usr/lib/systemd/systemd-socket-proxyd"
-GATEWAY_PID=""
-RELAY_PID=""
-OWN_GATEWAY=0
-OWN_RELAY=0
 VALIDATION_FAILURES=0
 
 usage() {
@@ -33,11 +23,8 @@ comparisons. The output directory must be new or empty.
 Options:
   --config PATH       benchmark config directory
   --output PATH       output root (default: timestamped bench/results path)
-  --upstream URL      OpenAI-compatible HTTPS API (default: DeepSeek API)
-  --gateway HOST:PORT host gateway endpoint (default: 127.0.0.1:17002)
-  --relay HOST:PORT   VM-visible relay endpoint (default: 192.168.122.1:17001)
   --progress SECONDS  run.py progress interval (default: 30)
-  --preflight-only    check host and one real LLM tool call without running VMs
+  --preflight-only    validate configured LLM access without running VMs
   --group-gate        run one LATENCY, BATCH, and MIX candidate pair
   --dry-run           generate all 44 runs without starting VMs or calling LLM
                       continue remaining experiment groups after validation failures
@@ -72,21 +59,6 @@ while (($# > 0)); do
       OUTPUT_ROOT=$2
       shift 2
       ;;
-    --upstream)
-      (($# >= 2)) || die "--upstream requires a URL"
-      UPSTREAM_URL=$2
-      shift 2
-      ;;
-    --gateway)
-      (($# >= 2)) || die "--gateway requires HOST:PORT"
-      GATEWAY_ENDPOINT=$2
-      shift 2
-      ;;
-    --relay)
-      (($# >= 2)) || die "--relay requires HOST:PORT"
-      RELAY_ENDPOINT=$2
-      shift 2
-      ;;
     --progress)
       (($# >= 2)) || die "--progress requires seconds"
       PROGRESS_INTERVAL=$2
@@ -116,36 +88,19 @@ done
 
 [[ -d "$CONFIG" ]] || die "config directory does not exist: $CONFIG"
 [[ "$PROGRESS_INTERVAL" =~ ^[0-9]+$ ]] || die "--progress must be a non-negative integer"
-[[ "$GATEWAY_ENDPOINT" =~ ^[^:]+:[0-9]+$ ]] || die "--gateway must be HOST:PORT"
-[[ "$RELAY_ENDPOINT" =~ ^[^:]+:[0-9]+$ ]] || die "--relay must be HOST:PORT"
-[[ "$GATEWAY_ENDPOINT" != "$RELAY_ENDPOINT" ]] || die "gateway and relay endpoints must differ"
-[[ "$UPSTREAM_URL" == https://* ]] || die "--upstream must be an HTTPS URL"
-[[ "$UPSTREAM_URL" != *\?* && "$UPSTREAM_URL" != *\#* ]] || die \
-  "--upstream must not contain a query or fragment"
-UPSTREAM_URL=${UPSTREAM_URL%/}
 ((PREFLIGHT_ONLY == 0 || DRY_RUN == 0)) || die \
   "--preflight-only and --dry-run cannot be combined"
 ((PREFLIGHT_ONLY == 0 || GROUP_GATE == 0)) || die \
   "--preflight-only and --group-gate cannot be combined"
 
-require_command curl
 require_command jq
 require_command python3
-require_command systemd-socket-activate
-require_command setsid
 require_command realpath
 require_command sha256sum
-[[ -x "$SYSTEMD_SOCKET_PROXYD" ]] || die "required executable is missing: $SYSTEMD_SOCKET_PROXYD"
-
-mkdir -p "$OUTPUT_ROOT"
-if find "$OUTPUT_ROOT" -mindepth 1 -print -quit | grep -q .; then
-  die "output directory is not empty: $OUTPUT_ROOT"
-fi
 
 mapfile -t CONFIG_VALUES < <(python3 - "$CONFIG" <<'PY'
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 from bench.core.config import load_config_data
 
@@ -156,96 +111,45 @@ names = (
     "scx_agent_classed_llm_mixed",
 )
 values = []
+triples = []
 for name in names:
     scheduler = config["schedulers"][name]
     env = scheduler.get("env", {})
-    base_url = env.get("SCX_REAL_LLM_BASE_URL", "http://192.168.122.1:17001")
-    model = env.get("SCX_REAL_LLM_MODEL", "deepseek-v4-flash")
-    api_key = env.get("SCX_REAL_LLM_API_KEY", "local-test")
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.path not in {"", "/"}:
-        raise SystemExit(f"invalid SCX_REAL_LLM_BASE_URL for {name}: {base_url}")
-    values.extend((base_url.rstrip("/"), model, api_key))
+    triples.append(tuple(env.get(key) for key in (
+        "SCX_TUNING_AGENT_LLM_BASE_URL",
+        "SCX_TUNING_AGENT_LLM_MODEL",
+        "SCX_TUNING_AGENT_LLM_API_KEY",
+    )))
+if len(set(triples)) != 1 or any(not isinstance(value, str) or not value for value in triples[0]):
+    raise SystemExit("real-LLM scheduler variants must use one complete LLM configuration")
+values.extend((triples[0][0].rstrip("/"), triples[0][1]))
 values.append(str(config["libvirt"]["kernel"]))
 print("\n".join(values))
 PY
 )
-(( ${#CONFIG_VALUES[@]} == 10 )) || die "could not read the LLM and kernel configurations"
+(( ${#CONFIG_VALUES[@]} == 3 )) || die "could not read the LLM and kernel configurations"
 
-for ((index = 0; index < 9; index += 3)); do
-  [[ "${CONFIG_VALUES[index]}" == "${CONFIG_VALUES[0]}" ]] || die "LLM base URLs differ between scheduler variants"
-  [[ "${CONFIG_VALUES[index + 1]}" == "$MODEL" ]] || die "scheduler model must be $MODEL"
-  [[ "${CONFIG_VALUES[index + 2]}" == "$API_KEY" ]] || die "scheduler API key must match the script gateway token"
-done
+LLM_BASE_URL=${CONFIG_VALUES[0]}
+MODEL=${CONFIG_VALUES[1]}
+KERNEL_IMAGE=${CONFIG_VALUES[2]}
 
-KERNEL_IMAGE=${CONFIG_VALUES[9]}
+if ((DRY_RUN)); then
+  printf 'dry run: skipping configured LLM protocol preflight\n'
+else
+  python3 -m bench.integrations.tuning_agent.llm_preflight \
+    --config "$CONFIG" \
+    --scheduler scx_agent_classed_llm_latency \
+    --scheduler scx_agent_classed_llm_batch \
+    --scheduler scx_agent_classed_llm_mixed \
+    --require-single || die "configured LLM preflight failed"
+fi
+
+if ((PREFLIGHT_ONLY)); then
+  printf 'preflight passed; no benchmark VM was started\n'
+  exit 0
+fi
+
 [[ -f "$KERNEL_IMAGE" ]] || die "configured kernel image is missing: $KERNEL_IMAGE"
-
-RELAY_URL="${CONFIG_VALUES[0]}"
-[[ "$RELAY_URL" == "http://${RELAY_ENDPOINT}" ]] || die \
-  "config relay ${RELAY_URL} does not match requested relay http://${RELAY_ENDPOINT}"
-
-probe_models() {
-  local endpoint=$1
-  curl -fsS --connect-timeout 15 --max-time 30 "http://${endpoint}/v1/models" \
-    -H "Authorization: Bearer ${API_KEY}" 2>/dev/null |
-    jq -e --arg model "$MODEL" '.data | any(.[]; .id == $model)' >/dev/null
-}
-
-wait_for_models() {
-  local endpoint=$1
-  for _ in {1..10}; do
-    probe_models "$endpoint" && return 0
-    sleep 0.5
-  done
-  return 1
-}
-
-probe_tool_call() {
-  local endpoint=$1
-  local response
-  response=$(
-    jq -nc --arg model "$MODEL" '{
-      model: $model,
-      messages: [{role: "user", content: "You must call preflight_ping now; do not answer with text."}],
-      tools: [{type: "function", function: {
-        name: "preflight_ping",
-        description: "Validate OpenAI-compatible tool calling.",
-        parameters: {type: "object", properties: {}, additionalProperties: false}
-      }}],
-      tool_choice: "auto",
-      stream: false
-    }' |
-      curl -fsS --max-time 120 "http://${endpoint}/v1/chat/completions" \
-        -H "Authorization: Bearer ${API_KEY}" \
-        -H 'Content-Type: application/json' \
-        --data-binary @-
-  ) || return 1
-  jq -e '
-    .choices[0].message.tool_calls |
-    any(.[]; .type == "function" and .function.name == "preflight_ping")
-  ' >/dev/null <<<"$response"
-}
-
-stop_process_group() {
-  local pid=$1
-  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-}
-
-cleanup() {
-  local status=$?
-  if [[ "$OWN_RELAY" == 1 && -n "$RELAY_PID" ]]; then
-    stop_process_group "$RELAY_PID"
-  fi
-  if [[ "$OWN_GATEWAY" == 1 && -n "$GATEWAY_PID" ]]; then
-    stop_process_group "$GATEWAY_PID"
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 for executable in \
   schedule/scx_agent_classed/target/release/scx_agent_classed \
@@ -258,61 +162,14 @@ do
   [[ -x "$executable" ]] || die "required benchmark executable is missing: $executable"
 done
 
+mkdir -p "$OUTPUT_ROOT"
+if find "$OUTPUT_ROOT" -mindepth 1 -print -quit | grep -q .; then
+  die "output directory is not empty: $OUTPUT_ROOT"
+fi
+
 python3 -m bench.env verify --config "$CONFIG"
 python3 -m bench.env isolation status --config "$CONFIG" |
   tee "$OUTPUT_ROOT/isolation-status.txt"
-
-if ((DRY_RUN)); then
-  printf 'dry run: skipping the LLM gateway, relay and network preflight\n'
-else
-  UPSTREAM_API_KEY=${DEEPSEEK_API_KEY:-${OPENAI_COMPAT_UPSTREAM_API_KEY:-}}
-  [[ -n "$UPSTREAM_API_KEY" ]] || die \
-    "DEEPSEEK_API_KEY is not set; export it in this shell before running the experiment"
-
-  if probe_models "$GATEWAY_ENDPOINT"; then
-    printf 'OpenAI-compatible gateway is already ready: http://%s (%s)\n' \
-      "$GATEWAY_ENDPOINT" "$MODEL"
-  else
-    printf 'starting OpenAI-compatible gateway %s -> %s\n' \
-      "$GATEWAY_ENDPOINT" "$UPSTREAM_URL"
-    OPENAI_COMPAT_UPSTREAM_API_KEY="$UPSTREAM_API_KEY" \
-      OPENAI_COMPAT_PROXY_TOKEN="$API_KEY" \
-      setsid python3 bench/integrations/tuning_agent/openai_compat_gateway.py \
-        --host "${GATEWAY_ENDPOINT%:*}" \
-        --port "${GATEWAY_ENDPOINT##*:}" \
-        --upstream "$UPSTREAM_URL" \
-        --strip-v1 \
-        >"$OUTPUT_ROOT/openai-gateway.log" 2>&1 &
-    GATEWAY_PID=$!
-    OWN_GATEWAY=1
-    wait_for_models "$GATEWAY_ENDPOINT" || die \
-      "OpenAI-compatible gateway did not become ready"
-  fi
-
-  if probe_models "$RELAY_ENDPOINT"; then
-    printf 'LLM relay is already ready: http://%s (%s)\n' "$RELAY_ENDPOINT" "$MODEL"
-  else
-    printf 'starting relay %s -> %s\n' "$RELAY_ENDPOINT" "$GATEWAY_ENDPOINT"
-    setsid systemd-socket-activate \
-      -l "$RELAY_ENDPOINT" \
-      "$SYSTEMD_SOCKET_PROXYD" \
-      --connections-max=16 \
-      "$GATEWAY_ENDPOINT" \
-      >"$OUTPUT_ROOT/llm-relay.log" 2>&1 &
-    RELAY_PID=$!
-    OWN_RELAY=1
-    wait_for_models "$RELAY_ENDPOINT" || die "LLM relay did not become ready"
-  fi
-
-  printf 'validating one real OpenAI-compatible tool call through the VM relay\n'
-  probe_tool_call "$RELAY_ENDPOINT" || die "LLM tool-call preflight failed"
-  unset UPSTREAM_API_KEY DEEPSEEK_API_KEY OPENAI_COMPAT_UPSTREAM_API_KEY
-fi
-
-if ((PREFLIGHT_ONLY)); then
-  printf 'preflight passed; no benchmark VM was started\n'
-  exit 0
-fi
 
 GIT_COMMIT=$(git rev-parse HEAD)
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -341,20 +198,15 @@ jq -n \
   --arg scheduler_sha256 "$SCHEDULER_SHA256" \
   --arg mcp_sha256 "$MCP_SHA256" \
   --arg agent_sha256 "$AGENT_SHA256" \
-  --arg gateway_sha256 "$(sha256sum bench/integrations/tuning_agent/openai_compat_gateway.py | cut -d' ' -f1)" \
   --argjson dry_run "$DRY_RUN" \
   --arg model "$MODEL" \
-  --arg relay "http://${RELAY_ENDPOINT}" \
-  --arg gateway "http://${GATEWAY_ENDPOINT}" \
-  --arg upstream "$UPSTREAM_URL" \
+  --arg base_url "$LLM_BASE_URL" \
   --argjson group_gate "$GROUP_GATE" \
-  '{schema_version: 1, config: $config, config_sha256: $config_sha256,
+  '{schema_version: 2, config: $config, config_sha256: $config_sha256,
     output: $output, git_commit: $git_commit, git_dirty: $git_dirty,
     artifacts: {kernel_sha256: $kernel_sha256, scheduler_sha256: $scheduler_sha256,
-                mcp_sha256: $mcp_sha256, tuning_agent_sha256: $agent_sha256,
-                openai_gateway_sha256: $gateway_sha256},
-    llm: {protocol: "openai-compatible", model: $model, relay: $relay,
-          gateway: $gateway, upstream: $upstream},
+                mcp_sha256: $mcp_sha256, tuning_agent_sha256: $agent_sha256},
+    llm: {protocol: "openai-compatible", model: $model, base_url: $base_url},
     order: "alternating", parallel: 1, dry_run: ($dry_run == 1),
     mode: (if $group_gate == 1 then "group_gate" else "full" end),
     experiments: (if $group_gate == 1 then

@@ -14,6 +14,7 @@ def render_html(analysis: dict[str, Any]) -> str:
     primary = [item for item in comparisons if item.get("role") == "primary"]
     invalid_runs = analysis.get("invalid_runs", [])
     summary = analysis.get("summary", {})
+    run_outcomes = analysis.get("run_outcomes", {})
 
     return f"""<!doctype html>
 <html lang="en">
@@ -136,6 +137,11 @@ def render_html(analysis: dict[str, Any]) -> str:
   </section>
 
   <section>
+    <h2>Run Outcomes</h2>
+    {_run_outcomes_table(analysis, run_outcomes)}
+  </section>
+
+  <section>
     <h2>All Comparisons</h2>
     {_comparison_table(comparisons)}
   </section>
@@ -185,6 +191,51 @@ def _comparison_table(comparisons: list[dict[str, Any]]) -> str:
         "</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
+    )
+
+
+def _run_outcomes_table(
+    analysis: dict[str, Any],
+    run_outcomes: Any,
+) -> str:
+    if not isinstance(run_outcomes, dict):
+        return '<p class="muted">No run outcomes.</p>'
+
+    rows = []
+    for role, label_key in (
+        ("baseline", "baseline_label"),
+        ("candidate", "candidate_label"),
+    ):
+        outcome = run_outcomes.get(role)
+        if not isinstance(outcome, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f"<td>{_h(analysis.get(label_key, role))}</td>"
+            f"<td>{_h(outcome.get('total', 0))}</td>"
+            f"<td>{_fmt_count_map(outcome.get('status_counts'))}</td>"
+            f"<td>{_fmt_count_map(outcome.get('treatment_disposition_counts'))}</td>"
+            f"<td>{_fmt_count_map(outcome.get('treatment_reason_counts'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return '<p class="muted">No run outcomes.</p>'
+    return (
+        "<table><thead><tr>"
+        "<th>Variant</th><th>Total Runs</th><th>Run Status</th>"
+        "<th>Treatment Disposition</th><th>Treatment Reason</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _fmt_count_map(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return '<span class="muted">none</span>'
+    return "<br>".join(
+        f"<code>{_h(name)}</code>: {_h(count)}"
+        for name, count in sorted(value.items())
     )
 
 

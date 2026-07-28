@@ -25,6 +25,9 @@ class RunMetricSet:
     bench_returncode: int | None
     scheduler_start_returncode: int | None
     failure_reason: str
+    treatment_phase_status: str = ""
+    treatment_disposition: str = ""
+    treatment_reason_code: str = ""
 
 
 def load_result_dir(path: str | Path, label: str) -> list[RunMetricSet]:
@@ -54,6 +57,9 @@ def _load_one(
     phases = _as_dict(guest_result.get("phases", {}))
     measurement = _as_dict(phases.get("measurement", {}))
     scheduler = _as_dict(phases.get("scheduler", {}))
+    treatment = _as_dict(phases.get("treatment", {}))
+    treatment_outcome = _as_dict(treatment.get("outcome", {}))
+    treatment_reason = _as_dict(treatment_outcome.get("reason", {}))
     return RunMetricSet(
         result_dir=result_dir,
         run_dir=run_dir,
@@ -74,6 +80,9 @@ def _load_one(
         bench_returncode=_as_int(measurement.get("returncode")),
         scheduler_start_returncode=_as_int(scheduler.get("start_returncode")),
         failure_reason=_failure_reason(result, run_dir),
+        treatment_phase_status=_as_string(treatment.get("status")),
+        treatment_disposition=_as_string(treatment_outcome.get("disposition")),
+        treatment_reason_code=_as_string(treatment_reason.get("code")),
     )
 
 
@@ -93,6 +102,10 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 def _as_int(value: Any) -> int | None:
     return value if isinstance(value, int) else None
+
+
+def _as_string(value: Any) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def _failure_reason(result: dict[str, Any], run_dir: Path) -> str:

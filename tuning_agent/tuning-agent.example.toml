@@ -1,5 +1,5 @@
 [llm]
-base_url = "http://127.0.0.1:17002"
+base_url = "http://127.0.0.1:17002/v1"
 api_key = "replace-me"
 model = "deepseek-v4-flash"
 timeout_ms = 30000

@@ -45,7 +45,7 @@ bench/
       loadgen.py
       workload.py
       mcp_server.py
-      matrix.py
+      run.py
   benchmarks/
     generic.py
 
@@ -65,7 +65,12 @@ bench/
       environment.config
       benches.config
       plan.config
+    redis_cpu_demo/
+      environment.config
+      benches.config
+      plan.config
     local_config/  # generated, ignored by git
+    local_profiles/  # named machine-local profiles, ignored by git
 
   workloads/
   schedulers/
@@ -291,10 +296,13 @@ verification.
 
 Owns self-contained experiment assets that are not generic framework code.
 The Redis CPU scenario contains its fixture, rolling load generator, held-out
-workload, MCP server, real-LLM matrix runner, and scenario-specific config
-references. Scenario workloads use benchmark staging; training and adapter
-dependencies use treatment staging. Live-model outcomes are classified
-separately from deterministic provider and safety invariants.
+workload, MCP server, and thin real-LLM entry point. `redis_cpu_demo` injects a
+bounded underweight Redis baseline for a repeatable positive demonstration;
+`redis_cpu_tuning` retains the fair baseline for open-ended research. Scenario
+workloads use benchmark staging; training and adapter dependencies use
+treatment staging. The entry point performs preflight and delegates execution,
+analysis, and reporting to the shared Bench pipeline. Deterministic tests cover
+provider and safety invariants.
 
 ### `bench/benchmarks/generic.py`
 
@@ -305,6 +313,64 @@ normalized JSON.
 
 Specialized wrappers are used for tools such as `fio`, `schbench`, `perf bench
 sched`, `will-it-scale`, `cyclictest`, `kernel build`, and `redis-benchmark`.
+
+### Workload Wrapper Contract
+
+Community workload sources and binaries live under `bench/workloads/`. The
+framework executes adapters under `bench/benchmarks/` so workload-specific
+output never leaks into the analysis model.
+
+A wrapper must:
+
+1. run the real workload without changing its benchmark semantics;
+2. write workload-native stdout and stderr below `SCX_BENCH_OUT`;
+3. emit one JSON document on its own stdout;
+4. exit non-zero when the workload or wrapper fails;
+5. use stable metric names and units across versions.
+
+The normalized document has this shape:
+
+```json
+{
+  "metrics": {
+    "elapsed_time_sec": 1.23
+  },
+  "metadata": {
+    "wrapper": "generic",
+    "returncode": 0
+  },
+  "raw": {
+    "stdout_path": "/scx_bench_out/workload_stdout.log",
+    "stderr_path": "/scx_bench_out/workload_stderr.log"
+  }
+}
+```
+
+`metrics` contains numeric values consumed by metric profiles and analysis.
+`metadata` contains non-comparison context such as the wrapper name, command,
+and return code. `raw` points to workload-native evidence; analysis does not
+parse those files.
+
+Specialized wrappers must parse native output and expose domain-appropriate,
+stable names such as:
+
+```text
+iops
+throughput
+p99_latency_us
+p999_latency_us
+elapsed_time_sec
+```
+
+`bench/benchmarks/generic.py` is the fallback when elapsed time is the only
+normalized workload metric. Shared command execution and JSON emission belong
+in `bench/benchmarks/util.py`. A specialized wrapper should remain small and
+limit itself to argument handling and native-output parsing.
+
+Wrappers are baked into the base image and covered by its provenance manifest.
+Any addition, removal, or modification under `bench/benchmarks/` requires
+`python3 -m bench.env rebuild-image` followed by `python3 -m bench.env verify`.
+A real run rejects a stale image before creating a VM.
 
 ### `bench/core/metrics.py`
 
@@ -331,6 +397,9 @@ Output:
 ```text
 RunMetricSet objects
 ```
+
+Each run also carries the generic treatment phase status, disposition, and
+reason code from Outcome V2.
 
 ### `bench/analysis/compare.py`
 
@@ -367,6 +436,10 @@ For each metric listed by the metric profile, it creates:
 }
 ```
 
+The same analysis model aggregates run status, treatment disposition, and
+treatment reason counts for each variant. This exposes successful tuning-agent
+commits without inspecting scenario-specific contracts or audit logs.
+
 Verdicts are based on:
 
 - metric direction;
@@ -376,7 +449,8 @@ Verdicts are based on:
 
 ### `bench/analysis/report.py`
 
-Renders `analysis.json` into HTML.
+Renders metrics, confidence intervals, invalid runs, and treatment outcome
+counts from `analysis.json` into HTML.
 
 It does not recompute verdicts or metrics.
 
@@ -396,9 +470,9 @@ while workload parsing remains the benchmark adapter's responsibility.
 ## Data Flow
 
 ```text
-example_config/ + env init
-  -> local_config/
-local_config/
+config template/profile + env init
+  -> machine-specific config directory
+config directory
   -> config parser
   -> base image + benchmark wrapper manifest verification
   -> RunSpec list
